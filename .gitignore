@@ -25,6 +25,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# Reference nanoGPT clone (for golden tests)
+/nanoGPT_ref/
+
 # IDE
 .elixir_ls/
 .vscode/
