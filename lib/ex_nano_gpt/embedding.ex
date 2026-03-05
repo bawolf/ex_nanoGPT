@@ -11,15 +11,24 @@ defmodule ExNanoGPT.Embedding do
 
   import Nx.Defn
 
-  @doc """
-  Initialize embedding parameters.
-
-  Returns a map with:
-  - :wte - token embedding table, shape {vocab_size, n_embd}
-  - :wpe - position embedding table, shape {block_size, n_embd}
-
-  Both initialized from Normal(0, 0.02) matching nanoGPT's _init_weights.
+  @typedoc """
+  Embedding parameters.
+  - `:wte` - token embedding table, shape `{vocab_size, n_embd}`
+  - `:wpe` - position embedding table, shape `{block_size, n_embd}`
   """
+  @type params :: %{wte: Nx.Tensor.t(), wpe: Nx.Tensor.t()}
+
+  @typedoc "PRNG key for random operations, shape `{2}` (Nx.Random key)"
+  @type prng_key :: Nx.Tensor.t()
+
+  @doc """
+  Initialize embedding parameters from Normal(0, 0.02).
+
+  ## Returns
+  A params map with `:wte` (shape `{vocab_size, n_embd}`) and
+  `:wpe` (shape `{block_size, n_embd}`).
+  """
+  @spec init_params(pos_integer(), pos_integer(), pos_integer(), prng_key()) :: params()
   def init_params(vocab_size, block_size, n_embd, key) do
     keys = Nx.Random.split(key, parts: 2)
     wte_key = keys[0]
@@ -34,8 +43,12 @@ defmodule ExNanoGPT.Embedding do
   @doc """
   Look up token embeddings for the given indices.
 
-  idx: integer tensor of shape {batch, seq_len}
-  Returns tensor of shape {batch, seq_len, n_embd}
+  ## Inputs
+    * `idx` - integer tensor, shape `{batch, seq_len}`
+    * `wte` - token embedding table, shape `{vocab_size, n_embd}`
+
+  ## Returns
+  Tensor of shape `{batch, seq_len, n_embd}`.
   """
   defn token_embedding(idx, wte) do
     Nx.take(wte, idx, axis: 0)
@@ -44,7 +57,11 @@ defmodule ExNanoGPT.Embedding do
   @doc """
   Look up position embeddings for positions 0..seq_len-1.
 
-  Returns tensor of shape {seq_len, n_embd}
+  ## Options
+    * `:seq_len` - sequence length (required)
+
+  ## Returns
+  Tensor of shape `{seq_len, n_embd}`.
   """
   defn position_embedding(wpe, opts \\ []) do
     seq_len = opts[:seq_len]
@@ -55,10 +72,17 @@ defmodule ExNanoGPT.Embedding do
   @doc """
   Compute combined token + position embeddings with dropout.
 
-  idx: integer tensor of shape {batch, seq_len}
-  params: map with :wte and :wpe keys
-  key: PRNG key for dropout
-  opts: [dropout_rate: float, training: boolean]
+  ## Inputs
+    * `idx` - integer tensor, shape `{batch, seq_len}`
+    * `params` - embedding params from `init_params/4`
+    * `key` - PRNG key for dropout randomness
+
+  ## Options
+    * `:dropout_rate` - probability of zeroing an element (default: 0.0)
+    * `:training` - whether to apply dropout (default: false)
+
+  ## Returns
+  Tensor of shape `{batch, seq_len, n_embd}`.
   """
   defn forward(idx, params, key, opts \\ []) do
     dropout_rate = opts[:dropout_rate]

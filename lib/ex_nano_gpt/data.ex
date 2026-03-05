@@ -15,13 +15,35 @@ defmodule ExNanoGPT.Data do
 
   defstruct [:vocab_size, :stoi, :itos]
 
+  @typedoc """
+  Dataset metadata.
+  - `:vocab_size` - number of unique characters
+  - `:stoi` - char (integer codepoint) -> token ID mapping
+  - `:itos` - token ID -> char (integer codepoint) mapping
+  """
+  @type t :: %__MODULE__{
+          vocab_size: pos_integer(),
+          stoi: %{non_neg_integer() => non_neg_integer()},
+          itos: %{non_neg_integer() => non_neg_integer()}
+        }
+
+  @typedoc "A list of integer token IDs"
+  @type token_ids :: [non_neg_integer()]
+
+  @spec data_dir() :: String.t()
   def data_dir, do: @data_dir
 
   @doc """
   Run the full data preparation pipeline.
   Downloads Shakespeare, builds vocab, encodes, splits, and saves binary files.
-  Returns the metadata struct.
+
+  ## Options
+    * `:data_dir` - directory to store data files (default: `./data`)
+
+  ## Returns
+  The dataset metadata struct.
   """
+  @spec prepare(keyword()) :: t()
   def prepare(opts \\ []) do
     data_dir = Keyword.get(opts, :data_dir, @data_dir)
     File.mkdir_p!(data_dir)
@@ -48,6 +70,7 @@ defmodule ExNanoGPT.Data do
   @doc """
   Download the Shakespeare text file if not already present.
   """
+  @spec download(String.t()) :: String.t()
   def download(data_dir \\ @data_dir) do
     path = Path.join(data_dir, "input.txt")
 
@@ -64,8 +87,9 @@ defmodule ExNanoGPT.Data do
 
   @doc """
   Build a character-level vocabulary from the text.
-  Chars are sorted (matching Python's sorted(list(set(data)))).
+  Chars are sorted (matching Python's `sorted(list(set(data)))`).
   """
+  @spec build_vocab(String.t()) :: t()
   def build_vocab(text) do
     chars =
       text
@@ -84,8 +108,9 @@ defmodule ExNanoGPT.Data do
   end
 
   @doc """
-  Encode a string into a list of integers using the vocabulary.
+  Encode a string into a list of token IDs using the vocabulary.
   """
+  @spec encode(t(), String.t()) :: token_ids()
   def encode(%__MODULE__{stoi: stoi}, text) do
     text
     |> String.to_charlist()
@@ -93,8 +118,9 @@ defmodule ExNanoGPT.Data do
   end
 
   @doc """
-  Decode a list of integers back into a string.
+  Decode a list of token IDs back into a string.
   """
+  @spec decode(t(), token_ids()) :: String.t()
   def decode(%__MODULE__{itos: itos}, ids) do
     ids
     |> Enum.map(&Map.fetch!(itos, &1))
@@ -104,6 +130,7 @@ defmodule ExNanoGPT.Data do
   @doc """
   Split text into train/val at the given ratio.
   """
+  @spec split(String.t(), float()) :: {String.t(), String.t()}
   def split(text, ratio) do
     n = String.length(text)
     split_at = trunc(n * ratio)
@@ -111,17 +138,19 @@ defmodule ExNanoGPT.Data do
   end
 
   @doc """
-  Save a list of integer token IDs as a binary file (little-endian uint16).
+  Save a list of token IDs as a binary file (little-endian uint16).
   This matches numpy's `np.array(ids, dtype=np.uint16).tofile(path)`.
   """
+  @spec save_bin(Path.t(), token_ids()) :: :ok
   def save_bin(path, ids) do
     binary = ids |> Enum.map(&<<&1::little-unsigned-16>>) |> IO.iodata_to_binary()
     File.write!(path, binary)
   end
 
   @doc """
-  Load a binary file of uint16 tokens into an Nx tensor.
+  Load a binary file of uint16 tokens into a 1D Nx tensor of shape `{n_tokens}`.
   """
+  @spec load_bin(Path.t()) :: Nx.Tensor.t()
   def load_bin(path) do
     binary = File.read!(path)
     count = byte_size(binary) |> div(2)
@@ -134,6 +163,7 @@ defmodule ExNanoGPT.Data do
   @doc """
   Save metadata as Erlang Term Format.
   """
+  @spec save_meta(Path.t(), t()) :: :ok
   def save_meta(path, meta) do
     File.write!(path, :erlang.term_to_binary(meta))
   end
@@ -141,6 +171,7 @@ defmodule ExNanoGPT.Data do
   @doc """
   Load metadata from Erlang Term Format.
   """
+  @spec load_meta(Path.t()) :: t()
   def load_meta(path) do
     path |> File.read!() |> :erlang.binary_to_term()
   end

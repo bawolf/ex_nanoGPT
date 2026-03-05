@@ -3,8 +3,7 @@ defmodule ExNanoGPT.Batch do
   Batch generation for training.
 
   Mirrors nanoGPT's get_batch() function:
-  - Memory-maps the binary data
-  - Picks random starting indices
+  - Picks random starting indices from the token data
   - Returns {x, y} where y = x shifted right by 1
   """
 
@@ -14,11 +13,19 @@ defmodule ExNanoGPT.Batch do
   Generate a random batch of training data.
 
   Given a 1D tensor of token IDs, picks `batch_size` random windows
-  of length `block_size` and returns {x, y} where:
-  - x has shape {batch_size, block_size}
-  - y has shape {batch_size, block_size} (x shifted right by 1)
+  of length `block_size`.
 
-  The `key` is an Nx.Random PRNG key for reproducible randomness.
+  ## Inputs
+    * `data` - 1D tensor of token IDs, shape `{n_tokens}`
+    * `key` - PRNG key for reproducible random sampling
+
+  ## Options
+    * `:batch_size` - number of sequences per batch (required)
+    * `:block_size` - length of each sequence (required)
+
+  ## Returns
+  `{x, y}` where both have shape `{batch_size, block_size}`.
+  `y` is `x` shifted right by one position (the prediction target).
   """
   defn get_batch(data, key, opts \\ []) do
     batch_size = opts[:batch_size]

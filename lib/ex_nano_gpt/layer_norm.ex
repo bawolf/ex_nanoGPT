@@ -11,13 +11,20 @@ defmodule ExNanoGPT.LayerNorm do
 
   import Nx.Defn
 
+  @typedoc "Layer norm parameters: scale weight and optional bias, both shape {n_embd}"
+  @type params :: %{weight: Nx.Tensor.t(), bias: Nx.Tensor.t()} | %{weight: Nx.Tensor.t()}
+
   @doc """
   Initialize layer norm parameters.
 
-  Returns a map with:
-  - :weight - scale parameter, shape {n_embd}, initialized to ones
-  - :bias - shift parameter, shape {n_embd}, initialized to zeros (or nil if bias=false)
+  ## Options
+    * `:bias` - whether to include a bias term (default: true)
+
+  ## Returns
+  A params map with `:weight` (shape `{n_embd}`, ones) and
+  optionally `:bias` (shape `{n_embd}`, zeros).
   """
+  @spec init_params(pos_integer(), keyword()) :: params()
   def init_params(n_embd, opts \\ []) do
     bias? = Keyword.get(opts, :bias, true)
 
@@ -33,7 +40,12 @@ defmodule ExNanoGPT.LayerNorm do
   @doc """
   Apply layer normalization.
 
-  Normalizes over the last axis of the input tensor.
+  ## Inputs
+    * `x` - input tensor, any shape; normalization is over the last axis
+    * `params` - layer norm params from `init_params/2`
+
+  ## Returns
+  Normalized tensor, same shape as `x`.
   """
   defn forward(x, params) do
     eps = 1.0e-5
