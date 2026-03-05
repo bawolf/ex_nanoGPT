@@ -61,7 +61,8 @@ defmodule ExNanoGPT.ModelTest do
     expected_logits = load_golden("gpt_logits_training")
 
     key = Nx.Random.key(0)
-    actual_logits = Model.forward(input, params, @config, key, training: true)
+    actual_logits = Model.forward_train(input, params, key,
+      n_head: @config.n_head, dropout_rate: @config.dropout)
 
     assert Nx.shape(actual_logits) == {2, 8, 65}
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
@@ -73,7 +74,7 @@ defmodule ExNanoGPT.ModelTest do
     expected_logits = load_golden("gpt_logits_inference")
 
     key = Nx.Random.key(0)
-    actual_logits = Model.forward(input, params, @config, key, training: false)
+    actual_logits = Model.forward(input, params, @config, key)
 
     assert Nx.shape(actual_logits) == {2, 1, 65}
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
@@ -86,7 +87,8 @@ defmodule ExNanoGPT.ModelTest do
     expected_loss = load_golden("gpt_loss")
 
     key = Nx.Random.key(0)
-    logits = Model.forward(input, params, @config, key, training: true)
+    logits = Model.forward_train(input, params, key,
+      n_head: @config.n_head, dropout_rate: @config.dropout)
     actual_loss = Model.cross_entropy_loss(logits, targets)
 
     expected_scalar = Nx.squeeze(expected_loss)

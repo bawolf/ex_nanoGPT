@@ -24,8 +24,7 @@ defmodule ExNanoGPT.MixProject do
   defp deps do
     [
       {:nx, "~> 0.9.2"},
-      {:exla, "~> 0.9.2"},
-      {:polaris, "~> 0.1"}
+      {:exla, "~> 0.9.2"}
     ]
   end
 end

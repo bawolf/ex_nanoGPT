@@ -83,48 +83,22 @@ defmodule ExNanoGPT.Model do
   end
 
   @doc """
-  Forward pass of the GPT model.
+  Forward pass of the GPT model (inference mode).
 
-  This is a regular function (not defn) because the config contains booleans
-  and the block loop requires Elixir-level iteration. It calls defn helpers
-  for the numerical work.
-
-  ## Inputs
-    * `idx` - token indices, shape `{batch, seq_len}`
-    * `params` - model params from `init_params/2`
-    * `config` - model configuration
-    * `key` - PRNG key for dropout
-
-  ## Options
-    * `:training` - whether in training mode (default: false)
-
-  ## Returns
-  When training is false: logits for the last token only, shape `{batch, 1, vocab_size}`.
-  When training is true: logits for all positions, shape `{batch, seq_len, vocab_size}`.
+  Returns logits for the last token only: shape `{batch, 1, vocab_size}`.
+  For training (full logits + gradient support), use `forward_train/4`.
   """
-  @spec forward(Nx.Tensor.t(), params(), config(), Nx.Tensor.t(), keyword()) :: Nx.Tensor.t()
-  def forward(idx, params, config, key, opts \\ []) do
-    training = Keyword.get(opts, :training, false)
+  @spec forward(Nx.Tensor.t(), params(), config(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  def forward(idx, params, config, key) do
     %{n_head: n_head, dropout: dropout} = config
 
     seq_len = Nx.axis_size(idx, 1)
 
-    # Token + position embeddings
     tok_emb = Embedding.token_embedding(idx, params.wte)
     pos_emb = Embedding.position_embedding(params.wpe, seq_len: seq_len)
     x = Nx.add(tok_emb, pos_emb)
 
-    # Embedding dropout
-    x =
-      if training and dropout > 0.0 do
-        {x, _} = apply_dropout_fn(x, key, dropout)
-        x
-      else
-        x
-      end
-
-    # Pass through N transformer blocks
-    block_opts = [n_head: n_head, dropout_rate: dropout, training: training]
+    block_opts = [n_head: n_head, dropout_rate: dropout, training: false]
 
     x =
       params.blocks
@@ -133,20 +107,63 @@ defmodule ExNanoGPT.Model do
         Block.forward(acc, block_params, key, block_opts)
       end)
 
-    # Final layer norm
     x = LayerNorm.forward(x, params.ln_f)
 
-    # Project to vocab: x @ wte^T (weight tying)
-    if training do
-      project_to_vocab(x, params.wte)
+    {_batch, seq, _n_embd} = Nx.shape(x)
+    x = Nx.slice_along_axis(x, seq - 1, 1, axis: 1)
+    project_to_vocab(x, params.wte)
+  end
+
+  @doc """
+  Forward pass for training (defn, supports gradient tracing).
+
+  Returns logits for ALL positions: shape `{batch, seq_len, vocab_size}`.
+  This is a defn function so it can be used inside `Nx.Defn.value_and_grad`.
+
+  ## Options
+    * `:n_head` - number of attention heads (required)
+    * `:dropout_rate` - dropout probability (required)
+  """
+  defn forward_train(idx, params, key, opts \\ []) do
+    n_head = opts[:n_head]
+    dropout_rate = opts[:dropout_rate]
+    seq_len = Nx.axis_size(idx, 1)
+
+    tok_emb = Embedding.token_embedding(idx, params.wte)
+    pos_emb = Embedding.position_embedding(params.wpe, seq_len: seq_len)
+    x = tok_emb + pos_emb
+
+    x = maybe_dropout(x, key, dropout_rate)
+
+    x = forward_blocks_train(x, params.blocks, key, n_head, dropout_rate)
+
+    x = LayerNorm.forward(x, params.ln_f)
+
+    Nx.dot(x, [-1], params.wte, [-1])
+  end
+
+  defnp maybe_dropout(x, key, rate) do
+    if rate > 0.0 do
+      {mask, _} = Nx.Random.uniform(key, shape: Nx.shape(x))
+      keep = Nx.greater(mask, rate)
+      x * keep / (1.0 - rate)
     else
-      {_batch, seq, _n_embd} = Nx.shape(x)
-      x = Nx.slice_along_axis(x, seq - 1, 1, axis: 1)
-      project_to_vocab(x, params.wte)
+      x
     end
   end
 
-  # x @ wte^T -> logits
+  deftransform forward_blocks_train(x, blocks, key, n_head, dropout_rate) do
+    blocks
+    |> Tuple.to_list()
+    |> Enum.reduce(x, fn block_params, acc ->
+      Block.forward(acc, block_params, key,
+        n_head: n_head,
+        dropout_rate: dropout_rate,
+        training: true
+      )
+    end)
+  end
+
   defn project_to_vocab(x, wte) do
     Nx.dot(x, [-1], wte, [-1])
   end
@@ -181,12 +198,6 @@ defmodule ExNanoGPT.Model do
     {n, vocab_size} = Nx.shape(log_probs)
     one_hot = Nx.equal(Nx.iota({n, vocab_size}, axis: 1), Nx.reshape(targets, {n, 1}))
     Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1])
-  end
-
-  defnp apply_dropout_fn(x, key, rate) do
-    {mask, new_key} = Nx.Random.uniform(key, shape: Nx.shape(x))
-    keep = Nx.greater(mask, rate)
-    {x * keep / (1.0 - rate), new_key}
   end
 
   @doc """
