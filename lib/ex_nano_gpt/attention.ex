@@ -81,6 +81,8 @@ defmodule ExNanoGPT.Attention do
     dropout_rate = opts[:dropout_rate]
     training = opts[:training]
 
+    {attn_drop_key, resid_drop_key} = split_key(key)
+
     dims = get_dims(x, n_head)
 
     qkv = linear(x, params.c_attn_weight, params[:c_attn_bias])
@@ -94,18 +96,15 @@ defmodule ExNanoGPT.Attention do
     scale = compute_scale(dims)
     att = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) * scale
 
-    # Causal mask: positions that should be masked get -1e10 added (effectively -inf after softmax)
-    # mask is 1 where we keep, 0 where we mask. (1-mask)*(-1e10) = 0 or -1e10
-    mask = build_causal_mask(dims)
-    att = att + (1.0 - mask) * -1.0e10
+    att = apply_causal_mask(att, dims)
 
     att = softmax(att)
 
-    {att, key} =
+    {att, _} =
       if training do
-        apply_dropout(att, key, dropout_rate)
+        apply_dropout(att, attn_drop_key, dropout_rate)
       else
-        {att, key}
+        {att, attn_drop_key}
       end
 
     y = Nx.dot(att, [3], [0, 1], v, [2], [0, 1])
@@ -114,14 +113,19 @@ defmodule ExNanoGPT.Attention do
 
     y = linear(y, params.c_proj_weight, params[:c_proj_bias])
 
-    {y, _key} =
+    {y, _} =
       if training do
-        apply_dropout(y, key, dropout_rate)
+        apply_dropout(y, resid_drop_key, dropout_rate)
       else
-        {y, key}
+        {y, resid_drop_key}
       end
 
     y
+  end
+
+  defnp split_key(key) do
+    keys = Nx.Random.split(key)
+    {keys[0], keys[1]}
   end
 
   # Extract dimensions as plain integers for use in shapes
@@ -158,12 +162,13 @@ defmodule ExNanoGPT.Attention do
     Nx.tensor(1.0 / :math.sqrt(dims.head_dim), type: :f32)
   end
 
-  # Build causal mask with shape {1, 1, seq_len, seq_len} for broadcasting
-  deftransform build_causal_mask(dims) do
-    seq_len = dims.seq_len
-    rows = Nx.iota({1, 1, seq_len, seq_len}, axis: 2)
-    cols = Nx.iota({1, 1, seq_len, seq_len}, axis: 3)
-    Nx.greater_equal(rows, cols)
+  deftransform apply_causal_mask(att, dims) do
+    %{batch: batch, n_head: n_head, seq_len: seq_len} = dims
+    rows = Nx.iota({batch, n_head, seq_len, seq_len}, axis: 2)
+    cols = Nx.iota({batch, n_head, seq_len, seq_len}, axis: 3)
+    mask = Nx.greater_equal(rows, cols)
+    neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), {batch, n_head, seq_len, seq_len})
+    Nx.select(mask, att, neg_inf)
   end
 
   @doc """

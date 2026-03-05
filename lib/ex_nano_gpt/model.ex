@@ -133,9 +133,10 @@ defmodule ExNanoGPT.Model do
     pos_emb = Embedding.position_embedding(params.wpe, seq_len: seq_len)
     x = tok_emb + pos_emb
 
-    x = maybe_dropout(x, key, dropout_rate)
+    {emb_drop_key, blocks_key} = split_key(key)
+    x = maybe_dropout(x, emb_drop_key, dropout_rate)
 
-    x = forward_blocks_train(x, params.blocks, key, n_head, dropout_rate)
+    x = forward_blocks_train(x, params.blocks, blocks_key, n_head, dropout_rate)
 
     x = LayerNorm.forward(x, params.ln_f)
 
@@ -153,15 +154,24 @@ defmodule ExNanoGPT.Model do
   end
 
   deftransform forward_blocks_train(x, blocks, key, n_head, dropout_rate) do
+    n_blocks = tuple_size(blocks)
+    block_keys = Nx.Random.split(key, parts: n_blocks)
+
     blocks
     |> Tuple.to_list()
-    |> Enum.reduce(x, fn block_params, acc ->
-      Block.forward(acc, block_params, key,
+    |> Enum.with_index()
+    |> Enum.reduce(x, fn {block_params, i}, acc ->
+      Block.forward(acc, block_params, block_keys[i],
         n_head: n_head,
         dropout_rate: dropout_rate,
         training: true
       )
     end)
+  end
+
+  defnp split_key(key) do
+    keys = Nx.Random.split(key)
+    {keys[0], keys[1]}
   end
 
   defn project_to_vocab(x, wte) do
@@ -170,6 +180,8 @@ defmodule ExNanoGPT.Model do
 
   @doc """
   Compute cross-entropy loss between logits and targets.
+
+  Targets with value -1 are ignored (matching PyTorch's `ignore_index=-1`).
 
   ## Inputs
     * `logits` - model output, shape `{batch, seq_len, vocab_size}`
@@ -185,7 +197,13 @@ defmodule ExNanoGPT.Model do
 
     log_probs = log_softmax(flat_logits)
     nll = gather_log_probs(log_probs, flat_targets)
-    -Nx.mean(nll)
+
+    # Mask out positions where target == -1 (ignore_index)
+    valid_mask = Nx.not_equal(flat_targets, -1)
+    nll = nll * valid_mask
+    n_valid = Nx.max(Nx.sum(valid_mask), 1)
+
+    -Nx.sum(nll) / n_valid
   end
 
   defnp log_softmax(logits) do

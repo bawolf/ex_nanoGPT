@@ -8,7 +8,7 @@ defmodule ExNanoGPT.Trainer do
   - Cosine LR schedule with warmup
   - Gradient clipping by global norm
   - Periodic evaluation on train/val sets
-  - Checkpoint saving/loading
+  - Checkpoint saving/loading (only when val loss improves)
   """
 
   alias ExNanoGPT.{Batch, Data, Model, Optimizer}
@@ -24,6 +24,7 @@ defmodule ExNanoGPT.Trainer do
           batch_size: pos_integer(),
           block_size: pos_integer(),
           gradient_accumulation_steps: pos_integer(),
+          always_save_checkpoint: boolean(),
           out_dir: String.t()
         }
 
@@ -35,6 +36,7 @@ defmodule ExNanoGPT.Trainer do
     batch_size: 64,
     block_size: 256,
     gradient_accumulation_steps: 1,
+    always_save_checkpoint: true,
     out_dir: "out"
   }
 
@@ -64,33 +66,47 @@ defmodule ExNanoGPT.Trainer do
     IO.puts("  gradient accumulation steps: #{train_config.gradient_accumulation_steps}")
     IO.puts("  effective batch size: #{train_config.batch_size * train_config.gradient_accumulation_steps}")
 
-    {final_params, _final_opt_state} =
-      Enum.reduce(0..(train_config.max_iters - 1), {params, opt_state}, fn iter, {params, opt_state} ->
-        if rem(iter, train_config.eval_interval) == 0 do
-          train_loss = estimate_loss(params, model_config, train_data, train_config)
-          val_loss = estimate_loss(params, model_config, val_data, train_config)
-          IO.puts("step #{iter}: train loss #{Float.round(train_loss, 4)}, val loss #{Float.round(val_loss, 4)}")
-          save_checkpoint(params, opt_state, model_config, iter, train_config.out_dir)
-        end
+    best_val_loss = :infinity
 
-        # Gradient accumulation: run N micro-steps, average the gradients
-        grads = accumulate_gradients(params, train_data, model_config, train_config, iter)
+    # nanoGPT: while True ... if iter_num > max_iters: break
+    # iter_num goes 0..max_iters inclusive = max_iters+1 steps
+    {final_params, _final_opt_state, _best_val_loss} =
+      Enum.reduce(0..train_config.max_iters, {params, opt_state, best_val_loss}, fn iter, {params, opt_state, best_val_loss} ->
+        # Evaluate and checkpoint
+        {best_val_loss} =
+          if rem(iter, train_config.eval_interval) == 0 do
+            train_loss = estimate_loss(params, model_config, train_data, train_config)
+            val_loss = estimate_loss(params, model_config, val_data, train_config)
+            IO.puts("step #{iter}: train loss #{Float.round(train_loss, 4)}, val loss #{Float.round(val_loss, 4)}")
 
+            if val_loss < best_val_loss or train_config.always_save_checkpoint do
+              new_best = min(val_loss, best_val_loss)
+              if iter > 0 do
+                save_checkpoint(params, opt_state, model_config, iter, best_val_loss, train_config.out_dir)
+                IO.puts("saving checkpoint to #{train_config.out_dir}")
+              end
+              {new_best}
+            else
+              {best_val_loss}
+            end
+          else
+            {best_val_loss}
+          end
+
+        # Gradient accumulation
+        {grads, last_micro_loss} =
+          accumulate_gradients(params, train_data, model_config, train_config, iter)
+
+        # Log using the last micro-step loss, scaled up (matches nanoGPT's approximation)
         if rem(iter, train_config.log_interval) == 0 do
           lr = Optimizer.get_lr(elem(opt_state, 0), optim_config)
-          loss = compute_loss(params, train_data, model_config, train_config, iter)
-          IO.puts("  iter #{iter}: loss #{Float.round(Nx.to_number(loss), 4)}, lr #{Float.round(lr, 8)}")
+          lossf = Nx.to_number(last_micro_loss) * train_config.gradient_accumulation_steps
+          IO.puts("  iter #{iter}: loss #{Float.round(lossf, 4)}, lr #{Float.round(lr, 8)}")
         end
 
         {new_params, new_opt_state} = Optimizer.step(params, grads, opt_state, optim_config)
-        {new_params, new_opt_state}
+        {new_params, new_opt_state, best_val_loss}
       end)
-
-    train_loss = estimate_loss(final_params, model_config, train_data, train_config)
-    val_loss = estimate_loss(final_params, model_config, val_data, train_config)
-    IO.puts("Final: train loss #{Float.round(train_loss, 4)}, val loss #{Float.round(val_loss, 4)}")
-
-    save_checkpoint(final_params, nil, model_config, train_config.max_iters, train_config.out_dir)
 
     final_params
   end
@@ -98,18 +114,17 @@ defmodule ExNanoGPT.Trainer do
   @doc """
   Accumulate gradients over multiple micro-batches, then average.
 
-  Matches nanoGPT's gradient accumulation loop:
-  each micro-step computes gradients on a small batch, and they're
-  averaged together before the optimizer step. This simulates a larger
-  effective batch size without requiring more memory.
+  Each micro-step computes loss / gradient_accumulation_steps (scaling
+  before backward, matching nanoGPT). Returns the averaged gradients
+  and the last micro-step's (scaled) loss for logging.
   """
-  @spec accumulate_gradients(Model.params(), Nx.Tensor.t(), Model.config(), train_config(), non_neg_integer()) :: map()
+  @spec accumulate_gradients(Model.params(), Nx.Tensor.t(), Model.config(), train_config(), non_neg_integer()) ::
+          {map(), Nx.Tensor.t()}
   def accumulate_gradients(params, data, model_config, train_config, iter) do
     accum_steps = train_config.gradient_accumulation_steps
 
-    # Run N micro-steps, accumulating gradients
-    accumulated =
-      Enum.reduce(0..(accum_steps - 1), nil, fn micro_step, acc_grads ->
+    {accumulated, last_loss} =
+      Enum.reduce(0..(accum_steps - 1), {nil, nil}, fn micro_step, {acc_grads, _last_loss} ->
         seed = iter * accum_steps + micro_step
         batch_key = Nx.Random.key(seed)
         {x, y} = Batch.get_batch(data, batch_key,
@@ -118,21 +133,29 @@ defmodule ExNanoGPT.Trainer do
         )
 
         dropout_key = Nx.Random.key(seed + 1_000_000)
-        {_loss, grads} = compute_loss_and_grads(params, x, y, model_config, dropout_key)
+        {loss, grads} = compute_loss_and_grads(params, x, y, model_config, dropout_key)
 
-        if acc_grads == nil do
-          grads
-        else
-          add_grads(acc_grads, grads)
-        end
+        # Scale loss and grads by 1/accum_steps (matches nanoGPT's loss = loss / grad_accum)
+        grads =
+          if accum_steps > 1 do
+            scale_grads(grads, 1.0 / accum_steps)
+          else
+            grads
+          end
+
+        scaled_loss = if accum_steps > 1, do: Nx.divide(loss, accum_steps), else: loss
+
+        acc_grads =
+          if acc_grads == nil do
+            grads
+          else
+            add_grads(acc_grads, grads)
+          end
+
+        {acc_grads, scaled_loss}
       end)
 
-    # Average by dividing by accumulation steps
-    if accum_steps > 1 do
-      scale_grads(accumulated, 1.0 / accum_steps)
-    else
-      accumulated
-    end
+    {accumulated, last_loss}
   end
 
   @doc """
@@ -160,22 +183,6 @@ defmodule ExNanoGPT.Trainer do
   end
 
   @doc """
-  Compute loss only (no gradients), for logging.
-  """
-  @spec compute_loss(Model.params(), Nx.Tensor.t(), Model.config(), train_config(), non_neg_integer()) :: Nx.Tensor.t()
-  def compute_loss(params, data, model_config, train_config, iter) do
-    batch_key = Nx.Random.key(iter)
-    {x, y} = Batch.get_batch(data, batch_key,
-      batch_size: train_config.batch_size,
-      block_size: train_config.block_size
-    )
-
-    logits = Model.forward_train(x, params, Nx.Random.key(0),
-      n_head: model_config.n_head, dropout_rate: 0.0)
-    Model.cross_entropy_loss(logits, y)
-  end
-
-  @doc """
   Estimate loss over multiple batches (for evaluation).
   """
   @spec estimate_loss(Model.params(), Model.config(), Nx.Tensor.t(), train_config()) :: float()
@@ -200,13 +207,14 @@ defmodule ExNanoGPT.Trainer do
   @doc """
   Save a checkpoint to disk as Erlang Term Format.
   """
-  @spec save_checkpoint(Model.params(), term(), Model.config(), non_neg_integer(), String.t()) :: :ok
-  def save_checkpoint(params, opt_state, model_config, iter, out_dir) do
+  @spec save_checkpoint(Model.params(), term(), Model.config(), non_neg_integer(), float(), String.t()) :: :ok
+  def save_checkpoint(params, opt_state, model_config, iter, best_val_loss, out_dir) do
     checkpoint = %{
       params: params,
       optimizer_state: opt_state,
       model_config: model_config,
-      iter: iter
+      iter: iter,
+      best_val_loss: best_val_loss
     }
 
     path = Path.join(out_dir, "ckpt.etf")

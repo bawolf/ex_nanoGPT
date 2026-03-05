@@ -77,12 +77,13 @@ defmodule ExNanoGPT.TrainerTest do
     dir = Path.join(System.tmp_dir!(), "ex_nano_gpt_test_#{:rand.uniform(100_000)}")
     File.mkdir_p!(dir)
 
-    Trainer.save_checkpoint(params, nil, @model_config, 0, dir)
+    Trainer.save_checkpoint(params, nil, @model_config, 0, :infinity, dir)
     loaded = Trainer.load_checkpoint(dir)
 
     assert Nx.to_number(Nx.sum(Nx.subtract(loaded.params.wte, params.wte))) == 0.0
     assert loaded.model_config == @model_config
     assert loaded.iter == 0
+    assert loaded.best_val_loss == :infinity
 
     File.rm_rf!(dir)
   end

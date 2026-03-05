@@ -32,7 +32,9 @@ defmodule ExNanoGPT.Batch do
     block_size = opts[:block_size]
 
     data_len = Nx.axis_size(data, 0)
-    max_start = data_len - block_size - 1
+    # torch.randint(len(data) - block_size, ...) gives [0, len-block_size)
+    # Nx.Random.randint upper bound is exclusive, same as torch.randint
+    max_start = data_len - block_size
 
     {starts, _new_key} = Nx.Random.randint(key, 0, max_start, shape: {batch_size})
 

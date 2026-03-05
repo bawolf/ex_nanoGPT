@@ -69,18 +69,23 @@ defmodule ExNanoGPT.Block do
   Tensor of shape `{batch, seq_len, n_embd}`.
   """
   defn forward(x, params, key, opts \\ []) do
-    # x = x + attn(ln_1(x))
+    {attn_key, mlp_key} = split_key(key)
+
     residual = x
     x = LayerNorm.forward(x, params.ln_1)
-    x = Attention.forward(x, params.attn, key, opts)
+    x = Attention.forward(x, params.attn, attn_key, opts)
     x = residual + x
 
-    # x = x + mlp(ln_2(x))
     residual = x
     x = LayerNorm.forward(x, params.ln_2)
-    x = MLP.forward(x, params.mlp, key, opts)
+    x = MLP.forward(x, params.mlp, mlp_key, opts)
     x = residual + x
 
     x
+  end
+
+  defnp split_key(key) do
+    keys = Nx.Random.split(key)
+    {keys[0], keys[1]}
   end
 end
