@@ -258,12 +258,60 @@ def extract_block():
     save("block_output", out)
 
 
+def extract_gpt():
+    """Extract full GPT model reference values."""
+    print("\n=== GPT ===")
+
+    sys.path.insert(0, os.path.join(OUT_DIR, '..', '..', 'nanoGPT_ref'))
+    from model import GPT, GPTConfig
+
+    config = GPTConfig(
+        block_size=16,
+        vocab_size=65,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        dropout=0.0,
+        bias=True,
+    )
+
+    torch.manual_seed(42)
+    model = GPT(config)
+    model.eval()
+
+    # Save all parameters
+    sd = model.state_dict()
+    for name, param in sd.items():
+        clean_name = name.replace('.', '_')
+        save(f"gpt_param_{clean_name}", param)
+
+    # Test input
+    idx = torch.tensor([[1, 5, 10, 20, 30, 15, 8, 3],
+                         [60, 2, 45, 12, 7, 55, 33, 0]], dtype=torch.long)
+    save("gpt_input", idx)
+
+    # Forward pass (no targets = inference mode)
+    with torch.no_grad():
+        logits, loss = model(idx)
+    save("gpt_logits_inference", logits)
+
+    # Forward pass with targets (training mode)
+    targets = torch.tensor([[5, 10, 20, 30, 15, 8, 3, 42],
+                             [2, 45, 12, 7, 55, 33, 0, 11]], dtype=torch.long)
+    save("gpt_targets", targets)
+
+    with torch.no_grad():
+        logits, loss = model(idx, targets)
+    save("gpt_logits_training", logits)
+    save("gpt_loss", torch.tensor([loss.item()]))
+
+
 if __name__ == "__main__":
-    import sys
     print("Extracting golden test values...")
     extract_layer_norm()
     extract_embeddings()
     extract_attention()
     extract_mlp()
     extract_block()
+    extract_gpt()
     print("\nDone! Golden test files saved to:", OUT_DIR)
