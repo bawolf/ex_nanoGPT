@@ -1,0 +1,30 @@
+/_build/
+/deps/
+/cover/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+ex_nano_gpt-*.tar
+
+# Data files
+/data/*.bin
+/data/*.txt
+/data/*.pkl
+
+# Checkpoints
+/checkpoints/
+*.ckpt
+
+# Golden test artifacts (regenerated from Python)
+/test/golden/*.npy
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.elixir_ls/
+.vscode/
