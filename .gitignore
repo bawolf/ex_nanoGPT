@@ -30,3 +30,4 @@ __pycache__/
 # IDE
 .elixir_ls/
 .vscode/
+test/support/golden_v2/
