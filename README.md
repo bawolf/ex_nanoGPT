@@ -1,14 +1,20 @@
 # ExNanoGPT
 
-An Elixir/Nx port of [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) -- the simplest, most readable implementation of a GPT language model, rewritten in Elixir using [Nx](https://github.com/elixir-nx/nx).
+An Elixir/Nx port of Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat) -- the simplest, most readable implementation of a GPT language model, rewritten in Elixir using [Nx](https://github.com/elixir-nx/nx).
 
-Every matrix multiply, every attention head, every gradient update is explicit Nx code. No magic libraries -- the AdamW optimizer, training loop, and sampler are all built from scratch.
+Every matrix multiply, every attention head, every gradient update is explicit Nx code. No magic libraries -- the AdamW optimizer, BPE tokenizer, training loop, and sampler are all built from scratch.
+
+**Two model versions:**
+- **v1 (nanoGPT)**: Character-level GPT-2 architecture with learned position embeddings, LayerNorm, GELU
+- **v2 (nanochat)**: Modern architecture with RoPE, RMSNorm, GQA, ReLU², KV cache, BPE tokenizer, SFT, and Phoenix LiveView chat UI
 
 **Trains on Apple Silicon GPU** via [EMLX](https://github.com/elixir-nx/emlx) (Metal), or on NVIDIA GPU via [EXLA](https://github.com/elixir-nx/nx/tree/main/exla) (CUDA).
 
 ## Learn by Building
 
-This repo includes **11 interactive Livebook notebooks** where you rebuild each component yourself, with exercises, solutions, and verification against the reference implementation.
+This repo includes **18 interactive Livebook notebooks** where you rebuild each component yourself, with exercises, visualizations, "Break It" experiments, and verification against the reference implementation.
+
+**Part 1: nanoGPT (v1) -- Character-level GPT**
 
 | # | Notebook | What you build |
 |---|----------|---------------|
@@ -23,6 +29,18 @@ This repo includes **11 interactive Livebook notebooks** where you rebuild each 
 | 08 | [AdamW Optimizer](notebooks/08_adamw_optimizer.livemd) | Moments, bias correction, LR schedule |
 | 09 | [Training Loop](notebooks/09_training_loop.livemd) | value_and_grad, gradient accumulation |
 | 10 | [Sampling & Generation](notebooks/10_sampling.livemd) | Temperature, top-k, autoregressive loop |
+
+**Part 2: nanochat (v2) -- Modern Chat Model**
+
+| # | Notebook | What you build |
+|---|----------|---------------|
+| 11 | [RoPE & RMSNorm](notebooks/11_rope_and_rmsnorm.livemd) | Rotary embeddings, RMS normalization |
+| 12 | [Modern Attention](notebooks/12_modern_attention.livemd) | GQA, QK norm, sliding window |
+| 13 | [Modern Transformer](notebooks/13_modern_transformer.livemd) | ReLU², softcapping, residual scaling |
+| 14 | [BPE Tokenization](notebooks/14_bpe_tokenization.livemd) | Byte-pair encoding from scratch |
+| 15 | [KV Cache](notebooks/15_kv_cache.livemd) | Cached inference, O(n) generation |
+| 16 | [Conversation & SFT](notebooks/16_conversation_and_sft.livemd) | Chat format, loss masking, fine-tuning |
+| 17 | [Serving with LiveView](notebooks/17_serving_with_liveview.livemd) | Phoenix chat UI, streaming generation |
 
 ### Getting Started with Livebook
 
@@ -68,12 +86,28 @@ lib/ex_nano_gpt/
   optimizer.ex         # AdamW with cosine LR schedule, gradient clipping
   trainer.ex           # Training loop, gradient accumulation, checkpointing
   sampler.ex           # Text generation (temperature, top-k, Gumbel-max)
+  npy.ex               # NumPy .npy file reader (for weight loading)
 
-notebooks/             # 11 interactive Livebook lessons
+  v2/                  # nanochat-style modern architecture
+    model.ex           # Compact single-file model (~300 lines)
+    kv_cache.ex        # KV cache for fast inference
+    tokenizer.ex       # BPE tokenizer (train, encode, decode)
+    weight_loader.ex   # Load nanochat PyTorch checkpoints
+    conversation.ex    # Conversation rendering + SFT loss masking
+
+lib/ex_nano_gpt_web/   # Phoenix LiveView chat UI
+  endpoint.ex          # HTTP endpoint
+  router.ex            # Routes
+  layouts.ex           # HTML root layout
+  live/chat_live.ex    # Chat interface with streaming generation
+
+notebooks/             # 18 interactive Livebook lessons (11 v1 + 7 v2)
 scripts/
-  train.exs            # Training script (--smoke for quick test)
-  bench_step.exs       # Benchmark a single training step
-test/                  # Unit tests + golden tests vs Python nanoGPT
+  train.exs            # v1 training script
+  cloud_train.exs      # v2 cloud training with cost estimates
+  convert_checkpoint.py # PyTorch -> .npy checkpoint converter
+  golden_v2/           # Python scripts for golden test generation
+test/                  # 91 tests (unit + golden tests vs Python)
 ```
 
 ## Quick Start
@@ -82,7 +116,7 @@ test/                  # Unit tests + golden tests vs Python nanoGPT
 # Install dependencies
 mix deps.get
 
-# Run tests (55 tests including golden tests against Python nanoGPT)
+# Run tests (91 tests including golden tests against Python nanoGPT + nanochat)
 mix test
 
 # Smoke test: train a tiny model for 10 steps
@@ -123,6 +157,53 @@ NX_BACKEND=exla mix run scripts/train.exs
 
 EMLX is ~2x faster on Mac. On Linux with CUDA, EXLA will be much faster (seconds per step).
 
+## v2: nanochat Modern Architecture
+
+The `v2/` modules implement the modern transformer architecture from [nanochat](https://github.com/karpathy/nanochat):
+
+- **RoPE** instead of learned position embeddings (no block_size limit)
+- **RMSNorm** instead of LayerNorm (no learnable params, faster)
+- **GQA** (grouped-query attention) with separate Q/K/V projections
+- **QK normalization** for training stability
+- **Sliding window attention** (per-layer window sizes)
+- **ReLU²** activation (sparser than GELU)
+- **Value embeddings** on alternating layers
+- **Per-layer residual scaling** (resid_lambda, x0_lambda)
+- **Logit softcapping** (prevents extreme confidence)
+- **BPE tokenizer** built from scratch
+- **KV cache** for O(n) autoregressive generation
+- **SFT support** with conversation rendering and loss masking
+
+### Chat UI
+
+A Phoenix LiveView streaming chat interface is included:
+
+```bash
+# Start the chat server
+iex -S mix phx.server
+# Open http://localhost:4000
+```
+
+### Loading Pre-trained Weights
+
+To load a nanochat checkpoint:
+
+```bash
+# 1. Convert PyTorch checkpoint to .npy files
+python scripts/convert_checkpoint.py path/to/checkpoint.pt converted_weights/
+
+# 2. Load in Elixir
+{params, config} = ExNanoGPT.V2.WeightLoader.load("converted_weights/")
+logits = ExNanoGPT.V2.Model.forward(token_ids, params, config)
+```
+
+### Cloud Training
+
+See `scripts/cloud_train.exs` for a complete training script with:
+- Cost estimates: ~$56-74 for 10B tokens depending on GPU
+- Quick test: ~$0.55 for 100M tokens on A100
+- Supported providers: Lambda Labs, RunPod, Vast.ai, Modal
+
 ## Known Limitations
 
 ### EMLX Metal sort kernel
@@ -161,5 +242,5 @@ Even with EMLX GPU, ~55s/step means ~3 days for the full 5000 iterations. This i
 
 ## Acknowledgements
 
-- [Andrej Karpathy](https://github.com/karpathy) for nanoGPT
+- [Andrej Karpathy](https://github.com/karpathy) for [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat)
 - [Elixir Nx team](https://github.com/elixir-nx) for Nx, EXLA, and EMLX
