@@ -1,0 +1,507 @@
+# 13: Assembling the Modern Transformer
+
+```elixir
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+backend = System.get_env("NX_BACKEND", "emlx")
+
+case backend do
+  "exla" ->
+    Nx.global_default_backend(EXLA.Backend)
+    Nx.Defn.global_default_options(compiler: EXLA)
+    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
+
+  "emlx_cpu" ->
+    Nx.global_default_backend({EMLX.Backend, device: :cpu})
+    Nx.Defn.global_default_options(compiler: EMLX)
+    IO.puts("Backend: EMLX (CPU)")
+
+  _ ->
+    Nx.global_default_backend({EMLX.Backend, device: :gpu})
+    Nx.Defn.global_default_options(compiler: EMLX)
+    IO.puts("Backend: EMLX (Apple Metal GPU)")
+end
+
+alias VegaLite, as: Vl
+```
+
+## The Full v2 Architecture
+
+We've built all the pieces in the previous two notebooks. Now we assemble them into a complete modern transformer and compare it with v1.
+
+The v2 model (nanochat) has several additional features beyond RoPE, RMSNorm, GQA, QK norm, and sliding windows:
+
+| Feature | Purpose |
+|---------|---------|
+| **ReLU² activation** | Sparser MLP activations → better feature selection |
+| **Value embeddings** | Alternate layers add learned token-level signals to V |
+| **Per-layer residual scaling** | `resid_lambda · x + x0_lambda · x0` controls information flow |
+| **Logit softcapping** | `softcap · tanh(logits/softcap)` prevents extreme confidence |
+| **Untied embeddings** | Separate input embedding and output head weights |
+
+## Math Notation
+
+New symbols for this notebook:
+
+| Symbol | Meaning | Nx code |
+|--------|---------|---------|
+| `ReLU²(x)` | `max(0, x)²` — squared ReLU | `Nx.multiply(Nx.max(x, 0), Nx.max(x, 0))` |
+| `λ_r` | Residual lambda — scales the running hidden state | `resid_lambdas[i]` |
+| `λ_0` | x0 lambda — scales the initial embedding skip | `x0_lambdas[i]` |
+| `softcap(x)` | `c · tanh(x/c)` — bounds output to `[-c, c]` | `softcap * Nx.tanh(x / softcap)` |
+| `W_E` | Input token embedding | `wte` |
+| `W_H` | Output lm_head (untied from W_E) | `lm_head` |
+
+**Full running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, Q/K/V, d_k, softmax, RMS(x), θᵢ, R(θ), n_h, n_kv, λ_r, λ_0, ReLU², softcap
+
+## ReLU² Activation
+
+### Why squared?
+
+In v1, the MLP uses GELU — a smooth approximation of ReLU. The v2 model uses **ReLU²**: apply ReLU, then square the result.
+
+Why square? It enforces **sparsity**. ReLU already zeros out negative values. Squaring amplifies large activations and further shrinks small ones. This means fewer neurons fire strongly, making the representation more sparse and interpretable.
+
+```elixir
+x_range = Nx.linspace(-3.0, 3.0, n: 200)
+
+# ReLU
+relu_vals = Nx.max(x_range, 0.0)
+
+# ReLU²
+relu_sq_vals = Nx.multiply(Nx.max(x_range, 0.0), Nx.max(x_range, 0.0))
+
+# GELU (for comparison)
+gelu_vals = Nx.multiply(x_range, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(x_range, Nx.sqrt(Nx.tensor(2.0)))))))
+
+x_list = Nx.to_flat_list(x_range)
+
+chart_data =
+  Enum.zip([x_list, Nx.to_flat_list(relu_vals), Nx.to_flat_list(relu_sq_vals), Nx.to_flat_list(gelu_vals)])
+  |> Enum.flat_map(fn {x, relu, relu2, gelu} ->
+    [
+      %{"x" => Float.round(x, 3), "y" => Float.round(relu, 4), "activation" => "ReLU"},
+      %{"x" => Float.round(x, 3), "y" => Float.round(relu2, 4), "activation" => "ReLU²"},
+      %{"x" => Float.round(x, 3), "y" => Float.round(gelu, 4), "activation" => "GELU (v1)"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "Activation Functions: GELU (v1) vs ReLU² (v2)")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Input")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "Output")
+|> Vl.encode_field(:color, "activation", type: :nominal)
+```
+
+### Sparsity comparison
+
+Let's see how many neurons are "active" (> some threshold) after each activation:
+
+```elixir
+key = Nx.Random.key(42)
+{activations, _} = Nx.Random.normal(key, 0.0, 1.0, shape: {1000})
+
+relu_out = Nx.max(activations, 0.0)
+relu2_out = Nx.multiply(relu_out, relu_out)
+gelu_out = Nx.multiply(activations, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(activations, Nx.sqrt(Nx.tensor(2.0)))))))
+
+threshold = 0.1
+
+relu_active = Nx.sum(Nx.greater(Nx.abs(relu_out), threshold)) |> Nx.to_number()
+relu2_active = Nx.sum(Nx.greater(Nx.abs(relu2_out), threshold)) |> Nx.to_number()
+gelu_active = Nx.sum(Nx.greater(Nx.abs(gelu_out), threshold)) |> Nx.to_number()
+
+IO.puts("Neurons with |output| > #{threshold} (out of 1000):")
+IO.puts("  GELU:  #{gelu_active} (#{Float.round(gelu_active / 10, 1)}%)")
+IO.puts("  ReLU:  #{relu_active} (#{Float.round(relu_active / 10, 1)}%)")
+IO.puts("  ReLU²: #{relu2_active} (#{Float.round(relu2_active / 10, 1)}%)")
+IO.puts("\nReLU² produces the sparsest activations — fewer but more decisive features.")
+```
+
+## Value Embeddings
+
+In the v2 model, **alternating layers** can add learned "value embeddings" directly to the V tensor. This provides an additional pathway for token identity information to flow into attention — bypassing the main residual stream.
+
+The value embedding for a token is looked up from a learned table (like the input embedding), gated by a small projection from the hidden state, then added to V.
+
+```elixir
+config = ExNanoGPT.V2.Model.tiny_config()
+
+for i <- 0..(config.n_layer - 1) do
+  has_ve = ExNanoGPT.V2.Model.has_ve?(i, config.n_layer)
+  IO.puts("Layer #{i}: value embeddings = #{if has_ve, do: "YES", else: "no"}")
+end
+
+IO.puts("\nGate channels: #{ExNanoGPT.V2.Model.ve_gate_channels()}")
+IO.puts("The gate uses a small slice of the hidden state to control how much VE signal to add.")
+```
+
+## Per-Layer Residual Scaling
+
+In v1, the residual connection is simple: `x = x + block(x)`. In v2, each layer first scales the residual stream and adds a scaled skip connection from the **initial** embedding:
+
+`x = λ_r · x + λ_0 · x₀`
+
+where x₀ is the output of the initial embedding + RMSNorm. This gives the model fine-grained control over how much of the original signal versus the transformed signal to keep at each layer.
+
+```elixir
+n_layers = 6
+
+resid_lambdas = Nx.broadcast(Nx.tensor(1.0, type: :f32), {n_layers})
+x0_lambdas = Nx.broadcast(Nx.tensor(0.1, type: :f32), {n_layers})
+
+IO.puts("Per-layer scaling factors:")
+IO.puts("  resid_lambda (scale running state): #{inspect(Nx.to_flat_list(resid_lambdas))}")
+IO.puts("  x0_lambda (scale initial embedding): #{inspect(Nx.to_flat_list(x0_lambdas))}")
+IO.puts("")
+IO.puts("At each layer: x = #{Nx.to_number(resid_lambdas[0])} · x + #{Nx.to_number(x0_lambdas[0])} · x₀")
+IO.puts("The x₀ skip connection prevents the initial signal from being completely overwritten.")
+```
+
+## Logit Softcapping
+
+### The Problem: Extreme Confidence
+
+Without any constraint, logits can grow arbitrarily large during training. A logit of 100 for one token and -100 for others means the model is 100% confident — leaving no room to learn from mistakes. The gradients become negligibly small.
+
+### The Solution: softcap · tanh(logits / softcap)
+
+Logit softcapping smoothly bounds the logits to the range `[-softcap, +softcap]`. For the v2 model, `softcap = 20.0`.
+
+The tanh function compresses values: inputs near zero pass through almost unchanged, but large inputs are squashed toward ±1. Multiplying by the softcap scales this to ±softcap.
+
+```elixir
+softcap = 20.0
+logit_range = Nx.linspace(-50.0, 50.0, n: 300)
+
+identity_vals = Nx.to_flat_list(logit_range)
+capped_vals = Nx.to_flat_list(Nx.multiply(softcap, Nx.tanh(Nx.divide(logit_range, softcap))))
+
+chart_data =
+  Enum.zip(identity_vals, capped_vals)
+  |> Enum.flat_map(fn {raw, capped} ->
+    [
+      %{"logit" => Float.round(raw, 2), "output" => Float.round(raw, 2), "function" => "Identity (no cap)"},
+      %{"logit" => Float.round(raw, 2), "output" => Float.round(capped, 4), "function" => "Softcap (c=20)"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "Logit Softcapping: Identity vs softcap·tanh(x/softcap)")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "logit", type: :quantitative, title: "Raw logit")
+|> Vl.encode_field(:y, "output", type: :quantitative, title: "Output")
+|> Vl.encode_field(:color, "function", type: :nominal)
+```
+
+### Key Property: Near-Identity for Small Values
+
+For logits much smaller than the softcap, the function is approximately identity. Only extreme values get compressed.
+
+```elixir
+for val <- [-5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0] do
+  capped = softcap * :math.tanh(val / softcap)
+  diff = abs(val - capped)
+  IO.puts("logit=#{String.pad_leading(Float.to_string(val), 6)} → capped=#{String.pad_leading(Float.to_string(Float.round(capped, 3)), 8)}  diff=#{Float.round(diff, 4)}")
+end
+```
+
+### Verify Against the v2 Model
+
+```elixir
+test_logits = Nx.tensor([[-30.0, -5.0, 0.0, 5.0, 30.0]])
+
+reference = ExNanoGPT.V2.Model.softcap_logits(test_logits)
+ours = Nx.multiply(20.0, Nx.tanh(Nx.divide(test_logits, 20.0)))
+
+diff = Nx.subtract(ours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+IO.inspect(Nx.to_flat_list(reference) |> Enum.map(&Float.round(&1, 4)), label: "softcapped logits")
+```
+
+## Full Forward Pass
+
+Let's walk through the complete v2 forward pass step by step, then run it end to end.
+
+### Architecture Walkthrough
+
+```
+Input token IDs: {batch, seq_len}
+        │
+        ▼
+   Token Embedding (wte)         ← {vocab_size, n_embd}
+        │
+        ▼
+   RMSNorm (embed)
+        │
+        ├─── save as x₀ (for skip connections)
+        │
+        ▼
+  ┌─────────────── Layer i ───────────────┐
+  │  x = λ_r · x + λ_0 · x₀             │  ← per-layer scaling
+  │  x_norm = RMSNorm(x)                  │
+  │  Q = x_norm · W_Q        (n_head)     │
+  │  K = x_norm · W_K        (n_kv_head)  │
+  │  V = x_norm · W_V + VE   (n_kv_head)  │  ← value embeddings on alt layers
+  │  Q, K = RoPE(Q, K)                    │
+  │  Q, K = RMSNorm(Q), RMSNorm(K)        │  ← QK normalization
+  │  K, V = expand_heads(K, V)             │  ← GQA head expansion
+  │  attn = softmax(Q·Kᵀ/√d + mask)·V    │  ← sliding window mask
+  │  x = x + attn · W_proj                │
+  │  x = x + ReLU²(RMSNorm(x)·W_fc)·W_p  │
+  └────────────────────────────────────────┘
+        │                    × n_layer
+        ▼
+   RMSNorm (final)
+        │
+        ▼
+   Linear (lm_head)              ← {vocab_size, n_embd}, untied from wte
+        │
+        ▼
+   Softcap: 20·tanh(logits/20)
+        │
+        ▼
+   Output logits: {batch, seq_len, vocab_size}
+```
+
+### Initialize and Run
+
+```elixir
+config = ExNanoGPT.V2.Model.tiny_config()
+
+IO.puts("v2 Model Config:")
+IO.puts("  sequence_len: #{config.sequence_len}")
+IO.puts("  vocab_size:   #{config.vocab_size}")
+IO.puts("  n_layer:      #{config.n_layer}")
+IO.puts("  n_head:       #{config.n_head}")
+IO.puts("  n_kv_head:    #{config.n_kv_head}")
+IO.puts("  n_embd:       #{config.n_embd}")
+IO.puts("  window_pattern: #{config.window_pattern}")
+```
+
+```elixir
+key = Nx.Random.key(1337)
+params = ExNanoGPT.V2.Model.init_params(config, key)
+
+IO.puts("Parameter shapes:")
+IO.inspect(Nx.shape(params.wte), label: "  wte (token embedding)")
+IO.inspect(Nx.shape(params.lm_head), label: "  lm_head (output head, UNTIED)")
+IO.inspect(Nx.shape(params.resid_lambdas), label: "  resid_lambdas")
+IO.inspect(Nx.shape(params.x0_lambdas), label: "  x0_lambdas")
+
+block0 = elem(params.blocks, 0)
+IO.puts("\nBlock 0 shapes:")
+IO.inspect(Nx.shape(block0.c_q), label: "  c_q")
+IO.inspect(Nx.shape(block0.c_k), label: "  c_k")
+IO.inspect(Nx.shape(block0.c_v), label: "  c_v")
+IO.inspect(Nx.shape(block0.c_proj), label: "  c_proj")
+IO.inspect(Nx.shape(block0.c_fc), label: "  c_fc")
+IO.inspect(Nx.shape(block0.c_proj_mlp), label: "  c_proj_mlp")
+IO.inspect(Nx.shape(block0.ve_gate), label: "  ve_gate")
+```
+
+```elixir
+# Run a forward pass with random input
+batch = 2
+seq_len = 16
+idx = Nx.tensor(Enum.map(1..batch, fn _ -> Enum.map(1..seq_len, fn _ -> :rand.uniform(config.vocab_size) - 1 end) end), type: :s32)
+
+IO.inspect(Nx.shape(idx), label: "input shape")
+
+logits = ExNanoGPT.V2.Model.forward(idx, params, config)
+
+IO.inspect(Nx.shape(logits), label: "output logits shape (should be {2, 16, 256})")
+IO.puts("\nLogit range: [#{Float.round(Nx.to_number(Nx.reduce_min(logits)), 4)}, #{Float.round(Nx.to_number(Nx.reduce_max(logits)), 4)}]")
+IO.puts("Softcap bound: [-20.0, 20.0]")
+IO.puts("All logits within softcap? #{Nx.to_number(Nx.reduce_max(Nx.abs(logits))) < 20.001}")
+```
+
+### Parameter Count Comparison
+
+```elixir
+v2_count = ExNanoGPT.V2.Model.count_params(params)
+
+# v1 equivalent config
+v1_config = %{
+  vocab_size: 65,
+  block_size: 256,
+  n_layer: 6,
+  n_head: 6,
+  n_embd: 384,
+  dropout: 0.0,
+  bias: true
+}
+
+v1_params = ExNanoGPT.Model.init_params(v1_config, Nx.Random.key(0))
+v1_count = ExNanoGPT.Model.count_params(v1_params, non_embedding: false)
+
+format_params = fn n ->
+  cond do
+    n >= 1_000_000 -> "#{Float.round(n / 1_000_000, 2)}M"
+    n >= 1_000 -> "#{Float.round(n / 1_000, 1)}K"
+    true -> "#{n}"
+  end
+end
+
+IO.puts("Parameter counts:")
+IO.puts("  v1 (nanoGPT):  #{format_params.(v1_count)} (vocab=#{v1_config.vocab_size}, d=#{v1_config.n_embd}, layers=#{v1_config.n_layer})")
+IO.puts("  v2 (nanochat):  #{format_params.(v2_count)} (vocab=#{config.vocab_size}, d=#{config.n_embd}, layers=#{config.n_layer})")
+```
+
+## Break It
+
+### Remove softcapping
+
+Without softcapping, logits can grow to any magnitude. With random weights this isn't dramatic, but during training the logits would grow unbounded.
+
+```elixir
+# Forward pass without softcapping — get the raw logits before capping
+x_test = Nx.take(params.wte, idx, axis: 0)
+x_test = ExNanoGPT.V2.Model.rms_norm(x_test)
+
+# Skip the transformer blocks — just project through lm_head to show the effect
+raw_logits = Nx.dot(x_test, [-1], params.lm_head, [1])
+capped_logits = ExNanoGPT.V2.Model.softcap_logits(raw_logits)
+
+IO.puts("Raw logit range:    [#{Float.round(Nx.to_number(Nx.reduce_min(raw_logits)), 2)}, #{Float.round(Nx.to_number(Nx.reduce_max(raw_logits)), 2)}]")
+IO.puts("Capped logit range: [#{Float.round(Nx.to_number(Nx.reduce_min(capped_logits)), 4)}, #{Float.round(Nx.to_number(Nx.reduce_max(capped_logits)), 4)}]")
+IO.puts("\nDuring training, raw logits would grow much larger.")
+IO.puts("Softcapping guarantees logits stay in [-20, 20], preventing overconfident predictions.")
+```
+
+### Set all resid_lambdas to 0
+
+If `resid_lambda = 0`, the running hidden state is completely discarded at each layer — only the skip from x₀ survives (scaled by x0_lambda).
+
+```elixir
+broken_params = %{params | resid_lambdas: Nx.broadcast(Nx.tensor(0.0, type: :f32), {config.n_layer})}
+
+logits_broken = ExNanoGPT.V2.Model.forward(idx, broken_params, config)
+
+IO.puts("Normal logit std:  #{Float.round(Nx.to_number(Nx.standard_deviation(logits)), 4)}")
+IO.puts("resid_λ=0 logit std: #{Float.round(Nx.to_number(Nx.standard_deviation(logits_broken)), 4)}")
+IO.puts("")
+IO.puts("With resid_lambda=0, the residual stream is zeroed out at each layer.")
+IO.puts("x = 0·x + 0.1·x₀ → the transformer blocks have no effect on subsequent layers.")
+IO.puts("Each block receives only a fraction of x₀, discarding all prior computation.")
+```
+
+### Remove x0 skip connection
+
+Without the x₀ skip, information from the initial embeddings can only survive through the residual stream. The model loses a direct shortcut to the original token representations.
+
+```elixir
+no_skip_params = %{params | x0_lambdas: Nx.broadcast(Nx.tensor(0.0, type: :f32), {config.n_layer})}
+
+logits_no_skip = ExNanoGPT.V2.Model.forward(idx, no_skip_params, config)
+
+IO.puts("Normal logit std:     #{Float.round(Nx.to_number(Nx.standard_deviation(logits)), 4)}")
+IO.puts("x0_lambda=0 logit std: #{Float.round(Nx.to_number(Nx.standard_deviation(logits_no_skip)), 4)}")
+IO.puts("")
+
+# Check how different the outputs are
+cosine_sim = fn a, b ->
+  a_flat = Nx.flatten(a)
+  b_flat = Nx.flatten(b)
+  dot = Nx.sum(Nx.multiply(a_flat, b_flat))
+  norm_a = Nx.sqrt(Nx.sum(Nx.multiply(a_flat, a_flat)))
+  norm_b = Nx.sqrt(Nx.sum(Nx.multiply(b_flat, b_flat)))
+  Nx.divide(dot, Nx.multiply(norm_a, norm_b)) |> Nx.to_number()
+end
+
+IO.puts("Cosine similarity (normal vs no-x0-skip): #{Float.round(cosine_sim.(logits, logits_no_skip), 4)}")
+IO.puts("The x₀ skip provides a stable gradient highway back to the embeddings.")
+IO.puts("Without it, deep layers may struggle to influence the embedding-level representation.")
+```
+
+## Architecture Comparison
+
+| Feature | v1 (nanoGPT / GPT-2) | v2 (nanochat / LLaMA-style) |
+|---------|----------------------|----------------------------|
+| **Normalization** | LayerNorm (learnable γ, β) | RMSNorm (no learnable params) |
+| **Position encoding** | Learned absolute embeddings | RoPE (rotary, relative) |
+| **Attention** | Multi-head (n_head = n_kv_head) | GQA (n_kv_head ≤ n_head) |
+| **QKV projection** | Single combined c_attn | Separate W_Q, W_K, W_V |
+| **QK normalization** | None | RMSNorm on Q and K |
+| **Attention mask** | Full causal | Sliding window (alternating) |
+| **MLP activation** | GELU | ReLU² |
+| **Bias** | Yes (in all linear layers) | No (nowhere) |
+| **Weight tying** | lm_head = wte^T | Untied (separate lm_head) |
+| **Residual connection** | x + block(x) | λ_r·x + λ_0·x₀ + block(x) |
+| **Value embeddings** | None | Alternating layers |
+| **Logit bounding** | None | Softcap: c·tanh(logits/c) |
+| **Dropout** | Yes | No |
+
+### Why These Changes?
+
+```elixir
+changes = [
+  {"LayerNorm → RMSNorm", "Simpler, faster, fewer params. Mean subtraction was unnecessary."},
+  {"Learned pos → RoPE", "Relative positions, can extrapolate to longer sequences."},
+  {"MHA → GQA", "Dramatically smaller KV cache for inference. Minimal quality loss."},
+  {"No QK norm → QK norm", "Stabilizes attention scores, especially early in training."},
+  {"Full causal → Sliding window", "O(T·w) instead of O(T²). Local layers + global layers."},
+  {"GELU → ReLU²", "Sparser activations, better feature selection, simpler."},
+  {"Bias everywhere → No bias", "Fewer params, RMSNorm handles the shift role."},
+  {"Weight tying → Untied", "More capacity in the output head. Worth the extra params."},
+  {"Simple residual → λ scaling", "Fine-grained control of information flow per layer."},
+  {"No VE → Value embeddings", "Extra token identity signal directly into attention."},
+  {"No softcap → Softcapping", "Prevents overconfident logits, stabilizes training."}
+]
+
+IO.puts("v1 → v2 Changes and Motivation:\n")
+for {change, reason} <- changes do
+  IO.puts("  #{change}")
+  IO.puts("    ↳ #{reason}\n")
+end
+```
+
+## Congratulations!
+
+You've now built every component of a modern transformer architecture from scratch:
+
+| Notebook | What you built |
+|----------|---------------|
+| **00–10** | Complete GPT-2 style transformer (v1) |
+| **11: RoPE & RMSNorm** | Modern normalization and position encoding |
+| **12: Modern Attention** | GQA, QK normalization, sliding window attention |
+| **13: Modern Transformer** | ReLU², value embeddings, residual scaling, softcapping |
+
+The full symbol table you've learned:
+
+| Notebook | Symbols |
+|----------|---------|
+| 00 | Σ (sum), xᵢ (indexing) |
+| 01 | W ∈ ℝ^{m×n} (matrix shape), W[i] (row lookup) |
+| 02 | μ (mean), σ² (variance), ε (epsilon), γ/β (learnable scale/shift) |
+| 03 | Q, K, V (projections), d_k (head dim), softmax, ^T (transpose) |
+| 04 | GELU, Φ (Gaussian CDF), erf (error function) |
+| 05 | x_{l+1} = x_l + F(x_l) (residual connection) |
+| 06 | W_E^T (transposed weight tying) |
+| 07 | L (loss), log, P(y\|x) (conditional probability) |
+| 08 | α (learning rate), β₁/β₂ (decay rates), ∇ (gradient), θ (parameters) |
+| 09 | ∇_θ L (gradient of loss w.r.t. params) |
+| 10 | T (temperature), P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T) |
+| 11 | RMS(x), θᵢ (RoPE frequency), R(θ) (rotation matrix) |
+| 12 | n_h, n_kv (head counts), w (window size), W_Q/W_K/W_V (separate projections) |
+| 13 | ReLU²(x), λ_r/λ_0 (residual scaling), softcap(x), W_E/W_H (untied weights) |
+
+Every symbol maps directly to Nx code you wrote. You can now read modern ML papers and understand the architecture behind LLaMA, Gemma, and similar models.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **ReLU²** | `max(0, x)²` — sparser activations than GELU, better feature selection |
+| **Value embeddings** | Learned token signals added to V on alternating layers |
+| **Residual scaling** | `λ_r · x + λ_0 · x₀` — per-layer control of information flow |
+| **x₀ skip** | Direct connection from initial embeddings to every layer |
+| **Logit softcapping** | `c · tanh(logits/c)` — prevents extreme confidence, bounds outputs to [-c, c] |
+| **Untied embeddings** | Separate input (wte) and output (lm_head) weight matrices |
+| **Bias-free** | No bias in any linear layer — fewer params, RMSNorm handles normalization |

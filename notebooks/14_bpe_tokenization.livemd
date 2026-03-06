@@ -1,0 +1,617 @@
+# 14: BPE Tokenization
+
+```elixir
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+alias VegaLite, as: Vl
+
+backend = System.get_env("NX_BACKEND", "emlx")
+
+case backend do
+  "exla" -> Nx.global_default_backend(EXLA.Backend)
+  "emlx_cpu" -> Nx.global_default_backend({EMLX.Backend, device: :cpu})
+  _ -> Nx.global_default_backend({EMLX.Backend, device: :gpu})
+end
+```
+
+## Math Notation
+
+BPE introduces vocabulary and merge notation used throughout:
+
+| Symbol | Meaning | Example |
+|--------|---------|---------|
+| V | Vocabulary — the set of all tokens | {0, 1, …, 255, 256, …} |
+| \|V\| | Vocabulary size | 256 + num_merges + num_special |
+| b = [b₁, …, bₙ] | Byte sequence (UTF-8 encoded text) | "hi" → [104, 105] |
+| (p, q) | An adjacent pair of token IDs | (116, 104) |
+| f(p, q) | Frequency of pair (p, q) in the corpus | f(116, 104) = 5 |
+| M = [(pair₁, id₁), …] | Merge table — ordered list of merge rules | [({32, 116}, 256), …] |
+| encode(text) | Apply M to convert text → token IDs | "the" → [256, 101] |
+| decode(ids) | Reverse: token IDs → text | [256, 101] → "the" |
+
+The key equation for each BPE training step:
+
+**(p\*, q\*) = argmax₍ₚ,q₎ f(p, q)**
+
+Find the most frequent adjacent pair and replace all its occurrences with a new token.
+
+## What is BPE?
+
+**Byte-Pair Encoding** is a compression algorithm repurposed for tokenization. The idea:
+
+1. Start with **raw bytes** — 256 possible values, one token per byte
+2. Scan the corpus and count every adjacent pair of tokens
+3. Find the **most frequent pair**
+4. **Merge** every occurrence into a single new token (ID = 256, 257, …)
+5. Repeat until reaching the desired vocabulary size
+
+Common subwords like `th`, `the`, ` the` (with leading space), `ing` emerge naturally as merged tokens. This gives a vocabulary that can represent any byte sequence (no unknown tokens) while keeping common words as single tokens.
+
+```elixir
+text = "hello"
+bytes = :binary.bin_to_list(text)
+
+IO.puts("Text:        #{inspect(text)}")
+IO.puts("UTF-8 bytes: #{inspect(bytes)}")
+IO.puts("As chars:    #{inspect(Enum.map(bytes, &<<&1>>))}")
+IO.puts("\nBPE starts here: each byte is one token (256 possible base tokens).")
+```
+
+```elixir
+text = "the cat sat on the mat"
+bytes = :binary.bin_to_list(text)
+IO.puts("#{inspect(text)}  →  #{length(bytes)} byte-tokens\n")
+
+pairs =
+  bytes
+  |> Enum.chunk_every(2, 1, :discard)
+  |> Enum.frequencies()
+  |> Enum.sort_by(fn {_, c} -> -c end)
+  |> Enum.take(5)
+
+IO.puts("Top 5 adjacent byte pairs:")
+
+for {{a, b}, count} <- pairs do
+  a_s = if a in 32..126, do: <<a>>, else: "0x#{Integer.to_string(a, 16)}"
+  b_s = if b in 32..126, do: <<b>>, else: "0x#{Integer.to_string(b, 16)}"
+  IO.puts("  (#{a}, #{b}) = '#{a_s}#{b_s}'  ×#{count}")
+end
+
+IO.puts("\nBPE would merge the most frequent pair first.")
+```
+
+## Build a BPE Tokenizer
+
+We'll build BPE from scratch in three steps: count pairs, merge pairs, repeat.
+
+### Step 1: Count Byte-Pair Frequencies
+
+Given a list of token IDs, count how often each adjacent pair occurs.
+
+```elixir
+count_pairs = fn ids ->
+  # TODO:
+  # 1. Enum.chunk_every(ids, 2, 1, :discard) → list of [a, b] pairs
+  # 2. Enum.reduce into a map: %{ {a, b} => count, ... }
+  %{}
+end
+
+# Test
+test_ids = [104, 101, 108, 108, 111, 104, 101]
+counts = count_pairs.(test_ids)
+IO.inspect(counts, label: "pair counts")
+IO.puts("Pair {104, 101} ('h','e') should appear 2 times: #{Map.get(counts, {104, 101}, 0)}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+count_pairs = fn ids ->
+  ids
+  |> Enum.chunk_every(2, 1, :discard)
+  |> Enum.reduce(%{}, fn [a, b], acc ->
+    Map.update(acc, {a, b}, 1, &(&1 + 1))
+  end)
+end
+```
+
+</details>
+
+### Step 2: The Merge Operation
+
+Replace every occurrence of a pair `{p1, p2}` with a new token ID. Scan left to right: when you see `p1` followed by `p2`, emit `new_id` and skip both; otherwise emit the current token and continue.
+
+Pattern matching on list heads makes this natural in Elixir — define it as a module.
+
+```elixir
+defmodule BPE do
+  def merge(ids, {p1, p2}, new_id) do
+    # TODO: call do_merge(ids, p1, p2, new_id, [])
+    #
+    # Base cases:
+    #   do_merge([], ..., acc) → Enum.reverse(acc)
+    #   do_merge([a], ..., acc) → Enum.reverse([a | acc])
+    #
+    # Match: when a == p1 and b == p2 →
+    #   do_merge(rest, ..., [new_id | acc])
+    #
+    # No match:
+    #   do_merge([b | rest], ..., [a | acc])
+    ids
+  end
+end
+
+# Test
+IO.puts("merge([1,2,3,1,2,4], {1,2}, 256)")
+IO.puts("Expected: [256, 3, 256, 4]")
+IO.puts("Got:      #{inspect(BPE.merge([1, 2, 3, 1, 2, 4], {1, 2}, 256))}")
+
+IO.puts("\nmerge([2,2,2], {2,2}, 256)  (greedy left-to-right)")
+IO.puts("Expected: [256, 2]")
+IO.puts("Got:      #{inspect(BPE.merge([2, 2, 2], {2, 2}, 256))}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+defmodule BPE do
+  def merge(ids, {p1, p2}, new_id), do: do_merge(ids, p1, p2, new_id, [])
+
+  defp do_merge([], _, _, _, acc), do: Enum.reverse(acc)
+  defp do_merge([a], _, _, _, acc), do: Enum.reverse([a | acc])
+
+  defp do_merge([a, b | rest], p1, p2, new_id, acc) when a == p1 and b == p2 do
+    do_merge(rest, p1, p2, new_id, [new_id | acc])
+  end
+
+  defp do_merge([a | rest], p1, p2, new_id, acc) do
+    do_merge(rest, p1, p2, new_id, [a | acc])
+  end
+end
+```
+
+</details>
+
+### Step 3: Train Step by Step
+
+Combine counting and merging into a training loop. Each iteration finds the most frequent pair and merges it.
+
+```elixir
+training_text = "the cat sat on the mat. the cat ate the rat. the fat cat and the hat."
+ids = :binary.bin_to_list(training_text)
+IO.puts("Training text (#{byte_size(training_text)} bytes):\n  #{inspect(training_text)}\n")
+
+num_merges = 20
+
+{merges, final_ids, _next_id} =
+  Enum.reduce(1..num_merges, {[], ids, 256}, fn step, {merges, ids, next_id} ->
+    counts = count_pairs.(ids)
+
+    if map_size(counts) == 0 do
+      {merges, ids, next_id}
+    else
+      {{p1, p2} = best_pair, freq} = Enum.max_by(counts, fn {_, c} -> c end)
+      new_ids = BPE.merge(ids, best_pair, next_id)
+
+      p1_s = if p1 in 32..126, do: <<p1>>, else: "#{p1}"
+      p2_s = if p2 in 32..126, do: <<p2>>, else: "#{p2}"
+
+      IO.puts(
+        "Merge #{String.pad_leading("#{step}", 2)}: " <>
+          "(#{p1}, #{p2}) '#{p1_s}'+'#{p2_s}' → #{next_id}  " <>
+          "freq=#{freq}  tokens: #{length(ids)} → #{length(new_ids)}"
+      )
+
+      {[{best_pair, next_id} | merges], new_ids, next_id + 1}
+    end
+  end)
+
+merges = Enum.reverse(merges)
+
+IO.puts("\nDone: #{byte_size(training_text)} bytes → #{length(final_ids)} tokens")
+IO.puts("Compression: #{Float.round(byte_size(training_text) / max(length(final_ids), 1), 2)}×")
+```
+
+### Visualize: Merge History
+
+Which pairs were most frequent when they were merged?
+
+```elixir
+ids = :binary.bin_to_list(training_text)
+
+{merge_data, _, _} =
+  Enum.reduce(1..num_merges, {[], ids, 256}, fn step, {data, ids, next_id} ->
+    counts = count_pairs.(ids)
+
+    if map_size(counts) == 0 do
+      {data, ids, next_id}
+    else
+      {{p1, p2} = best_pair, freq} = Enum.max_by(counts, fn {_, c} -> c end)
+      new_ids = BPE.merge(ids, best_pair, next_id)
+
+      p1_s = if p1 in 32..126, do: <<p1>>, else: "#{p1}"
+      p2_s = if p2 in 32..126, do: <<p2>>, else: "#{p2}"
+      label = "'#{p1_s}'+'#{p2_s}'"
+
+      entry = %{"step" => step, "frequency" => freq, "pair" => label}
+      {[entry | data], new_ids, next_id + 1}
+    end
+  end)
+
+Vl.new(width: 600, height: 300, title: "Merge History: Pair Frequency at Each Step")
+|> Vl.data_from_values(Enum.reverse(merge_data))
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "step", type: :ordinal, title: "Merge Step")
+|> Vl.encode_field(:y, "frequency", type: :quantitative, title: "Pair Frequency")
+|> Vl.encode_field(:color, "frequency", type: :quantitative,
+  scale: %{scheme: "blues"},
+  legend: nil
+)
+|> Vl.encode_field(:tooltip, "pair", type: :nominal)
+```
+
+Early merges capture the most frequent pairs (high bars). Later merges target rarer patterns (lower bars). The declining frequency is natural — each merge reduces the count of remaining pairs.
+
+### Visualize: Compression Ratio Over Merges
+
+```elixir
+ids = :binary.bin_to_list(training_text)
+original_len = length(ids)
+
+{ratio_data, _, _} =
+  Enum.reduce(0..num_merges, {[], ids, 256}, fn
+    0, {data, ids, next_id} ->
+      {[%{"merges" => 0, "tokens" => original_len, "ratio" => 1.0} | data], ids, next_id}
+
+    _step, {data, ids, next_id} ->
+      counts = count_pairs.(ids)
+
+      if map_size(counts) == 0 do
+        {data, ids, next_id}
+      else
+        {best_pair, _} = Enum.max_by(counts, fn {_, c} -> c end)
+        new_ids = BPE.merge(ids, best_pair, next_id)
+        ratio = Float.round(original_len / length(new_ids), 3)
+        step_num = next_id - 256 + 1
+
+        entry = %{"merges" => step_num, "tokens" => length(new_ids), "ratio" => ratio}
+        {[entry | data], new_ids, next_id + 1}
+      end
+  end)
+
+Vl.new(width: 600, height: 300, title: "Compression Ratio vs. Number of Merges")
+|> Vl.data_from_values(Enum.reverse(ratio_data))
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "merges", type: :quantitative, title: "Number of Merges")
+|> Vl.encode_field(:y, "ratio", type: :quantitative, title: "Compression Ratio (bytes / tokens)")
+```
+
+Each merge improves compression. The rate of improvement decreases as the most impactful merges happen first.
+
+## Encoding and Decoding
+
+### Encoding: Apply the Merge Table
+
+To encode new text, convert it to bytes and apply each merge rule in order. The order matters — merges are applied greedily left-to-right in the same order they were learned.
+
+```elixir
+encode = fn text, merges ->
+  ids = :binary.bin_to_list(text)
+
+  Enum.reduce(merges, ids, fn {{p1, p2}, new_id}, ids ->
+    BPE.merge(ids, {p1, p2}, new_id)
+  end)
+end
+
+encoded = encode.(training_text, merges)
+IO.puts("Original: #{byte_size(training_text)} bytes")
+IO.puts("Encoded:  #{length(encoded)} tokens")
+IO.puts("IDs: #{inspect(encoded)}")
+```
+
+### Decoding: Build the Vocabulary
+
+Each token maps to a byte sequence. Base tokens (0–255) map to a single byte. Merged tokens map to the concatenation of their constituents' bytes.
+
+```elixir
+vocab = for i <- 0..255, into: %{}, do: {i, [i]}
+
+vocab =
+  Enum.reduce(merges, vocab, fn {{a, b}, id}, vocab ->
+    bytes_a = Map.fetch!(vocab, a)
+    bytes_b = Map.fetch!(vocab, b)
+    Map.put(vocab, id, bytes_a ++ bytes_b)
+  end)
+
+decode = fn ids, vocab ->
+  ids
+  |> Enum.flat_map(&Map.fetch!(vocab, &1))
+  |> :binary.list_to_bin()
+end
+
+IO.puts("Sample vocabulary entries:")
+
+for {_pair, id} <- Enum.take(merges, 8) do
+  bytes = Map.fetch!(vocab, id)
+  text = :binary.list_to_bin(bytes)
+  IO.puts("  token #{id} → #{inspect(bytes)} → #{inspect(text)}")
+end
+```
+
+### Roundtrip: decode(encode(text)) == text
+
+```elixir
+test_texts = [
+  "hello world",
+  "the cat sat on the mat",
+  training_text,
+  "a brand new sentence that shares some words with the training data"
+]
+
+for text <- test_texts do
+  tokens = encode.(text, merges)
+  decoded = decode.(tokens, vocab)
+  status = if decoded == text, do: "✓", else: "✗"
+  ratio = Float.round(byte_size(text) / max(length(tokens), 1), 1)
+
+  IO.puts(
+    "#{status} #{byte_size(text)} bytes → #{length(tokens)} tokens (#{ratio}×)" <>
+      "  #{inspect(String.slice(text, 0, 50))}"
+  )
+end
+```
+
+The roundtrip always succeeds because BPE is lossless — every byte sequence can be represented, and decoding exactly reverses encoding.
+
+## Special Tokens
+
+Real tokenizers need synthetic tokens that don't correspond to any byte sequence. These mark **conversation structure**: where a conversation starts, where user and assistant turns begin and end.
+
+They get IDs assigned after all merge tokens.
+
+```elixir
+special_tokens =
+  ~w(<|bos|> <|user_start|> <|user_end|> <|assistant_start|> <|assistant_end|>
+     <|python_start|> <|python_end|> <|output_start|> <|output_end|>)
+
+special_start = 256 + length(merges)
+
+special_map =
+  special_tokens
+  |> Enum.with_index(special_start)
+  |> Map.new()
+
+IO.puts("Special token IDs:")
+
+for {name, id} <- Enum.sort_by(special_map, fn {_, id} -> id end) do
+  IO.puts("  #{name}  →  #{id}")
+end
+
+IO.puts("\nVocabulary breakdown:")
+IO.puts("  Base bytes:  0–255           (256 tokens)")
+IO.puts("  Merges:      256–#{255 + length(merges)}         (#{length(merges)} tokens)")
+IO.puts("  Special:     #{special_start}–#{special_start + length(special_tokens) - 1}         (#{length(special_tokens)} tokens)")
+IO.puts("  Total:       #{special_start + length(special_tokens)} tokens")
+```
+
+```elixir
+user_msg = "hello"
+assistant_msg = "hi there"
+
+user_ids = encode.(user_msg, merges)
+asst_ids = encode.(assistant_msg, merges)
+
+conversation_ids =
+  [special_map["<|bos|>"]] ++
+    [special_map["<|user_start|>"]] ++
+    user_ids ++
+    [special_map["<|user_end|>"]] ++
+    [special_map["<|assistant_start|>"]] ++
+    asst_ids ++
+    [special_map["<|assistant_end|>"]]
+
+special_inv = Map.new(special_map, fn {k, v} -> {v, k} end)
+
+IO.puts("Conversation: user=#{inspect(user_msg)}, assistant=#{inspect(assistant_msg)}")
+IO.puts("Token IDs: #{inspect(conversation_ids)}\n")
+
+for id <- conversation_ids do
+  label =
+    cond do
+      Map.has_key?(special_inv, id) -> special_inv[id]
+      Map.has_key?(vocab, id) -> inspect(:binary.list_to_bin(Map.fetch!(vocab, id)))
+      true -> "byte(#{id})"
+    end
+
+  IO.puts("  #{String.pad_leading("#{id}", 4)}  #{label}")
+end
+
+IO.puts("\nDuring fine-tuning, loss is computed only on assistant tokens.")
+IO.puts("The model learns to generate responses, not to predict prompts.")
+```
+
+## Break It
+
+### Experiment 1: Tiny Vocabulary (256 + 2 merges)
+
+With barely any merges, the tokenizer can't compress. Each character is roughly one token — long sequences, expensive attention.
+
+```elixir
+text = "the cat sat on the mat. the cat ate the rat."
+ids = :binary.bin_to_list(text)
+
+{tiny_merges, _, _} =
+  Enum.reduce(1..2, {[], ids, 256}, fn _, {m, ids, nid} ->
+    counts = count_pairs.(ids)
+
+    if map_size(counts) == 0 do
+      {m, ids, nid}
+    else
+      {best, _} = Enum.max_by(counts, fn {_, c} -> c end)
+      {[{best, nid} | m], BPE.merge(ids, best, nid), nid + 1}
+    end
+  end)
+
+tiny_encoded =
+  Enum.reduce(Enum.reverse(tiny_merges), :binary.bin_to_list(text), fn {{p1, p2}, nid}, ids ->
+    BPE.merge(ids, {p1, p2}, nid)
+  end)
+
+full_encoded = encode.(text, merges)
+
+IO.puts("Tiny vocab  (258 tokens): #{length(tiny_encoded)} tokens for #{byte_size(text)} bytes")
+IO.puts("Full vocab  (#{256 + length(merges)} tokens): #{length(full_encoded)} tokens for #{byte_size(text)} bytes")
+IO.puts("Original bytes:           #{byte_size(text)}")
+IO.puts("\nWith only 2 merges, almost no compression.")
+IO.puts("In a real model, longer sequences mean quadratically more attention compute.")
+```
+
+### Experiment 2: Giant Vocabulary on Tiny Corpus
+
+Too many merges on a small corpus: the tokenizer creates tokens for entire phrases that only exist in the training data.
+
+```elixir
+tiny_text = "ab ab ab"
+ids = :binary.bin_to_list(tiny_text)
+
+IO.puts("Training on #{inspect(tiny_text)} with 10 merges:\n")
+
+{giant_merges, final_ids, _} =
+  Enum.reduce(1..10, {[], ids, 256}, fn step, {m, ids, nid} ->
+    counts = count_pairs.(ids)
+
+    if map_size(counts) == 0 do
+      IO.puts("  Step #{step}: no pairs left to merge!")
+      {m, ids, nid}
+    else
+      {best, freq} = Enum.max_by(counts, fn {_, c} -> c end)
+      new_ids = BPE.merge(ids, best, nid)
+
+      IO.puts(
+        "  Step #{step}: #{inspect(best)} → #{nid}" <>
+          "  (freq=#{freq}, #{length(ids)} → #{length(new_ids)} tokens)"
+      )
+
+      {[{best, nid} | m], new_ids, nid + 1}
+    end
+  end)
+
+IO.puts("\nFinal: #{length(final_ids)} tokens. Ran out of pairs quickly.\n")
+
+giant_merges_ordered = Enum.reverse(giant_merges)
+new_text = "cd cd cd"
+
+new_encoded =
+  Enum.reduce(giant_merges_ordered, :binary.bin_to_list(new_text), fn {{p1, p2}, nid}, ids ->
+    BPE.merge(ids, {p1, p2}, nid)
+  end)
+
+IO.puts("Encoding unseen '#{new_text}': #{length(new_encoded)} tokens (#{byte_size(new_text)} bytes)")
+IO.puts("No compression — the learned merges don't apply to unseen byte patterns.")
+```
+
+### Experiment 3: Missing Merge (Skip a Rule)
+
+Later merges often depend on earlier ones. Skipping a merge in the middle breaks the dependency chain.
+
+```elixir
+ids = :binary.bin_to_list(training_text)
+
+{all_10, _, _} =
+  Enum.reduce(1..10, {[], ids, 256}, fn _, {m, ids, nid} ->
+    counts = count_pairs.(ids)
+
+    if map_size(counts) == 0 do
+      {m, ids, nid}
+    else
+      {best, _} = Enum.max_by(counts, fn {_, c} -> c end)
+      {[{best, nid} | m], BPE.merge(ids, best, nid), nid + 1}
+    end
+  end)
+
+all_10 = Enum.reverse(all_10)
+
+normal =
+  Enum.reduce(all_10, :binary.bin_to_list(training_text), fn {{p1, p2}, nid}, ids ->
+    BPE.merge(ids, {p1, p2}, nid)
+  end)
+
+skipped_merge = Enum.at(all_10, 2)
+broken_merges = List.delete_at(all_10, 2)
+
+broken =
+  Enum.reduce(broken_merges, :binary.bin_to_list(training_text), fn {{p1, p2}, nid}, ids ->
+    BPE.merge(ids, {p1, p2}, nid)
+  end)
+
+IO.puts("Skipped merge #3: #{inspect(skipped_merge)}")
+IO.puts("Normal encoding:  #{length(normal)} tokens")
+IO.puts("Broken encoding:  #{length(broken)} tokens  (+#{length(broken) - length(normal)})")
+IO.puts("\nMerges that depend on the skipped pair can no longer fire,")
+IO.puts("cascading into a longer, suboptimal encoding.")
+```
+
+## Compare with Our Tokenizer
+
+The `ExNanoGPT.V2.Tokenizer` module implements the same BPE algorithm. Let's train it on the same text and verify our implementation matches.
+
+```elixir
+alias ExNanoGPT.V2.Tokenizer
+
+# 256 base + 20 merges + 9 special = 285
+tok = Tokenizer.train(training_text, vocab_size: 256 + num_merges + 9)
+
+IO.puts("V2 Tokenizer: vocab_size=#{tok.vocab_size}, merges=#{length(tok.merges)}\n")
+
+lib_ids = Tokenizer.encode(tok, training_text)
+our_ids = encode.(training_text, merges)
+
+IO.puts("Library encoding: #{length(lib_ids)} tokens")
+IO.puts("Our encoding:     #{length(our_ids)} tokens")
+IO.puts("Library roundtrip: #{Tokenizer.decode(tok, lib_ids) == training_text}")
+
+IO.puts("\nFirst 5 merges — ours vs library:")
+
+for i <- 0..min(4, length(merges) - 1) do
+  ours = Enum.at(merges, i)
+  lib = Enum.at(tok.merges, i)
+  match = if ours == lib, do: "✓", else: "✗"
+  IO.puts("  #{match} #{inspect(ours)}  vs  #{inspect(lib)}")
+end
+
+IO.puts("\nSame algorithm, same corpus, same merge count → identical results.")
+```
+
+## Math Notation: Running Reference
+
+New symbols from this notebook:
+
+| Math | Elixir | What it means |
+|------|--------|---------------|
+| V, \|V\| | `vocab_size` | Vocabulary and its size |
+| (p, q) | `{a, b}` | Adjacent token pair |
+| f(p, q) | `count_pairs.(ids)[{a,b}]` | Pair frequency |
+| M | `merges` | Ordered merge rules |
+| argmax f(p,q) | `Enum.max_by(counts, ...)` | Find most frequent pair |
+
+**Running reference**: Σ (sum), xᵢ (indexing), W ∈ ℝ (matrix), μ (mean), σ² (variance), ε (epsilon), γ/β (scale/shift), Q/K/V (attention), d_k (head dim), GELU/Φ/erf (activations), x_{l+1} = x_l + F(x_l) (residual), L (loss), ∇ (gradient), α (LR), β₁/β₂ (Adam), T (temperature), V (vocabulary), M (merges)
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Byte-Pair Encoding** | Iteratively merge the most frequent adjacent pair to build a vocabulary |
+| **Base vocabulary** | 256 tokens, one per possible byte value (0–255) |
+| **Merge table** | Ordered list of (pair → new_id) rules learned from training |
+| **Encoding** | Convert text to bytes, apply merges left-to-right in order |
+| **Decoding** | Map token IDs → byte sequences → concatenate → UTF-8 string |
+| **Special tokens** | Synthetic tokens for conversation structure (BOS, turn delimiters) |
+| **Compression ratio** | bytes / tokens — higher means fewer tokens per character |
+| **Vocab size tradeoff** | Larger vocab = shorter sequences but bigger embedding table |
