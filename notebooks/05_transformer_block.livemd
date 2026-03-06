@@ -1,0 +1,242 @@
+# 05: The Transformer Block
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Putting It All Together
+
+We've built every individual piece of a transformer:
+- **Embeddings** -- convert tokens to vectors
+- **Layer normalization** -- stabilize values
+- **Self-attention** -- mix information across tokens
+- **MLP** -- process each token independently
+
+A **transformer block** combines these into a single repeating unit. GPT stacks N of these blocks in sequence. GPT-2 Small uses 12 blocks, GPT-2 Large uses 36. Our Shakespeare model uses 6.
+
+The block's structure is simple:
+
+```
+x → LayerNorm → Attention → add back to x → LayerNorm → MLP → add back to x → output
+```
+
+There are two important ideas here: **pre-norm** and **residual connections**. Let's understand both.
+
+## Residual Connections: The `x + ...` Pattern
+
+The core pattern in a transformer block is:
+
+```
+x = x + attention(layer_norm(x))
+x = x + mlp(layer_norm(x))
+```
+
+Notice the `x + ...` on both lines. This is a **residual connection** (also called a "skip connection"). Instead of replacing `x` with the output of attention, we *add* the output to the original `x`.
+
+Why? Imagine a network with 12 blocks. Without residual connections, the gradient has to flow backward through all 12 blocks during training -- like a game of telephone where the signal degrades at each step. With residual connections, the gradient has a **shortcut**: it can flow directly through the `+` operations, bypassing the blocks entirely. The blocks only need to learn the *difference* from the identity function.
+
+This is what makes deep networks trainable. Without skip connections, anything beyond ~5 layers becomes extremely hard to train.
+
+```elixir
+# Concrete example: residual connection
+key = Nx.Random.key(42)
+{x, _} = Nx.Random.normal(key, shape: {1, 4, 8})
+
+# Pretend some_transform is attention or MLP
+some_transform = fn x -> Nx.multiply(x, 0.1) end
+
+# WITHOUT residual: output is entirely the transform's output
+without_residual = some_transform.(x)
+
+# WITH residual: output is x + transform(x) — the original signal is preserved
+with_residual = Nx.add(x, some_transform.(x))
+
+IO.inspect(Nx.to_flat_list(x[0][0]) |> Enum.map(&Float.round(&1, 3)), label: "original x[0][0]")
+IO.inspect(Nx.to_flat_list(without_residual[0][0]) |> Enum.map(&Float.round(&1, 3)), label: "without residual")
+IO.inspect(Nx.to_flat_list(with_residual[0][0]) |> Enum.map(&Float.round(&1, 3)), label: "with residual (close to original)")
+```
+
+## Pre-Norm vs Post-Norm
+
+The original transformer paper (2017) put LayerNorm *after* attention and MLP:
+
+```
+post-norm:  x = layer_norm(x + attention(x))   ← original paper
+pre-norm:   x = x + attention(layer_norm(x))    ← GPT-2 style
+```
+
+GPT-2 and most modern transformers use **pre-norm** -- normalize *before* the sub-layer. This trains more stably because the normalization tames the inputs before they enter the more complex attention and MLP computations, and the residual path stays "clean" (no normalization on the skip connection).
+
+## Load the Reference Modules
+
+We need LayerNorm, Attention, and MLP from our reference implementation to build the block:
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/layer_norm.ex")
+Code.require_file("../lib/ex_nano_gpt/attention.ex")
+Code.require_file("../lib/ex_nano_gpt/mlp.ex")
+```
+
+## Exercise: Implement a Transformer Block
+
+Combine all the pieces. The forward pass is:
+
+1. Save `x` as a residual
+2. Apply LayerNorm (`ln_1`)
+3. Apply self-attention
+4. Add the residual back
+5. Save new `x` as a residual
+6. Apply LayerNorm (`ln_2`)
+7. Apply MLP
+8. Add the residual back
+
+```elixir
+n_embd = 8
+n_head = 2
+n_layer = 1
+
+key = Nx.Random.key(42)
+
+# Initialize all sub-component parameters
+ln_1_params = ExNanoGPT.LayerNorm.init_params(n_embd, bias: true)
+ln_2_params = ExNanoGPT.LayerNorm.init_params(n_embd, bias: true)
+
+keys = Nx.Random.split(key, parts: 3)
+attn_params = ExNanoGPT.Attention.init_params(n_embd, n_head, keys[0], bias: true, n_layer: n_layer)
+mlp_params = ExNanoGPT.MLP.init_params(n_embd, keys[1], bias: true, n_layer: n_layer)
+
+# Random input
+{x, _} = Nx.Random.normal(keys[2], shape: {1, 4, n_embd})
+IO.inspect(Nx.shape(x), label: "input shape")
+
+block_forward = fn x, ln_1_params, ln_2_params, attn_params, mlp_params, rng_key ->
+  # TODO:
+  # 1. residual = x
+  # 2. x = LayerNorm(x, ln_1_params)                -- ExNanoGPT.LayerNorm.forward/2
+  # 3. x = Attention(x, attn_params, key, opts)      -- ExNanoGPT.Attention.forward/4
+  #        opts: [n_head: n_head, dropout_rate: 0.0, training: false]
+  # 4. x = residual + x
+  # 5. residual = x
+  # 6. x = LayerNorm(x, ln_2_params)                -- ExNanoGPT.LayerNorm.forward/2
+  # 7. x = MLP(x, mlp_params, key, opts)            -- ExNanoGPT.MLP.forward/4
+  #        opts: [dropout_rate: 0.0, training: false]
+  # 8. x = residual + x
+  nil
+end
+
+result = block_forward.(x, ln_1_params, ln_2_params, attn_params, mlp_params, Nx.Random.key(0))
+IO.inspect(Nx.shape(result), label: "output shape (should be {1, 4, 8})")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+block_forward = fn x, ln_1_params, ln_2_params, attn_params, mlp_params, rng_key ->
+  attn_opts = [n_head: n_head, dropout_rate: 0.0, training: false]
+  mlp_opts = [dropout_rate: 0.0, training: false]
+
+  residual = x
+  x = ExNanoGPT.LayerNorm.forward(x, ln_1_params)
+  x = ExNanoGPT.Attention.forward(x, attn_params, rng_key, attn_opts)
+  x = Nx.add(residual, x)
+
+  residual = x
+  x = ExNanoGPT.LayerNorm.forward(x, ln_2_params)
+  x = ExNanoGPT.MLP.forward(x, mlp_params, rng_key, mlp_opts)
+  Nx.add(residual, x)
+end
+```
+
+</details>
+
+## Verify Against the Reference
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/block.ex")
+
+n_embd = 8
+n_head = 2
+key = Nx.Random.key(55)
+
+# Initialize using the reference Block module
+block_params = ExNanoGPT.Block.init_params(n_embd, n_head, key, bias: true, n_layer: 1)
+
+# Random input
+{x, _} = Nx.Random.normal(Nx.Random.key(7), shape: {2, 4, n_embd})
+
+# Your implementation
+yours = block_forward.(
+  x,
+  block_params.ln_1,
+  block_params.ln_2,
+  block_params.attn,
+  block_params.mlp,
+  Nx.Random.key(0)
+)
+
+# Reference
+reference = ExNanoGPT.Block.forward(x, block_params, Nx.Random.key(0),
+  n_head: n_head, dropout_rate: 0.0, training: false
+)
+
+diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+```
+
+## Stacking Blocks
+
+A full GPT model stacks N transformer blocks. Each block refines the representation -- early blocks tend to learn local patterns (syntax), while later blocks learn more abstract patterns (semantics, reasoning).
+
+Stacking is just a fold (reduce) -- pass the output of one block as input to the next:
+
+```elixir
+n_blocks = 3
+n_embd = 8
+n_head = 2
+
+key = Nx.Random.key(42)
+block_keys = Nx.Random.split(key, parts: n_blocks + 1)
+
+# Initialize N blocks
+blocks =
+  for i <- 0..(n_blocks - 1) do
+    ExNanoGPT.Block.init_params(n_embd, n_head, block_keys[i], bias: true, n_layer: n_blocks)
+  end
+
+{x, _} = Nx.Random.normal(block_keys[n_blocks], shape: {1, 4, n_embd})
+IO.inspect(Nx.shape(x), label: "input to block stack")
+
+# Run through all blocks sequentially
+output =
+  Enum.reduce(blocks, x, fn block_params, acc ->
+    ExNanoGPT.Block.forward(acc, block_params, Nx.Random.key(0),
+      n_head: n_head, dropout_rate: 0.0, training: false
+    )
+  end)
+
+IO.inspect(Nx.shape(output), label: "output after #{n_blocks} blocks (same shape)")
+```
+
+The shape doesn't change -- every block takes `{batch, seq_len, n_embd}` and returns `{batch, seq_len, n_embd}`. What changes is the *content*: each block enriches the representation with more context and computation.
+
+## What's Next
+
+We now have the complete repeating unit of GPT. In the next notebook, we'll assemble the **full model**: embeddings at the input, a stack of transformer blocks in the middle, and a projection head at the output that converts the final representations back into token probabilities. We'll also implement the loss function used for training.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Transformer block** | One unit of: LayerNorm → Attention → Add → LayerNorm → MLP → Add |
+| **Residual connection** | `x = x + sublayer(x)` — preserves the original signal and helps gradients flow |
+| **Pre-norm** | LayerNorm *before* attention/MLP (GPT-2 style), more stable than post-norm |
+| **Stacking blocks** | N blocks in sequence; early blocks learn syntax, later blocks learn semantics |
+| **Shape preservation** | Every block takes `{batch, seq_len, n_embd}` and returns the same shape |
+| **Gradient highway** | Residual connections create a direct path for gradients through the whole network |

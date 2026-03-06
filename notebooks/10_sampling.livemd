@@ -1,0 +1,491 @@
+# 10: Sampling & Generation
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Big Picture
+
+We've built every piece of a GPT: embeddings, attention, layer norm, feed-forward layers, loss, optimizer, and training loop. Now comes the payoff: **generating text**.
+
+The generation process is beautifully simple:
+
+1. Start with some prompt tokens (e.g., `"ROMEO:"`)
+2. Feed them through the model to get logits for the next token
+3. Sample a token from those logits
+4. Append it to the sequence
+5. Repeat from step 2
+
+This is called **autoregressive generation** -- the model's own output becomes its input for the next step. Each new token is generated one at a time, conditioned on everything that came before.
+
+## Setting Up a Tiny Model
+
+We'll work with a small model for demonstrations. It won't generate coherent Shakespeare (it's far too small and undertrained), but it will show the complete generation pipeline.
+
+```elixir
+tiny_config = %{
+  vocab_size: 65,
+  block_size: 32,
+  n_layer: 1,
+  n_head: 2,
+  n_embd: 32,
+  dropout: 0.0,
+  bias: true
+}
+
+key = Nx.Random.key(1337)
+tiny_params = ExNanoGPT.Model.init_params(tiny_config, key)
+
+# Load the character mappings
+data_dir = ExNanoGPT.Data.data_dir()
+
+meta =
+  if File.exists?(Path.join(data_dir, "meta.etf")) do
+    ExNanoGPT.Data.load_meta(Path.join(data_dir, "meta.etf"))
+  else
+    IO.puts("Preparing data...")
+    ExNanoGPT.Data.prepare()
+  end
+
+IO.puts("Model: #{ExNanoGPT.Model.count_params(tiny_params)} parameters")
+IO.puts("Vocab size: #{meta.vocab_size}")
+IO.puts("Block size: #{tiny_config.block_size}")
+```
+
+## The Forward Pass for Generation
+
+During training, we compute logits for all positions (because we need the loss at every position). During generation, we only care about the **last position** -- that's where the prediction for the next token lives.
+
+```elixir
+# Encode a short prompt
+prompt = "ROMEO:"
+prompt_ids = ExNanoGPT.Data.encode(meta, prompt)
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+IO.puts("Prompt: #{inspect(prompt)}")
+IO.puts("Token IDs: #{inspect(prompt_ids)}")
+IO.puts("Tensor shape: #{inspect(Nx.shape(idx))}")
+```
+
+```elixir
+# Forward pass -- get logits for the last position
+logits = ExNanoGPT.Model.forward(idx, tiny_params, tiny_config, Nx.Random.key(0))
+IO.puts("Logits shape: #{inspect(Nx.shape(logits))}")
+IO.puts("That's {batch=1, last_position=1, vocab_size=65}")
+
+# Squeeze out the batch and position dims to get a flat vector of 65 scores
+logits_flat = Nx.squeeze(logits, axes: [0, 1])
+IO.puts("\nTop 5 logit values:")
+sorted_indices = Nx.argsort(logits_flat, direction: :desc)
+for i <- 0..4 do
+  idx_val = Nx.to_number(sorted_indices[i])
+  logit_val = Nx.to_number(logits_flat[idx_val])
+  char = ExNanoGPT.Data.decode(meta, [idx_val])
+  IO.puts("  '#{char}' (id=#{idx_val}): #{Float.round(logit_val, 4)}")
+end
+
+IO.puts("\n(Random model, so these are random -- no meaningful predictions yet)")
+```
+
+## Temperature: Controlling Randomness
+
+Before sampling, we divide the logits by a **temperature** parameter. This controls how "creative" vs. "deterministic" the model is:
+
+- **Temperature = 1.0** (default): use the model's original probability distribution
+- **Temperature < 1.0** (e.g., 0.1): make the distribution "sharper" -- the most likely token becomes much more likely, others become negligible. Output is more predictable/repetitive.
+- **Temperature > 1.0** (e.g., 2.0): make the distribution "flatter" -- all tokens become more equally likely. Output is more random/diverse.
+
+At the extreme, temperature → 0 is greedy decoding (always pick the most likely), and temperature → infinity is uniform random.
+
+```elixir
+# Same logits, different temperatures
+raw_logits = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+tokens = ["the", "a", "my", "his", "?"]
+
+for temp <- [0.1, 0.5, 1.0, 2.0, 5.0] do
+  scaled = Nx.divide(raw_logits, temp)
+  exps = Nx.exp(Nx.subtract(scaled, Nx.reduce_max(scaled)))
+  probs = Nx.divide(exps, Nx.sum(exps))
+  probs_list = Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4))
+
+  dist = Enum.zip(tokens, probs_list)
+    |> Enum.map(fn {tok, p} -> "#{tok}=#{p}" end)
+    |> Enum.join(", ")
+
+  IO.puts("temp=#{temp}: #{dist}")
+end
+```
+
+## Top-k Filtering: Cutting Off the Long Tail
+
+Even with temperature, the model might assign tiny probabilities to many tokens. **Top-k filtering** keeps only the k most likely tokens and zeroes out the rest. This prevents the model from ever picking a truly unlikely token.
+
+The implementation: sort logits, find the k-th highest value, and set everything below that threshold to negative infinity (which becomes 0 after softmax).
+
+```elixir
+# Top-k example with k=3
+logits_example = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+k = 3
+
+# Sort descending, find the threshold (k-th value)
+sorted = Nx.sort(logits_example, axis: -1, direction: :desc)
+threshold = Nx.to_number(sorted[k - 1])
+IO.puts("Sorted: #{inspect(Nx.to_flat_list(sorted) |> Enum.map(&Float.round(&1, 2)))}")
+IO.puts("Threshold (#{k}-th value): #{threshold}")
+
+# Mask out everything below threshold
+mask = Nx.less(logits_example, threshold)
+neg_inf = Nx.Constants.neg_infinity(:f32)
+filtered = Nx.select(mask, Nx.broadcast(neg_inf, Nx.shape(logits_example)), logits_example)
+IO.puts("Filtered logits: #{inspect(Nx.to_flat_list(filtered) |> Enum.map(&Float.round(&1, 2)))}")
+
+# After softmax, only the top-k have non-zero probability
+exps = Nx.exp(Nx.subtract(filtered, Nx.reduce_max(filtered)))
+probs = Nx.divide(exps, Nx.sum(exps))
+IO.puts("Probabilities: #{inspect(Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4)))}")
+```
+
+## Exercise: Implement Temperature Scaling and Top-k Filtering
+
+Combine both techniques into a single function. Given logits of shape `{batch, vocab_size}`, apply temperature scaling and optionally top-k filtering.
+
+```elixir
+apply_temperature_and_top_k = fn logits, temperature, top_k ->
+  # logits shape: {batch, vocab_size}
+  # temperature: positive float
+  # top_k: positive integer or nil
+
+  # TODO:
+  # 1. Divide logits by temperature
+  # 2. If top_k is not nil:
+  #    a. Sort descending along last axis
+  #    b. Take the value at index k-1 as threshold (per row)
+  #    c. Set logits below threshold to negative infinity
+  # 3. Return the processed logits
+  logits
+end
+
+# Test
+test_logits = Nx.tensor([[2.0, 1.0, 0.5, 0.1, -1.0]])
+
+# Temperature only
+scaled = apply_temperature_and_top_k.(test_logits, 0.5, nil)
+IO.puts("Temp=0.5, no top-k:")
+IO.inspect(Nx.to_flat_list(scaled) |> Enum.map(&Float.round(&1, 3)), label: "  scaled logits")
+
+# Temperature + top-k
+scaled_topk = apply_temperature_and_top_k.(test_logits, 0.5, 3)
+IO.puts("Temp=0.5, top-k=3:")
+IO.inspect(Nx.to_flat_list(scaled_topk) |> Enum.map(&Float.round(&1, 3)), label: "  filtered logits")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+apply_temperature_and_top_k = fn logits, temperature, top_k ->
+  scaled = Nx.divide(logits, temperature)
+
+  if top_k do
+    {_batch, vocab_size} = Nx.shape(scaled)
+    k = min(top_k, vocab_size)
+    sorted = Nx.sort(scaled, axis: -1, direction: :desc)
+    threshold = Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)
+    mask = Nx.less(scaled, threshold)
+    neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(scaled))
+    Nx.select(mask, neg_inf, scaled)
+  else
+    scaled
+  end
+end
+```
+
+</details>
+
+## Exercise: The Gumbel-Max Trick for Sampling
+
+To generate text, we need to sample from the probability distribution. The standard approach is **multinomial sampling**: pick a random token where the probability of each token matches the model's predicted probabilities.
+
+Nx doesn't have a built-in multinomial sampler, but there's an elegant trick called **Gumbel-max**:
+
+1. Take `log(probabilities)` for each token
+2. Add random noise from the Gumbel distribution: `-log(-log(uniform_random))`
+3. Take the argmax
+
+This is mathematically equivalent to multinomial sampling. The noise "perturbs" the log-probs, and higher-probability tokens are more likely to survive the perturbation and remain the argmax.
+
+```elixir
+sample_multinomial = fn probs, key ->
+  # probs shape: {batch, vocab_size}
+  # key: PRNG key
+  # Return: {batch, 1} tensor of sampled token indices (as :s32)
+
+  # TODO:
+  # 1. Compute log(probs) -- clamp probs to min 1e-10 to avoid log(0)
+  # 2. Sample uniform random values, same shape as probs
+  # 3. Convert to Gumbel noise: -log(-log(uniform)), also clamp to avoid log(0)
+  # 4. Add log_probs + gumbel_noise
+  # 5. Take argmax along last axis (keep_axis: true)
+  # 6. Cast to :s32
+  Nx.tensor([[0]], type: :s32)
+end
+
+# Test: sampling from a known distribution many times
+# Token 0 has 70% probability, so it should appear most often
+test_probs = Nx.tensor([[0.7, 0.2, 0.05, 0.05]])
+
+counts = %{0 => 0, 1 => 0, 2 => 0, 3 => 0}
+
+counts =
+  Enum.reduce(0..999, counts, fn i, acc ->
+    key = Nx.Random.key(i)
+    sampled = sample_multinomial.(test_probs, key)
+    idx = Nx.to_number(Nx.squeeze(sampled))
+    Map.update!(acc, idx, &(&1 + 1))
+  end)
+
+IO.puts("Sampled 1000 times from [0.7, 0.2, 0.05, 0.05]:")
+for {idx, count} <- Enum.sort(counts) do
+  bar = String.duplicate("█", div(count, 10))
+  IO.puts("  token #{idx}: #{count}/1000 (#{Float.round(count / 10, 1)}%) #{bar}")
+end
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+sample_multinomial = fn probs, key ->
+  log_probs = Nx.log(Nx.max(probs, 1.0e-10))
+  {uniform, _} = Nx.Random.uniform(key, shape: Nx.shape(probs))
+  gumbel_noise = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))
+  perturbed = Nx.add(log_probs, gumbel_noise)
+  indices = Nx.argmax(perturbed, axis: -1, keep_axis: true)
+  Nx.as_type(indices, :s32)
+end
+```
+
+</details>
+
+## Exercise: The Full Autoregressive Generation Loop
+
+Now combine everything into a complete generation function. Given a starting sequence of tokens, generate `max_new_tokens` additional tokens one at a time.
+
+The loop:
+1. If the sequence is longer than `block_size`, crop to the last `block_size` tokens
+2. Forward pass to get logits for the last position
+3. Apply temperature scaling and optionally top-k filtering
+4. Softmax to get probabilities
+5. Sample one token using the Gumbel-max trick
+6. Append it to the sequence
+7. Repeat
+
+```elixir
+generate = fn idx, params, model_config, key, opts ->
+  # idx shape: {batch, seq_len} (starting tokens)
+  # opts: max_new_tokens, temperature, top_k
+  max_new_tokens = Keyword.get(opts, :max_new_tokens, 100)
+  temperature = Keyword.get(opts, :temperature, 1.0)
+  top_k = Keyword.get(opts, :top_k, nil)
+  block_size = model_config.block_size
+
+  # TODO: implement the generation loop
+  # Use Enum.reduce over 0..(max_new_tokens - 1), accumulating {idx, key}
+  #
+  # Each iteration:
+  # 1. Crop: if seq_len > block_size, take last block_size tokens
+  #    Nx.slice_along_axis(idx, seq_len - block_size, block_size, axis: 1)
+  #
+  # 2. Forward pass: ExNanoGPT.Model.forward(idx_cond, params, model_config, key)
+  #    Returns shape {batch, 1, vocab_size}
+  #
+  # 3. Squeeze to {batch, vocab_size}: Nx.squeeze(logits, axes: [1])
+  #
+  # 4. Scale by temperature: Nx.divide(logits, temperature)
+  #
+  # 5. Top-k filtering (if top_k is not nil):
+  #    sorted = Nx.sort(logits, axis: -1, direction: :desc)
+  #    threshold = Nx.slice_along_axis(sorted, top_k - 1, 1, axis: -1)
+  #    mask = Nx.less(logits, threshold)
+  #    logits = Nx.select(mask, neg_infinity, logits)
+  #
+  # 6. Softmax to probabilities
+  #
+  # 7. Gumbel-max sampling
+  #
+  # 8. Concatenate: Nx.concatenate([idx, new_token], axis: 1)
+  #
+  # 9. Split key for next iteration
+  #
+  # Return the final idx tensor
+  idx
+end
+
+# Test: generate 50 tokens from prompt "ROMEO:"
+prompt_ids = ExNanoGPT.Data.encode(meta, "ROMEO:")
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+generated = generate.(idx, tiny_params, tiny_config, Nx.Random.key(42),
+  max_new_tokens: 50, temperature: 1.0, top_k: 10)
+
+output_ids = generated |> Nx.squeeze(axes: [0]) |> Nx.to_flat_list()
+output_text = ExNanoGPT.Data.decode(meta, output_ids)
+IO.puts("Generated text (random model -- won't make sense):")
+IO.puts(output_text)
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+generate = fn idx, params, model_config, key, opts ->
+  max_new_tokens = Keyword.get(opts, :max_new_tokens, 100)
+  temperature = Keyword.get(opts, :temperature, 1.0)
+  top_k = Keyword.get(opts, :top_k, nil)
+  block_size = model_config.block_size
+
+  {final_idx, _final_key} =
+    Enum.reduce(0..(max_new_tokens - 1), {idx, key}, fn _i, {idx, key} ->
+      seq_len = Nx.axis_size(idx, 1)
+      idx_cond =
+        if seq_len > block_size do
+          Nx.slice_along_axis(idx, seq_len - block_size, block_size, axis: 1)
+        else
+          idx
+        end
+
+      logits = ExNanoGPT.Model.forward(idx_cond, params, model_config, key)
+      logits = Nx.squeeze(logits, axes: [1])
+      logits = Nx.divide(logits, temperature)
+
+      logits =
+        if top_k do
+          {_b, vs} = Nx.shape(logits)
+          k = min(top_k, vs)
+          sorted = Nx.sort(logits, axis: -1, direction: :desc)
+          threshold = Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)
+          mask = Nx.less(logits, threshold)
+          neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(logits))
+          Nx.select(mask, neg_inf, logits)
+        else
+          logits
+        end
+
+      # Softmax
+      max_val = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+      exps = Nx.exp(Nx.subtract(logits, max_val))
+      probs = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+
+      # Gumbel-max sampling
+      keys = Nx.Random.split(key)
+      sample_key = keys[1]
+      key = keys[0]
+
+      log_probs = Nx.log(Nx.max(probs, 1.0e-10))
+      {uniform, _} = Nx.Random.uniform(sample_key, shape: Nx.shape(probs))
+      gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))
+      idx_next = Nx.argmax(Nx.add(log_probs, gumbel), axis: -1, keep_axis: true)
+      idx_next = Nx.as_type(idx_next, :s32)
+
+      new_idx = Nx.concatenate([idx, idx_next], axis: 1)
+      {new_idx, key}
+    end)
+
+  final_idx
+end
+```
+
+</details>
+
+## Demo: Generating Text
+
+Let's use both our implementation and the real `ExNanoGPT.Sampler` to generate text from the random tiny model. The output will be nonsensical (the model hasn't been trained), but it proves the pipeline works end-to-end.
+
+```elixir
+IO.puts("=== Generation with our implementation ===")
+prompt_ids = ExNanoGPT.Data.encode(meta, "\n")
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+our_output = generate.(idx, tiny_params, tiny_config, Nx.Random.key(42),
+  max_new_tokens: 200, temperature: 0.8, top_k: 20)
+
+our_text = our_output |> Nx.squeeze(axes: [0]) |> Nx.to_flat_list() |> then(&ExNanoGPT.Data.decode(meta, &1))
+IO.puts(our_text)
+```
+
+```elixir
+IO.puts("=== Generation with ExNanoGPT.Sampler ===")
+real_text = ExNanoGPT.Sampler.generate_text(
+  tiny_params, tiny_config, meta, "\n", Nx.Random.key(42),
+  max_new_tokens: 200, temperature: 0.8, top_k: 20
+)
+
+IO.puts(real_text)
+```
+
+```elixir
+# Let's also see how temperature affects the output
+for temp <- [0.1, 0.5, 1.0, 2.0] do
+  text = ExNanoGPT.Sampler.generate_text(
+    tiny_params, tiny_config, meta, "H", Nx.Random.key(123),
+    max_new_tokens: 80, temperature: temp, top_k: 10
+  )
+
+  IO.puts("--- temperature = #{temp} ---")
+  IO.puts(text)
+  IO.puts("")
+end
+```
+
+## From Random to Shakespeare
+
+With a random model, the output is gibberish. But the code is exactly the same code that generates real Shakespeare from a trained model. The only difference is the quality of the parameters.
+
+If you were to train the full model (6 layers, 384 dimensions, ~10M parameters) on the Shakespeare dataset for a few thousand iterations on a GPU, you'd see output like:
+
+```
+ROMEO:
+What shall I swear by? Thou art all my world:
+And yet no doubt thou know'st my love is young.
+```
+
+The architecture, the loss function, the optimizer, the training loop, and the generation code are all the same. The only things that change are scale (more layers, more dimensions, more data, more compute) and time (more training iterations).
+
+If you have access to a GPU with EXLA's CUDA backend, you can train the full model using `ExNanoGPT.Trainer.train/3` -- the same code we built piece by piece across these notebooks. Even on CPU, you can train a small model overnight and see it start producing recognizable English words, then phrases, then sentences that almost make sense.
+
+## Congratulations!
+
+You've built a complete GPT from scratch in Elixir. Here's everything you implemented across these notebooks:
+
+| Notebook | What you built |
+|----------|---------------|
+| **00: Language Models** | Tokenization, encoding/decoding, batching |
+| **01: Embeddings** | Token and position embeddings -- converting IDs to vectors |
+| **02: Layer Norm** | Normalizing activations for stable training |
+| **03: Self-Attention** | The core mechanism: letting tokens attend to each other |
+| **04: MLP** | Feed-forward layers with GELU activation |
+| **05: Transformer Block** | Pre-norm residual connections combining attention and MLP |
+| **06: The Full Model** | Stacking blocks with weight-tied input/output embeddings |
+| **07: Cross-Entropy Loss** | Measuring how wrong the model's predictions are |
+| **08: AdamW Optimizer** | Smartly adjusting parameters with momentum, adaptive LR, and weight decay |
+| **09: Training Loop** | Tying it all together: batch → forward → backward → update |
+| **10: Sampling** | Generating text with temperature, top-k, and the Gumbel-max trick |
+
+Every one of these components is present in GPT-2, GPT-3, and the models behind ChatGPT and Claude. The difference is scale -- more layers, more heads, more data, more compute -- but the fundamental ideas are the same ones you just built by hand.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Autoregressive generation** | Generating one token at a time, feeding each output back as the next input |
+| **Temperature** | Divides logits before softmax; low = deterministic, high = creative |
+| **Top-k filtering** | Only consider the k most likely tokens; set the rest to negative infinity |
+| **Gumbel-max trick** | Sample from a categorical distribution via `argmax(log_probs + Gumbel_noise)` |
+| **Context window** | The model can only see `block_size` tokens at once; crop longer sequences |
+| **Greedy decoding** | Always picking the most likely token (equivalent to temperature → 0) |

@@ -1,0 +1,501 @@
+# 09: The Training Loop
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Big Picture
+
+Training a neural network is a loop. Every iteration does the same four things:
+
+1. **Get a batch** of training data (random input/target pairs)
+2. **Forward pass** -- run the data through the model to get predictions and loss
+3. **Backward pass** -- compute gradients (how each parameter should change to reduce loss)
+4. **Optimizer step** -- use the gradients to update the parameters
+
+Repeat thousands of times. The loss goes down, and the model gets better at predicting the next token.
+
+```
+for each training step:
+    {x, y}   = get_batch(train_data)           # random chunk of Shakespeare
+    logits    = model.forward(x)                # what the model predicts
+    loss      = cross_entropy_loss(logits, y)   # how wrong it is
+    gradients = backward(loss)                  # direction to improve
+    params    = optimizer.step(params, grads)   # make the improvement
+```
+
+In this notebook, we'll implement each piece and then wire them together.
+
+## Automatic Differentiation: Gradients for Free
+
+The backward pass -- computing gradients -- sounds hard. For a model with millions of parameters, we need to know how much each one contributed to the loss. Doing this by hand would be impractical.
+
+Fortunately, Nx provides **automatic differentiation** through `Nx.Defn.value_and_grad`. You give it a function that computes a scalar loss from some parameters, and it gives you back both the loss value and the gradients with respect to those parameters. The gradients have the exact same structure as the parameters -- every tensor gets a matching gradient tensor.
+
+```elixir
+# Simple example: minimize f(x) = (x - 3)^2
+# The gradient is df/dx = 2*(x-3)
+
+loss_fn = fn x -> Nx.pow(Nx.subtract(x, 3.0), 2) end
+
+x = Nx.tensor(10.0)
+{loss, grad} = Nx.Defn.value_and_grad(loss_fn).(x)
+
+IO.puts("x = #{Nx.to_number(x)}")
+IO.puts("loss = (x-3)^2 = #{Nx.to_number(loss)}")
+IO.puts("gradient = 2*(x-3) = #{Nx.to_number(grad)}")
+IO.puts("(That's correct: 2*(10-3) = 14)")
+```
+
+```elixir
+# It works with maps of tensors too -- just like our model parameters
+loss_fn = fn params ->
+  a = params.weight
+  b = params.bias
+  # Some dummy loss function
+  Nx.sum(Nx.multiply(a, a)) |> Nx.add(Nx.sum(Nx.multiply(b, b)))
+end
+
+params = %{
+  weight: Nx.tensor([[1.0, 2.0], [3.0, 4.0]]),
+  bias: Nx.tensor([5.0, 6.0])
+}
+
+{loss, grads} = Nx.Defn.value_and_grad(loss_fn).(params)
+IO.inspect(loss, label: "loss")
+IO.inspect(grads.weight, label: "weight gradients")
+IO.inspect(grads.bias, label: "bias gradients")
+IO.puts("\nGradients have the same shape as parameters -- one gradient per parameter value")
+```
+
+## The Tuple Trick: Why We Pack Everything Together
+
+There's an important constraint with `Nx.Defn.value_and_grad` and EXLA: every tensor the loss function uses must be passed as an argument. If you capture a tensor from outside the function (via a closure), EXLA will complain -- it needs to trace all tensors at compile time.
+
+The solution in ExNanoGPT: pack everything into a single tuple argument. The loss function receives `{params, x, y, key}`, and `value_and_grad` returns gradients for all of them. We just throw away the gradients for `x`, `y`, and `key` since we only need the parameter gradients.
+
+```elixir
+# This is the pattern used in ExNanoGPT.Trainer.compute_loss_and_grads:
+
+# The loss function takes a SINGLE argument (a tuple of all tensors)
+loss_fn = fn {params, x, y} ->
+  # In real code: forward pass through model, then cross_entropy_loss
+  # Simplified: just compute a dummy loss from params and data
+  pred = Nx.dot(x, params.weight) |> Nx.add(params.bias)
+  diff = Nx.subtract(pred, y)
+  Nx.mean(Nx.multiply(diff, diff))
+end
+
+params = %{
+  weight: Nx.tensor([[0.1, 0.2], [0.3, 0.4]]),
+  bias: Nx.tensor([0.0, 0.0])
+}
+x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]])
+y = Nx.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+# value_and_grad traces the ENTIRE tuple
+{loss, {param_grads, _x_grads, _y_grads}} =
+  Nx.Defn.value_and_grad(loss_fn).({params, x, y})
+
+IO.inspect(loss, label: "loss")
+IO.inspect(param_grads.weight, label: "weight grads (keep these)")
+IO.inspect(param_grads.bias, label: "bias grads (keep these)")
+IO.puts("\nWe discard gradients for x and y -- we only need param gradients")
+```
+
+## Exercise: Implement `compute_loss_and_grads`
+
+Now let's implement this with the real model. Given model parameters, a batch `{x, y}`, and the model config, compute the forward pass, cross-entropy loss, and gradients.
+
+We'll use a **tiny model** (1 layer, 32-dim embedding) since we're running on CPU.
+
+```elixir
+# Set up a tiny model for exercises
+tiny_config = %{
+  vocab_size: 65,
+  block_size: 32,
+  n_layer: 1,
+  n_head: 2,
+  n_embd: 32,
+  dropout: 0.0,
+  bias: true
+}
+
+key = Nx.Random.key(42)
+tiny_params = ExNanoGPT.Model.init_params(tiny_config, key)
+IO.puts("Tiny model initialized: #{ExNanoGPT.Model.count_params(tiny_params)} parameters")
+```
+
+```elixir
+# Prepare some training data
+data_dir = ExNanoGPT.Data.data_dir()
+
+train_data =
+  if File.exists?(Path.join(data_dir, "train.bin")) do
+    ExNanoGPT.Data.load_bin(Path.join(data_dir, "train.bin"))
+  else
+    IO.puts("Data not found, preparing...")
+    ExNanoGPT.Data.prepare()
+    ExNanoGPT.Data.load_bin(Path.join(data_dir, "train.bin"))
+  end
+
+IO.puts("Training data loaded: #{Nx.axis_size(train_data, 0)} tokens")
+```
+
+```elixir
+compute_loss_and_grads = fn params, x, y, model_config, dropout_key ->
+  # TODO: implement compute_loss_and_grads
+  # 1. Create a loss_fn that takes {params, x, y, key} as a single tuple argument
+  # 2. Inside loss_fn:
+  #    a. Call ExNanoGPT.Model.forward_train(x, params, key, n_head: ..., dropout_rate: ...)
+  #    b. Call ExNanoGPT.Model.cross_entropy_loss(logits, y)
+  # 3. Use Nx.Defn.value_and_grad(loss_fn).({params, x, y, dropout_key})
+  # 4. Destructure to get {loss, {param_grads, _, _, _}}
+  # 5. Return {loss, param_grads}
+  {Nx.tensor(0.0), params}
+end
+
+# Test it
+batch_key = Nx.Random.key(0)
+{x, y} = ExNanoGPT.Batch.get_batch(train_data, batch_key,
+  batch_size: 4, block_size: tiny_config.block_size)
+
+dropout_key = Nx.Random.key(1)
+{loss, grads} = compute_loss_and_grads.(tiny_params, x, y, tiny_config, dropout_key)
+IO.puts("Loss: #{Nx.to_number(loss) |> Float.round(4)}")
+IO.puts("Expected: ~4.17 (random model with vocab_size=65, since -log(1/65) ≈ 4.17)")
+IO.puts("Gradient for wte shape: #{inspect(Nx.shape(grads.wte))}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+compute_loss_and_grads = fn params, x, y, model_config, dropout_key ->
+  n_head = model_config.n_head
+  dropout_rate = model_config.dropout
+
+  loss_fn = fn {params, x, y, key} ->
+    logits = ExNanoGPT.Model.forward_train(x, params, key,
+      n_head: n_head, dropout_rate: dropout_rate)
+    ExNanoGPT.Model.cross_entropy_loss(logits, y)
+  end
+
+  {loss, {param_grads, _x_grads, _y_grads, _key_grads}} =
+    Nx.Defn.value_and_grad(loss_fn).({params, x, y, dropout_key})
+
+  {loss, param_grads}
+end
+```
+
+</details>
+
+## Gradient Accumulation: Simulating Larger Batches
+
+GPU memory limits how many sequences we can process at once. If we want the model to learn from 64 sequences per step but can only fit 16 in memory, we can run 4 "micro-steps" of 16 and average the gradients. This is called **gradient accumulation**.
+
+The math works out because gradients are additive: the gradient of the average loss over 64 examples equals the average of gradients computed over 4 groups of 16.
+
+```
+# Without gradient accumulation (batch_size=64):
+grads = compute_grads(batch_of_64)
+optimizer.step(grads)
+
+# With gradient accumulation (4 micro-steps of 16):
+accumulated_grads = zeros
+for micro_step in 0..3:
+    grads = compute_grads(batch_of_16)
+    accumulated_grads += grads / 4     # scale by 1/accum_steps
+optimizer.step(accumulated_grads)
+
+# These give the same result!
+```
+
+## Exercise: Implement Gradient Accumulation
+
+```elixir
+accumulate_gradients = fn params, data, model_config, batch_size, block_size, accum_steps, base_seed ->
+  # TODO:
+  # For each micro_step from 0 to accum_steps-1:
+  #   1. Generate a batch with a unique PRNG key (use base_seed * accum_steps + micro_step)
+  #   2. Compute loss and gradients
+  #   3. Scale gradients by 1/accum_steps
+  #   4. Add to accumulated gradients
+  # Return {accumulated_grads, last_loss}
+  #
+  # Hint for adding gradient maps together: use a recursive function or
+  # Map.merge/3 with fn _k, a, b -> Nx.add(a, b) end
+  # For the blocks tuple, convert to list, zip, add, convert back.
+  {nil, Nx.tensor(0.0)}
+end
+
+# Test with 2 accumulation steps
+{acc_grads, last_loss} = accumulate_gradients.(
+  tiny_params, train_data, tiny_config,
+  _batch_size = 4, _block_size = 32, _accum_steps = 2, _base_seed = 42
+)
+
+IO.puts("Last micro-step loss: #{Nx.to_number(last_loss) |> Float.round(4)}")
+IO.puts("Accumulated grads wte shape: #{inspect(Nx.shape(acc_grads.wte))}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+accumulate_gradients = fn params, data, model_config, batch_size, block_size, accum_steps, base_seed ->
+  add_grads = fn
+    %Nx.Tensor{} = a, %Nx.Tensor{} = b -> Nx.add(a, b)
+    a, b when is_map(a) and is_map(b) ->
+      Map.merge(a, b, fn _k, va, vb ->
+        cond do
+          is_struct(va, Nx.Tensor) -> Nx.add(va, vb)
+          is_map(va) -> Map.merge(va, vb, fn _k2, x, y -> Nx.add(x, y) end)
+          is_tuple(va) ->
+            [Tuple.to_list(va), Tuple.to_list(vb)]
+            |> Enum.zip()
+            |> Enum.map(fn {x, y} ->
+              Map.merge(x, y, fn _k3, xx, yy ->
+                if is_map(xx) and not is_struct(xx) do
+                  Map.merge(xx, yy, fn _k4, a, b -> Nx.add(a, b) end)
+                else
+                  Nx.add(xx, yy)
+                end
+              end)
+            end)
+            |> List.to_tuple()
+        end
+      end)
+  end
+
+  n_head = model_config.n_head
+  dropout_rate = model_config.dropout
+
+  loss_fn = fn {params, x, y, key} ->
+    logits = ExNanoGPT.Model.forward_train(x, params, key,
+      n_head: n_head, dropout_rate: dropout_rate)
+    ExNanoGPT.Model.cross_entropy_loss(logits, y)
+  end
+
+  Enum.reduce(0..(accum_steps - 1), {nil, nil}, fn micro_step, {acc, _last_loss} ->
+    seed = base_seed * accum_steps + micro_step
+    batch_key = Nx.Random.key(seed)
+    {x, y} = ExNanoGPT.Batch.get_batch(data, batch_key,
+      batch_size: batch_size, block_size: block_size)
+
+    dropout_key = Nx.Random.key(seed + 1_000_000)
+    {loss, {param_grads, _, _, _}} =
+      Nx.Defn.value_and_grad(loss_fn).({params, x, y, dropout_key})
+
+    scaled_grads =
+      Map.new(param_grads, fn
+        {k, %Nx.Tensor{} = t} -> {k, Nx.divide(t, accum_steps)}
+        {k, v} when is_tuple(v) ->
+          scaled = v |> Tuple.to_list() |> Enum.map(fn block_map ->
+            Map.new(block_map, fn {bk, bv} ->
+              if is_map(bv) and not is_struct(bv) do
+                {bk, Map.new(bv, fn {k2, t} -> {k2, Nx.divide(t, accum_steps)} end)}
+              else
+                {bk, Nx.divide(bv, accum_steps)}
+              end
+            end)
+          end) |> List.to_tuple()
+          {k, scaled}
+        {k, v} when is_map(v) ->
+          {k, Map.new(v, fn {k2, t} -> {k2, Nx.divide(t, accum_steps)} end)}
+      end)
+
+    new_acc = if acc == nil, do: scaled_grads, else: add_grads.(acc, scaled_grads)
+    scaled_loss = Nx.divide(loss, accum_steps)
+    {new_acc, scaled_loss}
+  end)
+end
+```
+
+This is admittedly verbose because of the nested parameter structure. The real implementation in `ExNanoGPT.Trainer` uses recursive helper functions to walk the parameter tree. The concept is simple even though the tree traversal code is a bit tedious.
+
+</details>
+
+## Exercise: Implement `estimate_loss`
+
+During training, we periodically evaluate the model on both training and validation data to track progress. We run the model on many random batches (without computing gradients) and average the losses.
+
+```elixir
+estimate_loss = fn params, model_config, data, batch_size, block_size, eval_iters ->
+  # TODO:
+  # For each i from 0 to eval_iters-1:
+  #   1. Get a batch (use Nx.Random.key(i + 50_000) as key)
+  #   2. Forward pass with dropout_rate: 0.0 (evaluation mode)
+  #   3. Compute cross-entropy loss
+  #   4. Convert to float with Nx.to_number
+  # Return the average loss as a float
+
+  # Hint: use ExNanoGPT.Model.forward_train with dropout_rate: 0.0
+  # (not the inference-mode forward, because we need full-sequence logits)
+  0.0
+end
+
+# Test with a few batches
+avg_loss = estimate_loss.(tiny_params, tiny_config, train_data, 4, 32, 10)
+IO.puts("Average loss over 10 batches: #{Float.round(avg_loss, 4)}")
+IO.puts("Expected: ~4.17 (random model)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+estimate_loss = fn params, model_config, data, batch_size, block_size, eval_iters ->
+  losses =
+    for i <- 0..(eval_iters - 1) do
+      batch_key = Nx.Random.key(i + 50_000)
+      {x, y} = ExNanoGPT.Batch.get_batch(data, batch_key,
+        batch_size: batch_size, block_size: block_size)
+
+      logits = ExNanoGPT.Model.forward_train(x, params, Nx.Random.key(0),
+        n_head: model_config.n_head, dropout_rate: 0.0)
+      loss = ExNanoGPT.Model.cross_entropy_loss(logits, y)
+      Nx.to_number(loss)
+    end
+
+  Enum.sum(losses) / length(losses)
+end
+```
+
+</details>
+
+## Checkpointing: Save and Load with Erlang Term Format
+
+Elixir has a simple built-in serialization format: **Erlang Term Format (ETF)**. We can serialize any Erlang/Elixir term -- including maps of Nx tensors -- to a binary and write it to disk.
+
+```elixir
+# Save a checkpoint
+checkpoint = %{
+  params: tiny_params,
+  model_config: tiny_config,
+  iter: 0,
+  best_val_loss: :infinity
+}
+
+ckpt_path = Path.join(System.tmp_dir!(), "notebook_ckpt.etf")
+File.write!(ckpt_path, :erlang.term_to_binary(checkpoint))
+file_size = File.stat!(ckpt_path).size
+IO.puts("Checkpoint saved: #{ckpt_path}")
+IO.puts("Size: #{Float.round(file_size / 1024, 1)} KB")
+```
+
+```elixir
+# Load it back
+loaded = ckpt_path |> File.read!() |> :erlang.binary_to_term()
+IO.puts("Loaded checkpoint at iter #{loaded.iter}")
+IO.puts("Params wte shape: #{inspect(Nx.shape(loaded.params.wte))}")
+IO.puts("Config: #{inspect(loaded.model_config)}")
+
+# Clean up
+File.rm!(ckpt_path)
+```
+
+## Putting It All Together: A Tiny Training Run
+
+Let's run a few training steps with our tiny model. This won't produce good text, but it demonstrates the complete pipeline: batch → forward → loss → backward → optimizer step.
+
+```elixir
+# Training config (very small for CPU)
+tiny_train_config = %{
+  batch_size: 4,
+  block_size: 32,
+  gradient_accumulation_steps: 1,
+  max_iters: 30,
+  log_interval: 5
+}
+
+optim_config = %{
+  learning_rate: 1.0e-3,
+  beta1: 0.9,
+  beta2: 0.95,
+  eps: 1.0e-8,
+  weight_decay: 0.1,
+  warmup_iters: 5,
+  lr_decay_iters: 50,
+  min_lr: 1.0e-4,
+  grad_clip: 1.0
+}
+
+IO.puts("Training tiny model for #{tiny_train_config.max_iters} steps...")
+IO.puts("  batch_size: #{tiny_train_config.batch_size}")
+IO.puts("  block_size: #{tiny_train_config.block_size}")
+IO.puts("")
+
+# Set up the loss+grad function
+n_head = tiny_config.n_head
+dropout_rate = tiny_config.dropout
+
+loss_fn = fn {params, x, y, key} ->
+  logits = ExNanoGPT.Model.forward_train(x, params, key,
+    n_head: n_head, dropout_rate: dropout_rate)
+  ExNanoGPT.Model.cross_entropy_loss(logits, y)
+end
+
+grad_fn = Nx.Defn.value_and_grad(loss_fn)
+
+# Initialize optimizer state
+opt_state = ExNanoGPT.Optimizer.init(tiny_params)
+
+# Training loop
+{final_params, _final_opt_state, losses} =
+  Enum.reduce(0..(tiny_train_config.max_iters - 1), {tiny_params, opt_state, []}, fn iter, {params, opt_state, losses} ->
+    # Get batch
+    batch_key = Nx.Random.key(iter)
+    {x, y} = ExNanoGPT.Batch.get_batch(train_data, batch_key,
+      batch_size: tiny_train_config.batch_size,
+      block_size: tiny_train_config.block_size)
+
+    # Forward + backward
+    dropout_key = Nx.Random.key(iter + 1_000_000)
+    {loss, {param_grads, _, _, _}} = grad_fn.({params, x, y, dropout_key})
+
+    loss_val = Nx.to_number(loss)
+
+    # Log
+    if rem(iter, tiny_train_config.log_interval) == 0 do
+      lr = ExNanoGPT.Optimizer.get_lr(elem(opt_state, 0), optim_config)
+      IO.puts("step #{String.pad_leading("#{iter}", 3)}: loss=#{Float.round(loss_val, 4)}, lr=#{Float.round(lr, 8)}")
+    end
+
+    # Optimizer step
+    {new_params, new_opt_state} = ExNanoGPT.Optimizer.step(params, param_grads, opt_state, optim_config)
+
+    {new_params, new_opt_state, [loss_val | losses]}
+  end)
+
+losses = Enum.reverse(losses)
+IO.puts("\nFirst loss: #{Float.round(List.first(losses), 4)}")
+IO.puts("Final loss: #{Float.round(List.last(losses), 4)}")
+IO.puts("Loss decreased: #{List.last(losses) < List.first(losses)}")
+```
+
+If the loss went down, training is working. The model is learning something -- even if it's too small and too few steps to generate coherent text.
+
+## What's Next
+
+The training loop is complete. With enough time, data, and compute (ideally a GPU), this exact code would train a model that writes passable Shakespeare.
+
+In the next and final notebook, we'll close the loop: take a trained model and **generate text** from it. We'll implement temperature scaling, top-k filtering, and the autoregressive sampling loop.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Training loop** | The repeated cycle: get batch → forward → loss → backward → optimizer step |
+| **Automatic differentiation** | `Nx.Defn.value_and_grad` computes gradients automatically from a loss function |
+| **The tuple trick** | Pack all tensors into one argument so EXLA can trace them; discard non-parameter gradients |
+| **Gradient accumulation** | Run multiple small batches and average their gradients to simulate a larger batch |
+| **Evaluation** | Run forward pass on many batches without gradients to estimate average loss |
+| **Checkpointing** | Save model parameters + optimizer state to disk using Erlang Term Format |
+| **Sanity check** | Initial loss should be around `-log(1/vocab_size)` for a random model |

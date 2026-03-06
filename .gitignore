@@ -9,13 +9,12 @@ erl_crash.dump
 ex_nano_gpt-*.tar
 
 # Data files
-/data/*.bin
-/data/*.txt
-/data/*.pkl
+/data/
 
-# Checkpoints
-/checkpoints/
+# Checkpoints and training output
+/out-*/
 *.ckpt
+*.etf
 
 # Golden test artifacts (regenerated from Python)
 /test/golden/*.npy

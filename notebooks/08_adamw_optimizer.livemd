@@ -1,0 +1,451 @@
+# 08: The AdamW Optimizer
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Big Picture
+
+We now have a model that produces logits and a loss function that measures how wrong they are. The missing piece: **how do we adjust the model's parameters to make the loss go down?**
+
+That's what an optimizer does. It looks at the gradients (which tell us how to change each parameter to reduce the loss) and updates the parameters accordingly.
+
+We'll build up from the simplest optimizer to the one nanoGPT actually uses.
+
+## Starting Simple: Stochastic Gradient Descent (SGD)
+
+The simplest optimizer: multiply each gradient by a small number (the **learning rate**) and subtract it from the parameter.
+
+```
+new_parameter = old_parameter - learning_rate * gradient
+```
+
+That's it. The gradient points in the direction of *increasing* loss, so we go the opposite way.
+
+```elixir
+# A toy optimization problem: find the value of x that minimizes (x - 3)^2
+# The answer is obviously x = 3, but let's let SGD find it
+
+sgd_step = fn x, lr ->
+  gradient = 2.0 * (x - 3.0)
+  x - lr * gradient
+end
+
+# Start at x = 10.0 with learning rate 0.1
+{x, history} =
+  Enum.reduce(1..20, {10.0, [10.0]}, fn _step, {x, hist} ->
+    new_x = sgd_step.(x, 0.1)
+    {new_x, [new_x | hist]}
+  end)
+
+history = Enum.reverse(history)
+IO.puts("SGD finds x = #{Float.round(x, 6)} (target: 3.0)")
+IO.puts("First 10 steps: #{inspect(Enum.take(history, 10) |> Enum.map(&Float.round(&1, 3)))}")
+```
+
+SGD works, but it has problems:
+- **Noisy gradients**: each mini-batch gives slightly different gradients, causing the parameter to bounce around
+- **One learning rate for all parameters**: some parameters need big updates, others need tiny ones
+- **No momentum**: it can get stuck oscillating in narrow valleys
+
+## Adam: Smarter Updates with Running Averages
+
+Adam fixes all three problems by keeping track of two running averages for each parameter:
+
+**First moment `m` (momentum)**: a smoothed average of recent gradients. Instead of reacting to every noisy gradient, the optimizer builds up a "consensus direction" over time. Think of it like a heavy ball rolling downhill -- it doesn't instantly change direction with every bump.
+
+```
+m = beta1 * m + (1 - beta1) * gradient
+```
+
+Here `beta1` is typically 0.9, meaning the new `m` is 90% old momentum + 10% current gradient.
+
+**Second moment `v` (adaptive learning rate)**: a smoothed average of squared gradients. This tracks how "volatile" each parameter's gradient is. Parameters with consistently large gradients get smaller learning rates; parameters with small gradients get larger ones. It's an automatic per-parameter learning rate adjustment.
+
+```
+v = beta2 * v + (1 - beta2) * gradient^2
+```
+
+Here `beta2` is typically 0.95 (nanoGPT) or 0.999.
+
+The update divides the momentum by the square root of the variance:
+
+```
+parameter -= learning_rate * m / (sqrt(v) + epsilon)
+```
+
+Each symbol:
+- `m` -- the smoothed gradient direction (which way to go)
+- `sqrt(v)` -- how much the gradient fluctuates (bigger = more cautious)
+- `epsilon` -- tiny constant (1e-8) to prevent division by zero
+- `learning_rate` -- overall step size
+
+**Bias correction**: There's one subtlety. At step 1, `m` and `v` were initialized to zero, so they're biased toward zero. We fix this by dividing by `(1 - beta^t)` where `t` is the step number. Early on, this correction is large; as `t` grows, it approaches 1 and has no effect.
+
+```
+m_corrected = m / (1 - beta1^t)
+v_corrected = v / (1 - beta2^t)
+```
+
+```elixir
+# Let's see bias correction in action
+beta1 = 0.9
+
+IO.puts("Bias correction factor 1/(1-β₁ᵗ) at each step:")
+
+for t <- [1, 2, 5, 10, 50, 100] do
+  correction = 1.0 / (1.0 - :math.pow(beta1, t))
+  IO.puts("  step #{String.pad_leading("#{t}", 3)}: #{Float.round(correction, 4)}x")
+end
+
+IO.puts("\nAt step 1, the correction is 10x (huge!)")
+IO.puts("By step 100, it's barely 1.0 (negligible)")
+```
+
+## AdamW: Decoupling Weight Decay
+
+Classic Adam applies weight decay through the gradient: it adds `weight_decay * parameter` to the gradient before the Adam update. The problem is that Adam's adaptive learning rate then *also* scales the weight decay, which isn't what we want.
+
+**AdamW** decouples the two: it applies weight decay directly to the parameter, completely independent of the adaptive gradient step.
+
+```
+# Standard Adam (weight decay mixed into gradient):
+gradient = gradient + weight_decay * parameter   # decay goes through Adam's scaling
+parameter -= lr * adam_update(gradient)
+
+# AdamW (weight decay separate):
+parameter -= lr * adam_update(gradient)           # pure Adam step
+parameter -= lr * weight_decay * parameter        # separate decay step
+```
+
+This small change makes a real difference -- it's what nanoGPT and most modern transformers use.
+
+## Exercise: Implement One AdamW Update Step
+
+Given a single parameter tensor with its gradient, the running `m` and `v` states, and the hyperparameters, compute the updated parameter and new optimizer state.
+
+The full AdamW update for one parameter at step `t`:
+
+1. `m = beta1 * m + (1 - beta1) * grad` -- update momentum
+2. `v = beta2 * v + (1 - beta2) * grad * grad` -- update variance estimate
+3. `m_hat = m / (1 - beta1^t)` -- bias-corrected momentum
+4. `v_hat = v / (1 - beta2^t)` -- bias-corrected variance
+5. `param = param - lr * m_hat / (sqrt(v_hat) + eps)` -- Adam step
+6. `param = param - lr * weight_decay * param` -- weight decay (only for 2D+ tensors)
+
+```elixir
+adamw_update_single = fn param, grad, m, v, lr, t, config ->
+  # config has keys: :beta1, :beta2, :eps, :weight_decay
+
+  # TODO: implement one AdamW step
+  # Return {new_param, new_m, new_v}
+  {param, m, v}
+end
+
+config = %{beta1: 0.9, beta2: 0.95, eps: 1.0e-8, weight_decay: 0.1}
+
+# Test: a 2x3 weight matrix (2D, so weight decay applies)
+param = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+grad = Nx.tensor([[0.1, -0.2, 0.3], [-0.1, 0.4, -0.5]])
+m = Nx.broadcast(0.0, {2, 3})
+v = Nx.broadcast(0.0, {2, 3})
+lr = 0.001
+t = 1
+
+{new_param, new_m, new_v} = adamw_update_single.(param, grad, m, v, lr, t, config)
+IO.inspect(new_param, label: "updated parameter")
+IO.inspect(new_m, label: "new m (momentum)")
+IO.inspect(new_v, label: "new v (variance)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+adamw_update_single = fn param, grad, m, v, lr, t, config ->
+  %{beta1: b1, beta2: b2, eps: eps, weight_decay: wd} = config
+
+  new_m = Nx.add(Nx.multiply(b1, m), Nx.multiply(1.0 - b1, grad))
+  new_v = Nx.add(Nx.multiply(b2, v), Nx.multiply(1.0 - b2, Nx.multiply(grad, grad)))
+
+  m_hat = Nx.divide(new_m, 1.0 - :math.pow(b1, t))
+  v_hat = Nx.divide(new_v, 1.0 - :math.pow(b2, t))
+
+  adam_step = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), eps)))
+  decay_step = Nx.multiply(lr * wd, param)
+
+  new_param = Nx.subtract(Nx.subtract(param, adam_step), decay_step)
+
+  {new_param, new_m, new_v}
+end
+```
+
+</details>
+
+## The Cosine Learning Rate Schedule
+
+Using a fixed learning rate isn't ideal. Modern training uses a **schedule** that changes the learning rate over time:
+
+1. **Warmup**: start from a very small LR and linearly increase to the peak LR over the first N steps. This prevents the model from making huge, destructive updates early on when the gradients are noisy and the parameters are random.
+
+2. **Cosine decay**: after warmup, smoothly decrease the LR following a cosine curve down to a minimum value. This lets the model make big updates early (exploring) and fine-grained updates later (polishing).
+
+3. **Constant minimum**: after the decay period, hold at the minimum LR.
+
+```elixir
+# Visualize what the schedule looks like
+lr = 6.0e-4
+min_lr = 6.0e-5
+warmup_iters = 2000
+lr_decay_iters = 600_000
+
+points =
+  for iter <- Enum.concat([
+    Enum.to_list(0..2500//100),
+    Enum.to_list(3000..600_000//10_000),
+    Enum.to_list(600_000..650_000//10_000)
+  ]) do
+    computed_lr =
+      cond do
+        iter < warmup_iters ->
+          lr * (iter + 1) / (warmup_iters + 1)
+
+        iter > lr_decay_iters ->
+          min_lr
+
+        true ->
+          decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
+          coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          min_lr + coeff * (lr - min_lr)
+      end
+
+    {iter, computed_lr}
+  end
+
+IO.puts("LR schedule samples:")
+for {iter, computed_lr} <- Enum.take(points, 5) do
+  IO.puts("  step #{iter}: lr = #{Float.round(computed_lr, 8)}")
+end
+IO.puts("  ...")
+IO.puts("  step #{warmup_iters}: lr = #{Float.round(lr, 8)} (peak)")
+IO.puts("  step #{div(lr_decay_iters, 2)}: lr = #{Float.round(min_lr + 0.5 * (lr - min_lr), 8)} (midpoint)")
+IO.puts("  step #{lr_decay_iters}: lr = #{Float.round(min_lr, 8)} (minimum)")
+```
+
+## Exercise: Implement the Cosine LR Schedule with Warmup
+
+```elixir
+get_lr = fn iter, config ->
+  # config has keys: :learning_rate, :warmup_iters, :lr_decay_iters, :min_lr
+
+  # TODO: implement the 3-phase LR schedule
+  # Phase 1 (iter < warmup): linear ramp from ~0 to learning_rate
+  #   lr * (iter + 1) / (warmup + 1)
+  # Phase 2 (warmup <= iter <= decay_iters): cosine decay
+  #   decay_ratio = (iter - warmup) / (decay_iters - warmup)
+  #   coeff = 0.5 * (1.0 + cos(pi * decay_ratio))
+  #   min_lr + coeff * (lr - min_lr)
+  # Phase 3 (iter > decay_iters): constant min_lr
+  0.0
+end
+
+lr_config = %{
+  learning_rate: 6.0e-4,
+  warmup_iters: 2000,
+  lr_decay_iters: 600_000,
+  min_lr: 6.0e-5
+}
+
+# Test key points
+IO.puts("Step 0 (start of warmup): #{get_lr.(0, lr_config) |> Float.round(8)}")
+IO.puts("Step 1999 (end of warmup): #{get_lr.(1999, lr_config) |> Float.round(8)}")
+IO.puts("Step 2000 (peak): #{get_lr.(2000, lr_config) |> Float.round(8)}")
+IO.puts("Step 301000 (midpoint): #{get_lr.(301_000, lr_config) |> Float.round(8)}")
+IO.puts("Step 600000 (end of decay): #{get_lr.(600_000, lr_config) |> Float.round(8)}")
+IO.puts("Step 700000 (after decay): #{get_lr.(700_000, lr_config) |> Float.round(8)}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+get_lr = fn iter, config ->
+  %{learning_rate: lr, warmup_iters: warmup, lr_decay_iters: decay_iters, min_lr: min_lr} = config
+
+  cond do
+    iter < warmup ->
+      lr * (iter + 1) / (warmup + 1)
+
+    iter > decay_iters ->
+      min_lr
+
+    true ->
+      decay_ratio = (iter - warmup) / (decay_iters - warmup)
+      coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+      min_lr + coeff * (lr - min_lr)
+  end
+end
+```
+
+</details>
+
+## Exercise: Implement Gradient Clipping by Global Norm
+
+When training is unstable, gradients can become very large ("exploding gradients"). Gradient clipping prevents this by scaling all gradients down if their total magnitude exceeds a threshold.
+
+The **global norm** is computed across *all* parameters at once:
+
+```
+global_norm = sqrt(sum of (gradient_i^2) for every element of every parameter)
+```
+
+If `global_norm > max_norm`, we scale every gradient by `max_norm / global_norm`. This preserves the direction of the gradients but limits their magnitude.
+
+```elixir
+clip_grad_norm = fn grads, max_norm ->
+  # grads is a flat map of %{name => tensor}
+  # max_norm is the threshold (e.g. 1.0)
+  # Return clipped grads (same structure)
+
+  # TODO:
+  # 1. Compute sum of squares for each gradient tensor
+  # 2. Sum them all to get total sum of squares
+  # 3. Take sqrt to get global norm
+  # 4. If global_norm > max_norm, scale all grads by (max_norm / global_norm)
+  # 5. Otherwise return grads unchanged
+  grads
+end
+
+# Test with gradients that are too large
+big_grads = %{
+  w1: Nx.tensor([[3.0, 4.0]]),
+  w2: Nx.tensor([[0.0, 5.0]])
+}
+
+# Global norm = sqrt(9 + 16 + 0 + 25) = sqrt(50) ≈ 7.07
+norm_before = :math.sqrt(Nx.to_number(Nx.sum(Nx.multiply(big_grads.w1, big_grads.w1))) +
+  Nx.to_number(Nx.sum(Nx.multiply(big_grads.w2, big_grads.w2))))
+IO.puts("Global norm before clipping: #{Float.round(norm_before, 4)}")
+
+clipped = clip_grad_norm.(big_grads, 1.0)
+norm_after = :math.sqrt(Nx.to_number(Nx.sum(Nx.multiply(clipped.w1, clipped.w1))) +
+  Nx.to_number(Nx.sum(Nx.multiply(clipped.w2, clipped.w2))))
+IO.puts("Global norm after clipping:  #{Float.round(norm_after, 4)} (should be ~1.0)")
+IO.puts("Direction preserved: gradients scaled proportionally")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+clip_grad_norm = fn grads, max_norm ->
+  sum_sq =
+    grads
+    |> Map.values()
+    |> Enum.map(fn t -> Nx.sum(Nx.multiply(t, t)) end)
+    |> Enum.reduce(Nx.tensor(0.0), &Nx.add/2)
+
+  global_norm = :math.sqrt(Nx.to_number(sum_sq))
+
+  if global_norm > max_norm do
+    scale = max_norm / (global_norm + 1.0e-6)
+    Map.new(grads, fn {k, v} -> {k, Nx.multiply(v, scale)} end)
+  else
+    grads
+  end
+end
+```
+
+</details>
+
+## Weight Decay Groups: Which Parameters Get Decayed?
+
+Not all parameters should have weight decay. The rule in nanoGPT (and GPT-2 generally):
+
+- **Decay**: 2D+ tensors (weight matrices in linear layers and embeddings). These have many parameters and benefit from regularization.
+- **No decay**: 1D tensors (biases, layer norm scale/shift). These have few parameters and decaying them hurts performance.
+
+The check is simple: if the tensor has 2 or more dimensions, apply weight decay; otherwise, don't.
+
+```elixir
+# Examples of what gets decayed vs. not
+examples = [
+  {"attention weight (2D)", Nx.iota({64, 64}), true},
+  {"embedding table (2D)", Nx.iota({65, 64}), true},
+  {"bias (1D)", Nx.iota({64}), false},
+  {"layer norm gamma (1D)", Nx.iota({64}), false}
+]
+
+for {name, tensor, should_decay} <- examples do
+  ndim = tuple_size(Nx.shape(tensor))
+  decayed = ndim >= 2
+  status = if decayed, do: "DECAY", else: "NO DECAY"
+  check = if decayed == should_decay, do: "✓", else: "✗"
+  IO.puts("#{check} #{status} - #{name} (#{ndim}D, shape #{inspect(Nx.shape(tensor))})")
+end
+```
+
+This is exactly what `ExNanoGPT.Optimizer` does -- it checks `tuple_size(Nx.shape(param)) >= 2` and sets weight decay to 0 for 1D parameters.
+
+## Verify LR Schedule Against the Real Implementation
+
+```elixir
+optim_config = ExNanoGPT.Optimizer.default_config()
+IO.inspect(optim_config, label: "default optimizer config")
+
+test_iters = [0, 100, 1000, 1999, 2000, 2001, 100_000, 300_000, 600_000, 700_000]
+
+IO.puts("\nLR schedule comparison:")
+IO.puts(String.pad_trailing("Step", 10) <> String.pad_trailing("Real", 15) <> "Ours")
+IO.puts(String.duplicate("-", 40))
+
+for iter <- test_iters do
+  real_lr = ExNanoGPT.Optimizer.get_lr(iter, optim_config)
+
+  # Our implementation
+  our_lr = cond do
+    iter < optim_config.warmup_iters ->
+      optim_config.learning_rate * (iter + 1) / (optim_config.warmup_iters + 1)
+    iter > optim_config.lr_decay_iters ->
+      optim_config.min_lr
+    true ->
+      ratio = (iter - optim_config.warmup_iters) / (optim_config.lr_decay_iters - optim_config.warmup_iters)
+      coeff = 0.5 * (1.0 + :math.cos(:math.pi() * ratio))
+      optim_config.min_lr + coeff * (optim_config.learning_rate - optim_config.min_lr)
+  end
+
+  IO.puts(
+    String.pad_trailing("#{iter}", 10) <>
+    String.pad_trailing("#{Float.round(real_lr, 10)}", 15) <>
+    "#{Float.round(our_lr, 10)}"
+  )
+end
+```
+
+## What's Next
+
+We now have all the ingredients for training:
+- A model that produces logits (notebooks 01-06)
+- A loss function that measures wrongness (notebook 07)
+- An optimizer that knows how to improve parameters (this notebook)
+
+In the next notebook, we'll assemble the **training loop** -- the code that ties these pieces together and actually teaches the model to generate Shakespeare.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **SGD** | Simplest optimizer: subtract `lr * gradient` from each parameter |
+| **Adam** | Tracks momentum (`m`) and gradient variance (`v`) for smarter, per-parameter updates |
+| **Bias correction** | Divides `m` and `v` by `(1 - beta^t)` to fix the zero-initialization bias in early steps |
+| **AdamW** | Adam with decoupled weight decay -- applies decay directly to parameters, not through gradients |
+| **Weight decay** | Gently pushes parameters toward zero to prevent overfitting (L2 regularization) |
+| **Weight decay groups** | Only decay 2D+ tensors (weights); skip biases and layer norm parameters |
+| **Learning rate schedule** | Changes LR over time: linear warmup → cosine decay → constant minimum |
+| **Gradient clipping** | Scales all gradients down if their global norm exceeds a threshold, preventing training instability |

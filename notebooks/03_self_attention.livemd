@@ -1,0 +1,306 @@
+# 03: Self-Attention
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Core Idea
+
+Self-attention is the mechanism that lets each token "look at" every other token in the sequence and decide how much to pay attention to it.
+
+Consider predicting the next word in: "The cat sat on the ___"
+
+The blank should be influenced by "cat" (it's the subject) and "sat on" (the verb phrase). Self-attention lets the model learn these relationships -- which tokens matter for predicting each position.
+
+## Queries, Keys, and Values
+
+The attention mechanism uses three projections of the input:
+
+- **Query (Q)**: "What am I looking for?"
+- **Key (K)**: "What do I contain?"
+- **Value (V)**: "What information do I provide?"
+
+Think of it like a search engine:
+- The query is your search term
+- Keys are the titles of documents
+- Values are the actual content of documents
+- The search engine compares your query against all keys, then returns a weighted mix of values
+
+```elixir
+# Start simple: 1 batch, 4 tokens, 8-dimensional embeddings
+batch = 1
+seq_len = 4
+n_embd = 8
+
+key_rng = Nx.Random.key(42)
+{x, _} = Nx.Random.normal(key_rng, shape: {batch, seq_len, n_embd})
+IO.inspect(Nx.shape(x), label: "input x")
+```
+
+## Step 1: Project to Q, K, V
+
+In nanoGPT, Q, K, and V are computed with a single big linear layer (`c_attn`) that produces all three at once, then we split the output into thirds.
+
+```elixir
+# c_attn projects from n_embd to 3*n_embd (Q, K, V concatenated)
+{c_attn_weight, _} = Nx.Random.normal(Nx.Random.key(1), 0.0, 0.02, shape: {n_embd, 3 * n_embd})
+c_attn_bias = Nx.broadcast(0.0, {3 * n_embd})
+
+# Project: x @ weight + bias
+qkv = Nx.dot(x, [-1], c_attn_weight, [0]) |> Nx.add(c_attn_bias)
+IO.inspect(Nx.shape(qkv), label: "QKV combined shape (should be {1, 4, 24})")
+```
+
+### Exercise: Split QKV
+
+Split the combined tensor into separate Q, K, V tensors, each of shape `{batch, seq_len, n_embd}`.
+
+```elixir
+split_qkv = fn qkv, n_embd ->
+  # TODO: slice along the last axis to get Q, K, V
+  # Q = qkv[:, :, 0..n_embd-1]
+  # K = qkv[:, :, n_embd..2*n_embd-1]
+  # V = qkv[:, :, 2*n_embd..3*n_embd-1]
+  {nil, nil, nil}
+end
+
+{q, k, v} = split_qkv.(qkv, n_embd)
+IO.inspect(Nx.shape(q), label: "Q shape (should be {1, 4, 8})")
+IO.inspect(Nx.shape(k), label: "K shape (should be {1, 4, 8})")
+IO.inspect(Nx.shape(v), label: "V shape (should be {1, 4, 8})")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+split_qkv = fn qkv, n_embd ->
+  q = Nx.slice_along_axis(qkv, 0, n_embd, axis: 2)
+  k = Nx.slice_along_axis(qkv, n_embd, n_embd, axis: 2)
+  v = Nx.slice_along_axis(qkv, 2 * n_embd, n_embd, axis: 2)
+  {q, k, v}
+end
+```
+
+</details>
+
+## Step 2: Compute Attention Scores
+
+How much should token `i` attend to token `j`? We measure this with the **dot product** of their Q and K vectors.
+
+If Q and K point in similar directions (large positive dot product), the attention score is high. If they're orthogonal, the score is near zero.
+
+```elixir
+# Q @ K^T gives us the raw attention scores
+# Shape: {batch, seq_len, seq_len} — a score for every pair of tokens
+att = Nx.dot(q, [-1], k, [-1])
+IO.inspect(Nx.shape(att), label: "attention scores shape")
+IO.inspect(att[0], label: "attention matrix (token i attends to token j)")
+```
+
+### Scaling
+
+The dot products grow with the embedding dimension (more dimensions = bigger sums). This pushes values into the extremes of softmax, making gradients tiny. We fix this by dividing by `sqrt(head_dim)`.
+
+```elixir
+scale = :math.sqrt(n_embd) |> then(&Nx.tensor(1.0 / &1))
+att = Nx.multiply(att, scale)
+IO.inspect(att[0], label: "scaled attention scores")
+```
+
+## Step 3: Causal Masking
+
+For language modeling, token `i` should only attend to tokens `0..i` (not future tokens). Otherwise the model could "cheat" by looking at the answer.
+
+We enforce this with a **causal mask**: set future positions to negative infinity before softmax, so they become zero probability.
+
+### Exercise: Build the Causal Mask
+
+```elixir
+build_causal_mask = fn seq_len ->
+  # TODO: create a {seq_len, seq_len} tensor where:
+  # - position (i, j) is 1 if j <= i (can attend)
+  # - position (i, j) is 0 if j > i (cannot attend — future)
+  # Hint: compare row indices against column indices
+  nil
+end
+
+mask = build_causal_mask.(4)
+IO.inspect(mask, label: "causal mask (4x4)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+build_causal_mask = fn seq_len ->
+  rows = Nx.iota({seq_len, seq_len}, axis: 0)
+  cols = Nx.iota({seq_len, seq_len}, axis: 1)
+  Nx.greater_equal(rows, cols)
+end
+```
+
+The mask is a lower-triangular matrix:
+```
+1 0 0 0
+1 1 0 0
+1 1 1 0
+1 1 1 1
+```
+
+</details>
+
+```elixir
+# Apply the mask: replace masked positions with -infinity
+mask = build_causal_mask.(seq_len) |> Nx.reshape({1, seq_len, seq_len})
+neg_inf = Nx.Constants.neg_infinity(:f32) |> Nx.broadcast({batch, seq_len, seq_len})
+att = Nx.select(mask, att, neg_inf)
+IO.inspect(att[0], label: "masked attention (upper triangle is -inf)")
+```
+
+## Step 4: Softmax
+
+Convert raw scores to probabilities. Each row sums to 1.0, and the `-inf` values become exactly 0.
+
+```elixir
+softmax = fn x ->
+  max = Nx.reduce_max(x, axes: [-1], keep_axes: true)
+  exp = Nx.exp(Nx.subtract(x, max))
+  Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+end
+
+att = softmax.(att)
+IO.inspect(att[0], label: "attention weights (rows sum to 1)")
+```
+
+## Step 5: Weighted Sum of Values
+
+Multiply the attention weights by the values. Token `i`'s output is a weighted combination of all tokens' values, weighted by how much attention `i` pays to each.
+
+```elixir
+# att @ v = weighted sum of values
+output = Nx.dot(att, [-1], v, [-2])
+IO.inspect(Nx.shape(output), label: "output shape (should be {1, 4, 8})")
+```
+
+## Multi-Head Attention
+
+One attention "head" can only focus on one pattern. **Multi-head attention** runs several attention heads in parallel, each looking at a different aspect of the data.
+
+We don't increase computation: we split the embedding into `n_head` heads, each of size `head_dim = n_embd / n_head`. After attention, we concatenate the heads back together.
+
+```elixir
+n_head = 2
+head_dim = div(n_embd, n_head)  # 8 / 2 = 4
+
+# Reshape: {batch, seq_len, n_embd} -> {batch, n_head, seq_len, head_dim}
+reshape_to_heads = fn x ->
+  {b, t, _c} = Nx.shape(x)
+  x |> Nx.reshape({b, t, n_head, head_dim}) |> Nx.transpose(axes: [0, 2, 1, 3])
+end
+
+# Reshape back: {batch, n_head, seq_len, head_dim} -> {batch, seq_len, n_embd}
+reshape_from_heads = fn x ->
+  {b, _h, t, _d} = Nx.shape(x)
+  x |> Nx.transpose(axes: [0, 2, 1, 3]) |> Nx.reshape({b, t, n_embd})
+end
+
+q_heads = reshape_to_heads.(q)
+k_heads = reshape_to_heads.(k)
+v_heads = reshape_to_heads.(v)
+IO.inspect(Nx.shape(q_heads), label: "Q with heads (should be {1, 2, 4, 4})")
+```
+
+### Exercise: Full Multi-Head Attention
+
+Put all the steps together. Given Q, K, V reshaped to heads, compute the multi-head attention output.
+
+```elixir
+multi_head_attention = fn q, k, v, n_head ->
+  {_b, _h, _t, head_dim} = Nx.shape(q)
+  seq_len = Nx.axis_size(q, 2)
+  batch = Nx.axis_size(q, 0)
+  scale = Nx.tensor(1.0 / :math.sqrt(head_dim))
+
+  # TODO:
+  # 1. Compute attention scores: q @ k^T * scale
+  #    Use Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) to dot over head_dim, keep batch & head
+  # 2. Build and apply causal mask (shape {1, 1, seq_len, seq_len} for broadcasting)
+  # 3. Softmax
+  # 4. att @ v to get weighted values
+  #    Use Nx.dot(att, [3], [0, 1], v, [2], [0, 1])
+  # 5. Reshape from heads back to {batch, seq_len, n_embd}
+  nil
+end
+
+result = multi_head_attention.(q_heads, k_heads, v_heads, n_head)
+IO.inspect(Nx.shape(result), label: "should be {1, 4, 8}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+multi_head_attention = fn q, k, v, _n_head ->
+  {_b, _h, _t, head_dim} = Nx.shape(q)
+  seq_len = Nx.axis_size(q, 2)
+  batch = Nx.axis_size(q, 0)
+  n_h = Nx.axis_size(q, 1)
+  scale = Nx.tensor(1.0 / :math.sqrt(head_dim))
+
+  att = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+
+  rows = Nx.iota({1, 1, seq_len, seq_len}, axis: 2)
+  cols = Nx.iota({1, 1, seq_len, seq_len}, axis: 3)
+  mask = Nx.greater_equal(rows, cols)
+  mask = Nx.broadcast(mask, {batch, n_h, seq_len, seq_len})
+  neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), {batch, n_h, seq_len, seq_len})
+  att = Nx.select(mask, att, neg_inf)
+
+  max = Nx.reduce_max(att, axes: [-1], keep_axes: true)
+  exp = Nx.exp(Nx.subtract(att, max))
+  att = Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+
+  y = Nx.dot(att, [3], [0, 1], v, [2], [0, 1])
+
+  y |> Nx.transpose(axes: [0, 2, 1, 3]) |> Nx.reshape({batch, seq_len, head_dim * n_h})
+end
+```
+
+</details>
+
+## The Full Picture
+
+In nanoGPT's `CausalSelfAttention`, after the multi-head attention, there's one more linear projection (`c_proj`) that mixes information across heads, followed by dropout:
+
+```
+input → c_attn (Q,K,V) → split heads → attention → merge heads → c_proj → dropout → output
+```
+
+The c_proj weight is initialized with a smaller standard deviation (`0.02 / sqrt(2 * n_layer)`) to keep residual connections stable in deep networks.
+
+## What's Next
+
+Self-attention is the most complex component in the transformer. If you made it through this notebook, you understand the core mechanism behind every modern LLM.
+
+Next: **The MLP block** -- a simpler feed-forward network that processes each token independently after attention has mixed information across tokens.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Query (Q)** | "What am I looking for?" — used to score against keys |
+| **Key (K)** | "What do I contain?" — scored against queries |
+| **Value (V)** | "What information do I provide?" — weighted by attention |
+| **Scaled dot-product** | `Q @ K^T / sqrt(d_k)` — prevents extreme softmax values |
+| **Causal mask** | Prevents attending to future tokens (lower triangular) |
+| **Softmax** | Converts scores to probabilities (each row sums to 1) |
+| **Multi-head** | Run N parallel attention heads on split embedding dims |
+| **c_attn** | Single linear layer projecting to Q, K, V at once |
+| **c_proj** | Output projection that mixes across heads |

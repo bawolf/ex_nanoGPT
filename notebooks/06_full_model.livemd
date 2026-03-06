@@ -1,0 +1,401 @@
+# 06: The Full GPT Model
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Complete Architecture
+
+Over the last five notebooks, we've built every component of a GPT model individually. Now we assemble them into the full model. Here's the complete data flow:
+
+```
+token IDs → token embedding + position embedding → dropout
+  → transformer block 1
+  → transformer block 2
+  → ...
+  → transformer block N
+  → final LayerNorm
+  → lm_head (project to vocabulary) → logits
+```
+
+The input is a batch of token ID sequences. The output is **logits** -- a score for every possible next token at every position. Higher logit = the model thinks that token is more likely to come next.
+
+## Load All Reference Modules
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/layer_norm.ex")
+Code.require_file("../lib/ex_nano_gpt/attention.ex")
+Code.require_file("../lib/ex_nano_gpt/mlp.ex")
+Code.require_file("../lib/ex_nano_gpt/embedding.ex")
+Code.require_file("../lib/ex_nano_gpt/block.ex")
+Code.require_file("../lib/ex_nano_gpt/model.ex")
+```
+
+## Model Configuration
+
+A GPT model is defined by a handful of hyperparameters. We'll use tiny values so everything runs quickly:
+
+```elixir
+config = %{
+  vocab_size: 65,     # number of unique tokens (Shakespeare has 65 characters)
+  block_size: 16,     # maximum sequence length (context window)
+  n_layer: 2,         # number of transformer blocks
+  n_head: 2,          # attention heads per block
+  n_embd: 32,         # embedding dimension
+  dropout: 0.0,       # dropout rate (0 for exercises)
+  bias: true          # use bias in linear layers
+}
+
+IO.puts("Config: #{inspect(config)}")
+```
+
+## Weight Tying: A Clever Trick
+
+The model has a token embedding table `wte` of shape `{vocab_size, n_embd}`. Row `i` is the vector for token `i`. At the very end, the model needs to convert its `n_embd`-dimensional representations back into scores over the vocabulary. This final projection is called `lm_head`.
+
+Here's the clever part: **lm_head reuses the token embedding table**. Instead of having a separate `{n_embd, vocab_size}` weight matrix, we just compute:
+
+```
+logits = x @ wte^T
+```
+
+This is `Nx.dot(x, [-1], wte, [-1])` -- dotting along the embedding dimension of both tensors. Since `wte` is `{vocab_size, n_embd}`, the result is `{batch, seq_len, vocab_size}`.
+
+Why does this work? The token embedding maps token ID `i` to vector `wte[i]`. The output projection asks "how similar is this hidden state to the embedding for token `i`?" -- the dot product measures exactly that. Tying these weights also reduces the total parameter count significantly and acts as a form of regularization.
+
+```elixir
+# Demonstrate weight tying
+n_embd = 32
+vocab_size = 65
+
+key = Nx.Random.key(42)
+{wte, _} = Nx.Random.normal(key, 0.0, 0.02, shape: {vocab_size, n_embd})
+
+# Pretend x is the output of the final LayerNorm, shape {batch, seq_len, n_embd}
+{x, _} = Nx.Random.normal(Nx.Random.key(1), shape: {1, 4, n_embd})
+
+# lm_head projection: x @ wte^T
+logits = Nx.dot(x, [-1], wte, [-1])
+IO.inspect(Nx.shape(logits), label: "logits shape (should be {1, 4, 65})")
+IO.puts("Each of the 4 positions now has a score for each of the 65 tokens")
+```
+
+## Exercise: Implement the Full Forward Pass
+
+Combine all components into a single forward pass. Given token IDs, produce logits.
+
+Steps:
+1. Look up token embeddings: `tok_emb = Nx.take(wte, idx, axis: 0)`
+2. Look up position embeddings: `pos_emb = Nx.take(wpe, positions, axis: 0)`
+3. Add them: `x = tok_emb + pos_emb`
+4. Pass through each transformer block
+5. Apply final LayerNorm
+6. Project to vocabulary: `logits = x @ wte^T`
+
+```elixir
+# Initialize model parameters using reference
+key = Nx.Random.key(42)
+params = ExNanoGPT.Model.init_params(config, key)
+
+IO.inspect(Nx.shape(params.wte), label: "wte (token embedding)")
+IO.inspect(Nx.shape(params.wpe), label: "wpe (position embedding)")
+IO.inspect(tuple_size(params.blocks), label: "number of blocks")
+
+# Fake input: batch of 2 sequences, each 8 tokens long
+idx = Nx.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [10, 20, 30, 40, 50, 60, 0, 1]])
+IO.inspect(Nx.shape(idx), label: "input token IDs")
+```
+
+```elixir
+gpt_forward = fn idx, params, config ->
+  %{n_head: n_head, dropout: dropout, n_layer: _n_layer} = config
+  seq_len = Nx.axis_size(idx, 1)
+
+  # TODO:
+  # 1. Token embeddings: Nx.take(params.wte, idx, axis: 0)
+  #    Shape: {batch, seq_len, n_embd}
+  #
+  # 2. Position embeddings: Nx.take(params.wpe, positions, axis: 0)
+  #    Positions are just 0, 1, 2, ..., seq_len-1
+  #    Use Nx.iota({seq_len}) to generate them
+  #    Shape: {seq_len, n_embd} — broadcasts to add with tok_emb
+  #
+  # 3. Add: x = tok_emb + pos_emb
+  #
+  # 4. Pass through each block:
+  #    params.blocks is a tuple of block params
+  #    Convert to list with Tuple.to_list/1
+  #    Reduce over them, passing x through each block
+  #    Use ExNanoGPT.Block.forward(x, block_params, key, opts)
+  #    opts: [n_head: n_head, dropout_rate: dropout, training: false]
+  #
+  # 5. Final LayerNorm: ExNanoGPT.LayerNorm.forward(x, params.ln_f)
+  #
+  # 6. Project to vocab: Nx.dot(x, [-1], params.wte, [-1])
+  #    This is the weight-tied lm_head
+  nil
+end
+
+logits = gpt_forward.(idx, params, config)
+IO.inspect(Nx.shape(logits), label: "logits shape (should be {2, 8, 65})")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+gpt_forward = fn idx, params, config ->
+  %{n_head: n_head, dropout: dropout} = config
+  seq_len = Nx.axis_size(idx, 1)
+  rng_key = Nx.Random.key(0)
+
+  tok_emb = Nx.take(params.wte, idx, axis: 0)
+  pos = Nx.iota({seq_len})
+  pos_emb = Nx.take(params.wpe, pos, axis: 0)
+  x = Nx.add(tok_emb, pos_emb)
+
+  block_opts = [n_head: n_head, dropout_rate: dropout, training: false]
+
+  x =
+    params.blocks
+    |> Tuple.to_list()
+    |> Enum.reduce(x, fn block_params, acc ->
+      ExNanoGPT.Block.forward(acc, block_params, rng_key, block_opts)
+    end)
+
+  x = ExNanoGPT.LayerNorm.forward(x, params.ln_f)
+
+  Nx.dot(x, [-1], params.wte, [-1])
+end
+```
+
+</details>
+
+## Verify the Forward Pass
+
+```elixir
+# Compare against reference implementation
+your_logits = gpt_forward.(idx, params, config)
+ref_logits = ExNanoGPT.Model.forward(idx, params, config, Nx.Random.key(0))
+
+# Note: reference forward() only returns logits for the LAST position
+# So we compare just the last position of our output
+your_last = Nx.slice_along_axis(your_logits, Nx.axis_size(your_logits, 1) - 1, 1, axis: 1)
+IO.inspect(Nx.shape(your_last), label: "your last-position logits")
+IO.inspect(Nx.shape(ref_logits), label: "reference logits")
+
+diff = Nx.subtract(your_last, ref_logits) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-4, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+```
+
+## From Logits to Predictions
+
+The logits are raw scores -- they can be any real number. To turn them into probabilities, we apply **softmax**. But during training, we don't actually need probabilities -- we need the **loss**.
+
+## Cross-Entropy Loss
+
+The loss function tells us how wrong the model's predictions are. For language modeling, we use **cross-entropy loss**. Here's the intuition:
+
+1. **Softmax** converts logits to probabilities (positive, sum to 1)
+2. We look at the probability the model assigned to the *correct* next token
+3. We take the negative log of that probability
+
+If the model is confident and correct (assigns probability 0.95 to the right token), the loss is small: `-log(0.95) = 0.05`. If the model is wrong (assigns probability 0.01 to the right token), the loss is large: `-log(0.01) = 4.6`.
+
+```elixir
+# Example: 3 tokens in vocabulary, model predicts logits for one position
+logits_example = Nx.tensor([2.0, 1.0, 0.1])
+correct_token = 0
+
+# Step 1: softmax to get probabilities
+exp_logits = Nx.exp(logits_example)
+probs = Nx.divide(exp_logits, Nx.sum(exp_logits))
+IO.inspect(Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4)), label: "probabilities (sum to 1)")
+
+# Step 2: probability of the correct token
+correct_prob = Nx.to_number(probs[correct_token])
+IO.puts("P(correct token) = #{Float.round(correct_prob, 4)}")
+
+# Step 3: negative log probability = loss for this position
+loss = -:math.log(correct_prob)
+IO.puts("Loss = -log(#{Float.round(correct_prob, 4)}) = #{Float.round(loss, 4)}")
+```
+
+## Why Log-Softmax is Numerically Stable
+
+There's a practical problem with computing softmax then log separately. If the logits are large (say, 1000), then `exp(1000)` overflows to infinity. Even moderate values can cause issues.
+
+The trick: instead of `log(exp(x) / sum(exp(x)))`, we compute `log_softmax` directly:
+
+```
+log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
+```
+
+By subtracting `max(x)` first, the largest exponent becomes `exp(0) = 1`, and nothing overflows. The subtraction doesn't change the result because it cancels out mathematically.
+
+```elixir
+# Unstable: large logits cause overflow
+big_logits = Nx.tensor([1000.0, 1001.0, 999.0])
+IO.inspect(Nx.exp(big_logits), label: "exp of big logits (overflow!)")
+
+# Stable: subtract max first
+max_val = Nx.reduce_max(big_logits)
+shifted = Nx.subtract(big_logits, max_val)
+IO.inspect(Nx.exp(shifted), label: "exp of shifted logits (safe)")
+
+log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted)))
+log_softmax = Nx.subtract(shifted, log_sum_exp)
+IO.inspect(Nx.to_flat_list(log_softmax) |> Enum.map(&Float.round(&1, 4)), label: "log_softmax (stable)")
+```
+
+### Exercise: Implement Cross-Entropy Loss
+
+Given logits of shape `{batch * seq_len, vocab_size}` and targets of shape `{batch * seq_len}`, compute the average cross-entropy loss.
+
+Steps:
+1. Compute log-softmax (using the stable version: subtract max, then `x - log(sum(exp(x)))`)
+2. For each position, pick the log-probability of the correct target token
+3. Average the negative log-probabilities
+
+```elixir
+cross_entropy_loss = fn logits, targets ->
+  # logits: {n, vocab_size}, targets: {n}
+  # TODO:
+  # 1. Log-softmax (stable):
+  #    max_val = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+  #    shifted = logits - max_val
+  #    log_probs = shifted - Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true))
+  #
+  # 2. Gather the log-prob of each target token:
+  #    Create a one-hot matrix from targets: shape {n, vocab_size}
+  #    Multiply element-wise with log_probs and sum along vocab axis
+  #    This gives the log-prob of the correct token at each position
+  #
+  # 3. Return the mean negative log-probability: -mean(gathered_log_probs)
+  nil
+end
+
+# Test: random logits, known targets
+test_logits = Nx.tensor([
+  [2.0, 1.0, 0.1],
+  [0.5, 2.5, 0.3],
+  [1.0, 1.0, 1.0]
+])
+test_targets = Nx.tensor([0, 1, 2])
+
+loss = cross_entropy_loss.(test_logits, test_targets)
+IO.inspect(Nx.to_number(loss) |> Float.round(4), label: "loss")
+
+# For uniform predictions (all logits equal), loss should be log(vocab_size)
+uniform_expected = :math.log(3) |> Float.round(4)
+IO.puts("Uniform prediction loss would be log(3) = #{uniform_expected}")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+cross_entropy_loss = fn logits, targets ->
+  {n, vocab_size} = Nx.shape(logits)
+
+  max_val = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+  shifted = Nx.subtract(logits, max_val)
+  log_probs = Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+
+  one_hot = Nx.equal(Nx.iota({n, vocab_size}, axis: 1), Nx.reshape(targets, {n, 1}))
+  target_log_probs = Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1])
+
+  Nx.negate(Nx.mean(target_log_probs))
+end
+```
+
+</details>
+
+## Verify Loss Against the Reference
+
+```elixir
+# Full end-to-end test: forward pass + loss
+idx = Nx.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [10, 20, 30, 40, 50, 60, 0, 1]])
+targets = Nx.tensor([[2, 3, 4, 5, 6, 7, 8, 9], [20, 30, 40, 50, 60, 0, 1, 2]])
+
+# Your forward pass (full logits)
+your_logits = gpt_forward.(idx, params, config)
+IO.inspect(Nx.shape(your_logits), label: "your logits shape")
+
+# Flatten for loss computation
+{batch, seq_len, vocab_size} = Nx.shape(your_logits)
+flat_logits = Nx.reshape(your_logits, {batch * seq_len, vocab_size})
+flat_targets = Nx.reshape(targets, {batch * seq_len})
+
+your_loss = cross_entropy_loss.(flat_logits, flat_targets)
+IO.inspect(Nx.to_number(your_loss) |> Float.round(4), label: "your loss")
+
+# Reference loss
+ref_loss = ExNanoGPT.Model.cross_entropy_loss(your_logits, targets)
+IO.inspect(Nx.to_number(ref_loss) |> Float.round(4), label: "reference loss")
+
+diff = abs(Nx.to_number(your_loss) - Nx.to_number(ref_loss))
+IO.puts(if diff < 1.0e-4, do: "✓ MATCH! Diff: #{Float.round(diff, 6)}", else: "✗ MISMATCH. Diff: #{Float.round(diff, 6)}")
+```
+
+## Untrained Model: Random Predictions
+
+An untrained model assigns roughly equal probability to all tokens. With a vocabulary of 65 characters, the expected loss is:
+
+```
+-log(1/65) = log(65) ≈ 4.17
+```
+
+Let's verify:
+
+```elixir
+expected_loss = :math.log(config.vocab_size)
+IO.puts("Expected untrained loss: #{Float.round(expected_loss, 2)}")
+IO.puts("Actual untrained loss:   #{Float.round(Nx.to_number(your_loss), 2)}")
+IO.puts("Close enough? #{abs(Nx.to_number(your_loss) - expected_loss) < 0.5}")
+```
+
+If the loss is close to `log(vocab_size)`, the model is initialized correctly -- it's starting from a reasonable place. Training will bring this loss down as the model learns to predict the right tokens.
+
+## Parameter Count
+
+Let's count how many learnable parameters our model has:
+
+```elixir
+param_count = ExNanoGPT.Model.count_params(params, non_embedding: false)
+IO.puts("Total parameters: #{param_count}")
+IO.puts("That's #{Float.round(param_count / 1_000, 1)}K parameters")
+IO.puts("")
+IO.puts("For comparison:")
+IO.puts("  GPT-2 Small:  124M parameters (n_embd=768,  n_layer=12, n_head=12)")
+IO.puts("  GPT-2 Medium: 350M parameters (n_embd=1024, n_layer=24, n_head=16)")
+IO.puts("  Our model:    #{Float.round(param_count / 1_000, 1)}K parameters (n_embd=#{config.n_embd}, n_layer=#{config.n_layer}, n_head=#{config.n_head})")
+```
+
+## What's Next
+
+You've now built a complete GPT model from scratch. Every component -- embeddings, layer norm, attention, MLP, the transformer block, the full assembly, and the loss function -- you understand because you implemented it.
+
+The next step is **training**: using gradient descent to update all these parameters so the model learns to predict Shakespeare. That involves:
+- Computing gradients with `Nx.Defn.value_and_grad`
+- An optimizer (AdamW) to update parameters
+- A training loop with batching and evaluation
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Full GPT** | token_emb + pos_emb → dropout → N blocks → ln_f → lm_head → logits |
+| **Weight tying** | lm_head reuses the token embedding table (wte), reducing parameters |
+| **lm_head projection** | `x @ wte^T` maps hidden states back to vocabulary scores |
+| **Logits** | Raw (unnormalized) scores for each token in the vocabulary |
+| **Softmax** | Converts logits to probabilities: `exp(x) / sum(exp(x))` |
+| **Log-softmax** | Numerically stable: subtract max before exp to prevent overflow |
+| **Cross-entropy loss** | `-mean(log(P(correct token)))` — measures prediction quality |
+| **Untrained baseline** | Expected loss = `log(vocab_size)` for random predictions |

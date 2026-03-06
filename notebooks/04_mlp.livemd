@@ -1,0 +1,227 @@
+# 04: The MLP Block
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## What Does the MLP Do?
+
+In the transformer, **self-attention** mixes information across tokens -- it lets each token look at other tokens. But after that mixing step, each token needs to actually *think* about what it's learned. That's what the **MLP** (multi-layer perceptron) does.
+
+The MLP processes each token **independently** -- the same little network runs on every token position, with no communication between them. It's like: attention is a group discussion, and the MLP is each person going away to think on their own.
+
+## The Architecture
+
+The MLP in GPT-2 is a simple two-layer network:
+
+```
+input (n_embd) → Linear → GELU → Linear → Dropout → output (n_embd)
+  n_embd      →  4*n_embd  →  4*n_embd  →   n_embd
+```
+
+The input and output have the same size (`n_embd`), but in the middle, it expands to **4x the size**. Think of it as: expand to a larger space where there's room to do complex computation, then compress back down.
+
+## GELU: A Smoother ReLU
+
+You might know **ReLU** -- the activation function that's just `max(0, x)`. It outputs `x` when positive, `0` when negative. Simple, but it has a sharp corner at zero.
+
+**GELU** (Gaussian Error Linear Unit) is a smoother version. Instead of a hard cutoff at zero, it gradually transitions. Small negative values get *mostly* zeroed out (but not completely), and positive values pass through *almost* unchanged.
+
+The formula is: `gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))`, where `erf` is the error function (a smooth S-curve from -1 to 1). You don't need to understand `erf` deeply -- just know that `erf(x / sqrt(2))` acts like a smooth switch between -1 and +1.
+
+Let's see how GELU compares to ReLU:
+
+```elixir
+x = Nx.linspace(-3.0, 3.0, n: 50)
+
+relu_y = Nx.max(x, 0)
+gelu_y = Nx.multiply(x, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(x, Nx.sqrt(Nx.tensor(2.0)))))))
+
+IO.puts("Sample values at x = -1.0, 0.0, 1.0:")
+for val <- [-1.0, 0.0, 1.0] do
+  t = Nx.tensor(val)
+  relu = Nx.to_number(Nx.max(t, 0))
+  gelu = Nx.to_number(Nx.multiply(t, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(t, Nx.sqrt(Nx.tensor(2.0))))))))
+  IO.puts("  x=#{val}: ReLU=#{Float.round(relu, 4)}, GELU=#{Float.round(gelu, 4)}")
+end
+```
+
+Notice that GELU(-1.0) is slightly negative, not zero like ReLU. This smoothness helps gradient flow during training.
+
+### Exercise: Implement GELU
+
+```elixir
+gelu = fn x ->
+  # TODO: implement GELU
+  # gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+  # Hint: Nx.erf/1 and Nx.sqrt/1 are available
+  nil
+end
+
+# Test it
+test_input = Nx.tensor([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0])
+result = gelu.(test_input)
+IO.inspect(result, label: "GELU output")
+
+# Expected (approximately):
+# [-0.0455, -0.1587, -0.1543, 0.0, 0.3457, 0.8413, 1.9545]
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+gelu = fn x ->
+  x * 0.5 * (1.0 + Nx.erf(x / Nx.sqrt(Nx.tensor(2.0, type: :f32))))
+end
+```
+
+</details>
+
+## The Linear Layer
+
+A linear layer (also called a "dense" or "fully connected" layer) is just a matrix multiply plus a bias:
+
+```
+output = input @ weight + bias
+```
+
+If input is `{batch, seq_len, n_embd}` and weight is `{n_embd, 4*n_embd}`, the output is `{batch, seq_len, 4*n_embd}`. It transforms each token's vector from one size to another.
+
+```elixir
+n_embd = 8
+
+key = Nx.Random.key(42)
+{x, key} = Nx.Random.normal(key, shape: {1, 4, n_embd})
+
+# First linear: n_embd -> 4*n_embd (expansion)
+{c_fc_weight, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {n_embd, 4 * n_embd})
+c_fc_bias = Nx.broadcast(0.0, {4 * n_embd})
+
+expanded = Nx.dot(x, [-1], c_fc_weight, [0]) |> Nx.add(c_fc_bias)
+IO.inspect(Nx.shape(expanded), label: "after first linear (should be {1, 4, 32})")
+```
+
+## Why the 4x Expansion?
+
+The 4x factor comes from the original transformer paper and GPT-2. The idea is:
+
+1. **Expand** to a higher-dimensional space (4x the embedding size)
+2. **Apply GELU** -- each feature independently decides how much to "activate"
+3. **Compress** back to the original size
+
+The expansion gives the network more capacity to learn complex per-token transformations. It's like having 4x as many features to work with, then distilling the result back down. The 4x factor isn't magic -- it's just what works well empirically.
+
+### Exercise: Implement the Full MLP Forward Pass
+
+```elixir
+n_embd = 8
+
+key = Nx.Random.key(42)
+{x, key} = Nx.Random.normal(key, shape: {1, 4, n_embd})
+
+# Initialize weights
+{c_fc_weight, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {n_embd, 4 * n_embd})
+c_fc_bias = Nx.broadcast(0.0, {4 * n_embd})
+{c_proj_weight, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {4 * n_embd, n_embd})
+c_proj_bias = Nx.broadcast(0.0, {n_embd})
+
+mlp_forward = fn x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias ->
+  # TODO:
+  # 1. First linear: x @ c_fc_weight + c_fc_bias  (n_embd -> 4*n_embd)
+  # 2. GELU activation
+  # 3. Second linear: result @ c_proj_weight + c_proj_bias  (4*n_embd -> n_embd)
+  # (skip dropout for this exercise)
+  nil
+end
+
+result = mlp_forward.(x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias)
+IO.inspect(Nx.shape(result), label: "MLP output shape (should be {1, 4, 8})")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+mlp_forward = fn x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias ->
+  x = Nx.dot(x, [-1], c_fc_weight, [0]) |> Nx.add(c_fc_bias)
+  x = x * 0.5 * (1.0 + Nx.erf(x / Nx.sqrt(Nx.tensor(2.0, type: :f32))))
+  Nx.dot(x, [-1], c_proj_weight, [0]) |> Nx.add(c_proj_bias)
+end
+```
+
+</details>
+
+## The c_proj Scaling Trick
+
+There's a subtle detail in how the second linear layer (`c_proj`) is initialized. Its weights use a *smaller* standard deviation than usual:
+
+```
+standard init:   std = 0.02
+c_proj init:     std = 0.02 / sqrt(2 * n_layer)
+```
+
+Why? Each transformer block adds its MLP output to the residual stream via `x = x + mlp(...)`. With many blocks, these additions accumulate and the values grow. The `1/sqrt(2*n_layer)` scaling keeps the output variance stable regardless of depth. The factor of 2 accounts for the fact that each block adds *two* residual contributions (one from attention, one from MLP).
+
+```elixir
+n_layer = 6
+
+standard_std = 0.02
+proj_std = 0.02 / :math.sqrt(2 * n_layer)
+
+IO.puts("Standard init std: #{Float.round(standard_std, 4)}")
+IO.puts("c_proj init std (#{n_layer} layers): #{Float.round(proj_std, 4)}")
+IO.puts("Ratio: #{Float.round(proj_std / standard_std, 4)}x smaller")
+```
+
+## Verify Against the Reference
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/mlp.ex")
+
+n_embd = 8
+key = Nx.Random.key(99)
+
+# Use the reference init to get identical params
+params = ExNanoGPT.MLP.init_params(n_embd, key, bias: true, n_layer: 1)
+
+# Random input
+{x, _} = Nx.Random.normal(Nx.Random.key(7), shape: {2, 4, n_embd})
+
+# Your implementation (using same params)
+yours = mlp_forward.(x, params.c_fc_weight, params.c_fc_bias, params.c_proj_weight, params.c_proj_bias)
+
+# Reference (no dropout for comparison)
+reference = ExNanoGPT.MLP.forward(x, params, Nx.Random.key(0), dropout_rate: 0.0, training: false)
+
+diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+```
+
+## What's Next
+
+We've now built all the individual components of a transformer:
+- **Embeddings** (notebook 01) -- convert tokens to vectors
+- **Layer normalization** (notebook 02) -- stabilize values
+- **Self-attention** (notebook 03) -- mix information across tokens
+- **MLP** (this notebook) -- process each token independently
+
+Next: **The transformer block** -- combining LayerNorm, attention, and MLP with residual connections into the core repeating unit of GPT.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **MLP** | Feed-forward network that processes each token independently |
+| **GELU** | Smooth activation function: `x * 0.5 * (1 + erf(x/sqrt(2)))` |
+| **4x expansion** | MLP expands to 4x n_embd internally for more computation capacity |
+| **c_fc** | First linear layer: expands from n_embd to 4*n_embd |
+| **c_proj** | Second linear layer: compresses from 4*n_embd back to n_embd |
+| **c_proj scaling** | Init std = `0.02/sqrt(2*n_layer)` to keep residuals stable in deep nets |
+| **Linear layer** | Matrix multiply + bias: `output = input @ weight + bias` |

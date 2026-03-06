@@ -1,0 +1,406 @@
+# 07: Cross-Entropy Loss
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Big Picture
+
+Our model takes in tokens and produces **logits** -- raw scores for every token in the vocabulary. If our vocab has 65 characters, the model outputs 65 numbers for each position in the sequence.
+
+But these logits are just raw numbers. They could be negative, huge, or tiny. We need two things:
+
+1. **A way to turn logits into probabilities** (so we can interpret them as "the model thinks 'e' is 40% likely")
+2. **A way to measure how wrong those probabilities are** (so we can tell the model to do better)
+
+That's what cross-entropy loss does. It's the single number the entire training process tries to minimize.
+
+## A Concrete Example
+
+Let's say our tiny vocabulary is just 4 tokens: `a`, `b`, `c`, `d`. The model sees the context and outputs logits for the next token:
+
+```elixir
+logits = Nx.tensor([2.0, 1.0, 0.1, -1.0])
+IO.puts("Logits: #{inspect(Nx.to_flat_list(logits))}")
+IO.puts("These are raw scores -- not probabilities yet")
+```
+
+The correct next token is `a` (index 0). How do we measure how well the model did?
+
+## Step 1: Softmax -- Turning Scores into Probabilities
+
+We need numbers that are (a) all positive and (b) sum to 1. The **softmax** function does exactly this:
+
+For each score, raise `e` (≈ 2.718) to that power, then divide by the sum of all such values. Bigger scores get bigger probabilities; the ratios between scores are preserved.
+
+```elixir
+# Softmax by hand
+exps = Nx.exp(logits)
+probs = Nx.divide(exps, Nx.sum(exps))
+
+IO.puts("exp(logits): #{inspect(Nx.to_flat_list(exps) |> Enum.map(&Float.round(&1, 4)))}")
+IO.puts("sum:         #{Nx.to_number(Nx.sum(exps)) |> Float.round(4)}")
+IO.puts("probs:       #{inspect(Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4)))}")
+IO.puts("sum of probs: #{Nx.to_number(Nx.sum(probs)) |> Float.round(4)}")
+```
+
+Token `a` (logit 2.0) gets the highest probability. Token `d` (logit -1.0) gets the lowest. That makes sense -- softmax preserves the ranking while giving us proper probabilities.
+
+## Step 2: Log-Softmax -- The Numerically Stable Version
+
+There's a subtle problem with computing softmax directly. If the logits are very large (like 1000.0), `exp(1000)` overflows to infinity. If they're very negative (like -1000.0), we get underflow to zero, and then we'd be dividing zero by zero.
+
+The fix is simple and clever: **subtract the maximum logit before exponentiating**. This doesn't change the answer (the subtraction cancels out in the division), but it guarantees the largest exponent is `exp(0) = 1`, so nothing blows up.
+
+Since we usually need the *log* of the probabilities anyway (we'll see why in a moment), we can combine the log and the softmax into one formula:
+
+```
+log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max) for all j))
+```
+
+Each symbol explained:
+- `x_i` -- the logit for token `i`
+- `max` -- the largest logit in the row (subtracted for numerical safety)
+- `exp(...)` -- raises e to a power
+- `sum(...)` -- adds up all the exponentiated values
+- `log(...)` -- natural logarithm (the inverse of exp)
+
+```elixir
+# Log-softmax with the stability trick
+max_logit = Nx.reduce_max(logits)
+shifted = Nx.subtract(logits, max_logit)
+log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted)))
+log_probs = Nx.subtract(shifted, log_sum_exp)
+
+IO.puts("max logit:     #{Nx.to_number(max_logit)}")
+IO.puts("shifted:       #{inspect(Nx.to_flat_list(shifted) |> Enum.map(&Float.round(&1, 4)))}")
+IO.puts("log_probs:     #{inspect(Nx.to_flat_list(log_probs) |> Enum.map(&Float.round(&1, 4)))}")
+IO.puts("exp(log_probs) ≈ probs: #{inspect(Nx.to_flat_list(Nx.exp(log_probs)) |> Enum.map(&Float.round(&1, 4)))}")
+```
+
+Notice that `exp(log_probs)` gives us back the same probabilities as before. The log-softmax is just a more numerically stable way to get there.
+
+## Step 3: Negative Log-Likelihood -- Measuring Wrongness
+
+Now we have log-probabilities for each token. The correct token is `a` (index 0). How wrong is the model?
+
+We just look up the log-probability of the correct answer and negate it. This is called the **negative log-likelihood (NLL)**:
+
+```elixir
+correct_index = 0
+correct_log_prob = Nx.to_number(log_probs[correct_index])
+loss = -correct_log_prob
+
+IO.puts("Log-prob of correct token 'a': #{Float.round(correct_log_prob, 4)}")
+IO.puts("Loss (negative log-prob):      #{Float.round(loss, 4)}")
+```
+
+Why does this work as a loss function?
+
+- If the model is **confident and correct** (high probability for the right token), the log-prob is close to 0, so the loss is low.
+- If the model is **wrong** (low probability for the right token), the log-prob is a large negative number, so the loss is high.
+
+Let's see this in action:
+
+```elixir
+# The model is very confident about the right answer
+confident_logits = Nx.tensor([10.0, 0.0, 0.0, 0.0])
+confident_probs = Nx.divide(Nx.exp(confident_logits), Nx.sum(Nx.exp(confident_logits)))
+confident_loss = -Nx.to_number(Nx.log(confident_probs[0]))
+
+# The model has no idea (uniform distribution)
+unsure_logits = Nx.tensor([0.0, 0.0, 0.0, 0.0])
+unsure_probs = Nx.divide(Nx.exp(unsure_logits), Nx.sum(Nx.exp(unsure_logits)))
+unsure_loss = -Nx.to_number(Nx.log(unsure_probs[0]))
+
+# The model is confidently wrong
+wrong_logits = Nx.tensor([-5.0, 10.0, 0.0, 0.0])
+wrong_probs = Nx.divide(Nx.exp(wrong_logits), Nx.sum(Nx.exp(wrong_logits)))
+wrong_loss = -Nx.to_number(Nx.log(wrong_probs[0]))
+
+IO.puts("Confident & correct:  prob=#{Float.round(Nx.to_number(confident_probs[0]), 4)}, loss=#{Float.round(confident_loss, 4)}")
+IO.puts("Uniform (no clue):    prob=#{Float.round(Nx.to_number(unsure_probs[0]), 4)}, loss=#{Float.round(unsure_loss, 4)}")
+IO.puts("Confidently wrong:    prob=#{Float.round(Nx.to_number(wrong_probs[0]), 4)}, loss=#{Float.round(wrong_loss, 4)}")
+```
+
+The loss goes from near-zero (confident and right) to very high (confidently wrong). An untrained model with vocab size 65 would give roughly uniform probabilities, so the initial loss should be around `-log(1/65) ≈ 4.17`. If you see a starting loss near that number during training, that's a good sanity check.
+
+## Exercise: Implement `log_softmax`
+
+Implement log-softmax with the numerical stability trick. The input is a 2D tensor where each row is a set of logits. Apply the operation independently to each row.
+
+The steps for each row:
+1. Find the max value
+2. Subtract the max from every element (the "shift")
+3. Compute `shifted - log(sum(exp(shifted)))`
+
+```elixir
+log_softmax = fn logits ->
+  # logits shape: {n, vocab_size}
+  # Return log-probabilities, same shape
+
+  # TODO: implement log_softmax
+  # Hint: use Nx.reduce_max/2 with axes: [-1] and keep_axes: true
+  # to operate on each row independently
+  logits
+end
+
+# Test with our example (batch of 2 rows)
+test_logits = Nx.tensor([
+  [2.0, 1.0, 0.1, -1.0],
+  [0.0, 0.0, 0.0, 0.0]
+])
+
+result = log_softmax.(test_logits)
+IO.inspect(result, label: "log_softmax result")
+
+# Verify: exp(log_softmax) should give valid probabilities (positive, sum to 1)
+probs = Nx.exp(result)
+IO.inspect(Nx.sum(probs, axes: [-1]), label: "row sums (should be ~1.0)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+log_softmax = fn logits ->
+  max = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+  shifted = Nx.subtract(logits, max)
+  Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+end
+```
+
+</details>
+
+## Exercise: Implement `gather_log_probs`
+
+Given a matrix of log-probabilities (one row per position) and a vector of target indices, extract the log-probability of the correct token at each position.
+
+For example, if `log_probs` is a 3x4 matrix and `targets` is `[2, 0, 3]`, we want:
+- Row 0, column 2
+- Row 1, column 0
+- Row 2, column 3
+
+The trick: create a one-hot encoding of the targets and multiply element-wise, then sum each row. The one-hot mask zeros out everything except the correct column.
+
+```elixir
+gather_log_probs = fn log_probs, targets ->
+  # log_probs shape: {n, vocab_size}
+  # targets shape: {n}
+  # Return: {n} tensor of log-probs for the correct tokens
+
+  # TODO: implement gather using one-hot multiplication
+  # Hint: Nx.iota({n, vocab_size}, axis: 1) gives column indices
+  #       Compare with targets (reshaped to {n, 1}) to make a one-hot mask
+  Nx.tensor(0.0)
+end
+
+# Test
+test_log_probs = Nx.tensor([
+  [-1.44, -1.94, -2.54, -3.64],
+  [-1.39, -1.39, -1.39, -1.39]
+])
+test_targets = Nx.tensor([0, 2])
+
+gathered = gather_log_probs.(test_log_probs, test_targets)
+IO.inspect(gathered, label: "gathered log-probs")
+IO.puts("Expected: [-1.44, -1.39] (row 0 col 0, row 1 col 2)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+gather_log_probs = fn log_probs, targets ->
+  {n, vocab_size} = Nx.shape(log_probs)
+  one_hot = Nx.equal(Nx.iota({n, vocab_size}, axis: 1), Nx.reshape(targets, {n, 1}))
+  Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1])
+end
+```
+
+</details>
+
+## Exercise: Implement Full `cross_entropy_loss`
+
+Now put it all together. Given logits of shape `{batch, seq_len, vocab_size}` and targets of shape `{batch, seq_len}`:
+
+1. Flatten batch and sequence into one dimension: `{batch * seq_len, vocab_size}` and `{batch * seq_len}`
+2. Compute log-softmax of the flattened logits
+3. Gather the log-prob of each correct target
+4. Return the mean negative log-probability (negate, then average)
+
+```elixir
+cross_entropy_loss = fn logits, targets ->
+  # logits shape: {batch, seq_len, vocab_size}
+  # targets shape: {batch, seq_len}
+  # Return: scalar loss
+
+  # TODO: implement cross-entropy loss
+  # Step 1: flatten to 2D logits and 1D targets
+  # Step 2: log_softmax
+  # Step 3: gather_log_probs for correct targets
+  # Step 4: negate and average
+  Nx.tensor(0.0)
+end
+
+# Test with a tiny example: batch=1, seq_len=3, vocab_size=4
+test_logits = Nx.tensor([
+  [[2.0, 1.0, 0.1, -1.0],
+   [0.5, 2.5, 0.0, 0.0],
+   [0.0, 0.0, 3.0, 0.0]]
+])
+
+test_targets = Nx.tensor([[0, 1, 2]])
+
+loss = cross_entropy_loss.(test_logits, test_targets)
+IO.inspect(loss, label: "cross-entropy loss")
+IO.puts("The correct tokens have the highest logits, so loss should be low (~0.4-0.7)")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+cross_entropy_loss = fn logits, targets ->
+  {batch, seq_len, vocab_size} = Nx.shape(logits)
+  flat_logits = Nx.reshape(logits, {batch * seq_len, vocab_size})
+  flat_targets = Nx.reshape(targets, {batch * seq_len})
+
+  # log-softmax
+  max = Nx.reduce_max(flat_logits, axes: [-1], keep_axes: true)
+  shifted = Nx.subtract(flat_logits, max)
+  log_probs = Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+
+  # gather
+  {n, vs} = Nx.shape(log_probs)
+  one_hot = Nx.equal(Nx.iota({n, vs}, axis: 1), Nx.reshape(flat_targets, {n, 1}))
+  nll = Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1])
+
+  # negate and average
+  Nx.negate(Nx.mean(nll))
+end
+```
+
+</details>
+
+## Ignoring Certain Positions with `ignore_index = -1`
+
+Sometimes we don't want to compute loss for every position. For example, if our sequences are different lengths and we've padded the short ones, we shouldn't penalize the model for its predictions on padding tokens.
+
+The convention (from PyTorch) is to set the target to `-1` for positions we want to ignore. Our loss function masks those out:
+
+```elixir
+# Batch of 2 sequences, but the second one is shorter (padded with -1)
+padded_logits = Nx.tensor([
+  [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
+  [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]]
+])
+
+# Second sequence only has 2 real tokens; position 2 is padding
+padded_targets = Nx.tensor([
+  [0, 1, 2],
+  [0, 1, -1]
+])
+
+# Without masking, the -1 target would look up garbage
+# With masking, we zero out the loss for that position and only
+# average over valid positions
+
+{batch, seq_len, vocab_size} = Nx.shape(padded_logits)
+flat_logits = Nx.reshape(padded_logits, {batch * seq_len, vocab_size})
+flat_targets = Nx.reshape(padded_targets, {batch * seq_len})
+
+max = Nx.reduce_max(flat_logits, axes: [-1], keep_axes: true)
+shifted = Nx.subtract(flat_logits, max)
+log_probs = Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+
+{n, vs} = Nx.shape(log_probs)
+one_hot = Nx.equal(Nx.iota({n, vs}, axis: 1), Nx.reshape(flat_targets, {n, 1}))
+nll = Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1])
+
+# The mask: 1 for real targets, 0 for -1 targets
+valid_mask = Nx.not_equal(flat_targets, -1)
+nll = Nx.multiply(nll, valid_mask)
+n_valid = Nx.max(Nx.sum(valid_mask), 1)
+
+loss = Nx.negate(Nx.divide(Nx.sum(nll), n_valid))
+
+IO.inspect(valid_mask, label: "valid mask")
+IO.inspect(Nx.to_number(n_valid), label: "number of valid positions")
+IO.inspect(loss, label: "loss (ignoring padded position)")
+```
+
+## Verify Against the Real Implementation
+
+Let's confirm our understanding matches `ExNanoGPT.Model.cross_entropy_loss`:
+
+```elixir
+# Build a test case
+logits = Nx.tensor([
+  [[2.0, 1.0, 0.1, -1.0],
+   [0.5, 2.5, 0.0, 0.0],
+   [0.0, 0.0, 3.0, 0.0]]
+])
+targets = Nx.tensor([[0, 1, 2]])
+
+# Our manual computation
+{batch, seq_len, vocab_size} = Nx.shape(logits)
+flat_logits = Nx.reshape(logits, {batch * seq_len, vocab_size})
+flat_targets = Nx.reshape(targets, {batch * seq_len})
+
+max = Nx.reduce_max(flat_logits, axes: [-1], keep_axes: true)
+shifted = Nx.subtract(flat_logits, max)
+lp = Nx.subtract(shifted, Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true)))
+{n, vs} = Nx.shape(lp)
+oh = Nx.equal(Nx.iota({n, vs}, axis: 1), Nx.reshape(flat_targets, {n, 1}))
+nll = Nx.sum(Nx.multiply(lp, oh), axes: [-1])
+valid = Nx.not_equal(flat_targets, -1)
+our_loss = Nx.negate(Nx.divide(Nx.sum(Nx.multiply(nll, valid)), Nx.max(Nx.sum(valid), 1)))
+
+# The real implementation
+real_loss = ExNanoGPT.Model.cross_entropy_loss(logits, targets)
+
+IO.puts("Our loss:  #{Nx.to_number(our_loss) |> Float.round(6)}")
+IO.puts("Real loss: #{Nx.to_number(real_loss) |> Float.round(6)}")
+IO.puts("Match: #{abs(Nx.to_number(our_loss) - Nx.to_number(real_loss)) < 1.0e-4}")
+```
+
+```elixir
+# Also verify with ignore_index
+targets_with_ignore = Nx.tensor([[0, -1, 2]])
+our_loss_ign =
+  (fn ->
+    flat_t = Nx.reshape(targets_with_ignore, {3})
+    nll2 = Nx.sum(Nx.multiply(lp, Nx.equal(Nx.iota({3, 4}, axis: 1), Nx.reshape(flat_t, {3, 1}))), axes: [-1])
+    v = Nx.not_equal(flat_t, -1)
+    Nx.negate(Nx.divide(Nx.sum(Nx.multiply(nll2, v)), Nx.max(Nx.sum(v), 1)))
+  end).()
+
+real_loss_ign = ExNanoGPT.Model.cross_entropy_loss(logits, targets_with_ignore)
+
+IO.puts("\nWith ignore_index=-1 at position 1:")
+IO.puts("Our loss:  #{Nx.to_number(our_loss_ign) |> Float.round(6)}")
+IO.puts("Real loss: #{Nx.to_number(real_loss_ign) |> Float.round(6)}")
+IO.puts("Match: #{abs(Nx.to_number(our_loss_ign) - Nx.to_number(real_loss_ign)) < 1.0e-4}")
+```
+
+## What's Next
+
+We now have a way to measure how wrong the model is. But knowing the error isn't enough -- we need to **reduce** it. In the next notebook, we'll build the **AdamW optimizer**, the algorithm that adjusts the model's parameters to make the loss go down.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Logits** | Raw, unnormalized scores the model outputs for each vocabulary token |
+| **Softmax** | Converts logits to probabilities (positive, sum to 1) |
+| **Log-softmax** | Log of softmax, computed in a numerically stable way (subtract the max first) |
+| **Negative log-likelihood** | `-log(probability of correct token)` -- low when the model is right, high when wrong |
+| **Cross-entropy loss** | Average NLL across all positions in the batch -- the single number training minimizes |
+| **ignore_index** | Positions with target `-1` are excluded from the loss calculation |

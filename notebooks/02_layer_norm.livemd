@@ -1,0 +1,175 @@
+# 02: Layer Normalization
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Why Normalize?
+
+As data flows through a deep neural network, the values at each layer can grow or shrink wildly. Some neurons might output values around 1000 while others are near 0.001. This makes training unstable -- the optimizer has to handle vastly different scales simultaneously.
+
+**Layer normalization** fixes this by normalizing the values at each position to have mean 0 and variance 1, then applying learnable scale and shift parameters.
+
+## The Math (It's Simpler Than It Looks)
+
+For a vector `x` of dimension `n_embd`:
+
+1. Compute the **mean**: `μ = sum(x) / n_embd`
+2. Compute the **variance**: `σ² = sum((x - μ)²) / n_embd`
+3. **Normalize**: `x_norm = (x - μ) / sqrt(σ² + ε)`
+4. **Scale and shift**: `output = γ * x_norm + β`
+
+Where:
+- `ε` (epsilon) is a tiny number (1e-5) to prevent division by zero
+- `γ` (gamma, called "weight") starts at 1.0 -- learnable scale per feature
+- `β` (beta, called "bias") starts at 0.0 -- learnable shift per feature
+
+The key: normalization happens across the **last axis** (the embedding dimension), independently for each token position.
+
+## See It In Action
+
+```elixir
+# Before normalization: values are all over the place
+x = Nx.tensor([[100.0, 0.5, -30.0, 7.0]])
+IO.inspect(Nx.to_flat_list(x), label: "before (range: -30 to 100)")
+
+# After: mean ≈ 0, variance ≈ 1
+mean = Nx.mean(x, axes: [-1], keep_axes: true)
+variance = Nx.variance(x, axes: [-1], keep_axes: true)
+eps = 1.0e-5
+normalized = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(variance, eps)))
+
+IO.inspect(Nx.to_flat_list(normalized) |> Enum.map(&Float.round(&1, 4)), label: "after normalization")
+IO.inspect(Float.round(Nx.to_number(Nx.mean(normalized)), 6), label: "mean (should be ~0)")
+IO.inspect(Float.round(Nx.to_number(Nx.variance(normalized)), 4), label: "variance (should be ~1)")
+```
+
+## Exercise: Implement Layer Norm
+
+```elixir
+layer_norm = fn x, weight, bias ->
+  # TODO:
+  # 1. Compute mean across the last axis (keep_axes: true)
+  # 2. Compute variance across the last axis (keep_axes: true)
+  # 3. Normalize: (x - mean) / sqrt(variance + 1.0e-5)
+  # 4. Scale by weight and add bias
+  nil
+end
+
+# Test with a batch of vectors
+x = Nx.tensor([
+  [10.0, 20.0, 30.0, 40.0],
+  [1.0, 1.0, 1.0, 1.0],
+  [-5.0, 0.0, 5.0, 10.0]
+])
+
+# Weight = 1, Bias = 0 (no scaling initially)
+weight = Nx.broadcast(1.0, {4})
+bias = Nx.broadcast(0.0, {4})
+
+result = layer_norm.(x, weight, bias)
+IO.inspect(Nx.shape(result), label: "shape (should be {3, 4})")
+
+# Check: each row should have mean ≈ 0 and variance ≈ 1
+for i <- 0..2 do
+  row = result[i]
+  m = Nx.to_number(Nx.mean(row)) |> Float.round(6)
+  v = Nx.to_number(Nx.variance(row)) |> Float.round(4)
+  IO.puts("Row #{i}: mean=#{m}, variance=#{v}")
+end
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+layer_norm = fn x, weight, bias ->
+  mean = Nx.mean(x, axes: [-1], keep_axes: true)
+  variance = Nx.variance(x, axes: [-1], keep_axes: true)
+  normalized = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(variance, 1.0e-5)))
+  Nx.add(Nx.multiply(weight, normalized), bias)
+end
+```
+
+</details>
+
+## What About the Constant Row?
+
+Notice that row `[1.0, 1.0, 1.0, 1.0]` has zero variance. Without epsilon, we'd divide by zero. With epsilon (1.0e-5), we get a safe near-zero result. This is why epsilon exists.
+
+```elixir
+# What happens with a constant input?
+constant = Nx.tensor([[5.0, 5.0, 5.0, 5.0]])
+result = layer_norm.(constant, weight, bias)
+IO.inspect(Nx.to_flat_list(result) |> Enum.map(&Float.round(&1, 4)), label: "constant input → all zeros")
+```
+
+## Learnable Parameters
+
+The scale (`weight`) and shift (`bias`) parameters start as 1s and 0s respectively, but they're learned during training. This lets the model "undo" the normalization when it's helpful.
+
+Why normalize and then let the model undo it? Because the optimizer works much better when values are normalized. The learnable parameters give the model flexibility without giving up the training stability.
+
+```elixir
+# Initialize LayerNorm parameters (matching nanoGPT)
+init_layer_norm = fn n_embd ->
+  %{
+    weight: Nx.broadcast(1.0, {n_embd}),
+    bias: Nx.broadcast(0.0, {n_embd})
+  }
+end
+
+params = init_layer_norm.(384)
+IO.inspect(Nx.shape(params.weight), label: "weight shape")
+IO.inspect(Nx.shape(params.bias), label: "bias shape")
+```
+
+## Verify Against the Reference
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/layer_norm.ex")
+
+n_embd = 8
+params = ExNanoGPT.LayerNorm.init_params(n_embd, bias: true)
+
+x = Nx.tensor([
+  [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+  [-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+])
+
+yours = layer_norm.(x, params.weight, params.bias)
+reference = ExNanoGPT.LayerNorm.forward(x, params)
+
+diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-6, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+```
+
+## Where LayerNorm Appears in GPT
+
+In nanoGPT's transformer, LayerNorm appears in three places:
+1. **Before self-attention** in each block (`ln_1`)
+2. **Before the MLP** in each block (`ln_2`)
+3. **After the final block**, before projecting to vocabulary (`ln_f`)
+
+This is called "pre-norm" style -- normalize before the computation, not after. It was found to train more stably than the original "post-norm" from the Attention Is All You Need paper.
+
+## What's Next
+
+We've built two simple but important components: embeddings (notebook 01) and layer normalization (this notebook). Next comes the main event: **self-attention** -- the mechanism that lets each token look at other tokens in the sequence to decide what comes next.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Layer normalization** | Normalize each token's features to mean=0, variance=1 |
+| **Epsilon (ε)** | Tiny constant preventing division by zero |
+| **Weight (γ)** | Learnable per-feature scale (initialized to 1) |
+| **Bias (β)** | Learnable per-feature shift (initialized to 0) |
+| **Pre-norm** | Apply LayerNorm before attention/MLP (GPT-2 style) |
+| **Last axis** | Normalization happens across the embedding dimension, not across tokens |

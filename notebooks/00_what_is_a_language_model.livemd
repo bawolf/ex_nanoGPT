@@ -1,0 +1,244 @@
+# 00: What Is a Language Model?
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9.2"},
+  {:exla, "~> 0.9.2"},
+  {:kino, "~> 0.14"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## The Big Picture
+
+A language model does one thing: **given some text, predict the next character** (or word, or token).
+
+That's it. Every LLM -- GPT-4, Claude, LLaMA -- is fundamentally a next-token predictor. The magic is that by getting really good at predicting the next token, the model learns grammar, facts, reasoning, and style.
+
+In this series of notebooks, you'll build one from scratch. Not a toy -- a real GPT, the same architecture behind GPT-2, trained on Shakespeare. By the end, it will generate text like:
+
+```
+ROMEO:
+What shall I swear by? Thou art all my world:
+And yet no doubt thou know'st my love is young.
+```
+
+We're following Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT), but in Elixir with Nx instead of Python with PyTorch.
+
+## The Shakespeare Dataset
+
+Our training data is ~1MB of Shakespeare plays. The model will learn to write Shakespeare-like text by predicting one character at a time.
+
+```elixir
+# Download the dataset
+shakespeare_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+{:ok, {{_, 200, _}, _, body}} = :httpc.request(:get, {~c"#{shakespeare_url}", []}, [], body_format: :binary)
+text = IO.iodata_to_binary(body)
+
+IO.puts("Dataset size: #{String.length(text)} characters")
+IO.puts("\nFirst 200 characters:")
+IO.puts(String.slice(text, 0, 200))
+```
+
+## Character-Level Tokenization
+
+Before the model can process text, we need to convert characters into numbers. This is called **tokenization**.
+
+Real LLMs use sophisticated tokenizers that split text into subwords (like "un" + "break" + "able"). We use the simplest possible tokenizer: each unique character gets a number.
+
+```elixir
+# Get all unique characters, sorted
+chars = text |> String.to_charlist() |> Enum.uniq() |> Enum.sort()
+vocab_size = length(chars)
+IO.puts("Vocabulary: #{List.to_string(chars)}")
+IO.puts("Vocab size: #{vocab_size}")
+```
+
+### Exercise: Build the Encoder and Decoder
+
+A tokenizer needs two functions:
+- **encode**: string → list of integers
+- **decode**: list of integers → string
+
+The mapping is simple: each character gets an index based on its sorted position.
+
+```elixir
+# YOUR CODE: create stoi (character -> index) and itos (index -> character) maps
+# Hint: Enum.with_index/1 and Map.new/2 are your friends
+
+stoi = nil  # TODO: %{?a => 0, ?b => 1, ...}
+itos = nil  # TODO: %{0 => ?a, 1 => ?b, ...}
+
+# Test it
+IO.inspect(Map.get(stoi, ?h), label: "h encodes to")
+IO.inspect(Map.get(itos, 0), label: "0 decodes to")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+stoi = chars |> Enum.with_index() |> Map.new()
+itos = chars |> Enum.with_index() |> Map.new(fn {ch, i} -> {i, ch} end)
+```
+
+</details>
+
+```elixir
+# Now build encode and decode functions
+
+encode = fn text ->
+  # TODO: convert a string to a list of token IDs
+  nil
+end
+
+decode = fn ids ->
+  # TODO: convert a list of token IDs back to a string
+  nil
+end
+
+# Test
+encoded = encode.("hello")
+IO.inspect(encoded, label: "encoded 'hello'")
+decoded = decode.(encoded)
+IO.inspect(decoded, label: "decoded back")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+encode = fn text ->
+  text |> String.to_charlist() |> Enum.map(&Map.fetch!(stoi, &1))
+end
+
+decode = fn ids ->
+  ids |> Enum.map(&Map.fetch!(itos, &1)) |> List.to_string()
+end
+```
+
+</details>
+
+## From Text to Tensors
+
+Neural networks work with tensors (multi-dimensional arrays of numbers), not lists. Let's convert our encoded text into an Nx tensor.
+
+```elixir
+# Encode the full text and convert to a tensor
+data = encode.(text) |> Nx.tensor(type: :s32)
+IO.inspect(Nx.shape(data), label: "data shape")
+IO.inspect(data[0..9], label: "first 10 tokens")
+```
+
+## Train/Val Split
+
+We split the data 90/10 into training and validation sets. The model trains on the training set; we measure how well it generalizes on the validation set (data it's never seen).
+
+```elixir
+n = Nx.axis_size(data, 0)
+split_at = trunc(n * 0.9)
+
+train_data = Nx.slice(data, [0], [split_at])
+val_data = Nx.slice(data, [split_at], [n - split_at])
+
+IO.puts("Train tokens: #{Nx.axis_size(train_data, 0)}")
+IO.puts("Val tokens: #{Nx.axis_size(val_data, 0)}")
+```
+
+## What Does "Predict the Next Token" Mean?
+
+Given a sequence of characters, the model should predict what comes next at **every position**.
+
+For example, with the sequence `"hello"`:
+- Given `h` → predict `e`
+- Given `he` → predict `l`
+- Given `hel` → predict `l`
+- Given `hell` → predict `o`
+
+We do this with input/target pairs where the target is just the input shifted by one position:
+
+```elixir
+block_size = 8  # context length: how many characters the model sees at once
+
+x = train_data[0..block_size-1]
+y = train_data[1..block_size]
+
+IO.puts("Input:  #{inspect(Nx.to_flat_list(x))}")
+IO.puts("Target: #{inspect(Nx.to_flat_list(y))}")
+IO.puts("")
+
+for i <- 0..(block_size - 1) do
+  context = Nx.to_flat_list(x[0..i])
+  target = Nx.to_number(y[i])
+  IO.puts("when context is #{inspect(context)} → target is #{target} ('#{decode.([target])}')")
+end
+```
+
+## Batching
+
+We don't train on one sequence at a time -- we train on **batches** of sequences in parallel. This is faster and leads to more stable gradient estimates.
+
+### Exercise: Build a Batch
+
+Write a function that, given the data tensor and a PRNG key, generates a random batch of input/target pairs.
+
+```elixir
+batch_size = 4
+block_size = 8
+
+get_batch = fn data, key ->
+  data_len = Nx.axis_size(data, 0)
+  max_start = data_len - block_size
+  # TODO:
+  # 1. Generate `batch_size` random start indices in [0, max_start)
+  # 2. For each start index, slice out block_size tokens for x
+  # 3. For each start index, slice out block_size tokens starting at start+1 for y
+  # 4. Stack into {batch_size, block_size} tensors
+  # Return {x, y}
+  {nil, nil}
+end
+
+key = Nx.Random.key(42)
+{x, y} = get_batch.(train_data, key)
+IO.inspect(Nx.shape(x), label: "x shape")
+IO.inspect(Nx.shape(y), label: "y shape")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+get_batch = fn data, key ->
+  data_len = Nx.axis_size(data, 0)
+  max_start = data_len - block_size
+  {starts, _} = Nx.Random.randint(key, 0, max_start, shape: {batch_size})
+
+  x_rows = for i <- 0..(batch_size - 1), do: Nx.slice(data, [starts[i]], [block_size])
+  y_rows = for i <- 0..(batch_size - 1), do: Nx.slice(data, [Nx.add(starts[i], 1)], [block_size])
+
+  {Nx.stack(x_rows), Nx.stack(y_rows)}
+end
+```
+
+</details>
+
+## What's Next
+
+We now have:
+- A dataset of Shakespeare text
+- A character-level tokenizer (encode/decode)
+- A way to generate training batches
+
+In the next notebook, we'll build the first neural network component: **embeddings** -- the layer that converts token IDs into dense vectors that the model can actually learn from.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Language model** | Predicts the next token given previous tokens |
+| **Tokenization** | Converting text to numbers (and back) |
+| **Vocabulary** | The set of all possible tokens |
+| **Block size** | Maximum number of tokens the model can see at once (context window) |
+| **Batch** | Multiple sequences processed simultaneously for efficiency |
+| **Train/val split** | Separate data for training vs. measuring generalization |
