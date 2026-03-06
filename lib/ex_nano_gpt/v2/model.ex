@@ -126,6 +126,8 @@ defmodule ExNanoGPT.V2.Model do
 
   def has_ve?(layer_idx, n_layer), do: rem(layer_idx, 2) == rem(n_layer - 1, 2)
 
+  def ve_gate_channels, do: @ve_gate_channels
+
   def compute_window_sizes(%__MODULE__{} = config) do
     pattern = config.window_pattern |> String.upcase() |> String.graphemes()
     long = config.sequence_len
