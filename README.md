@@ -92,18 +92,18 @@ mix run scripts/train.exs
 
 ## Known Limitations
 
-### No GPU training on Mac
+### No GPU training on Mac (yet)
 
-EXLA does not support Apple Metal (the GPU API on Apple Silicon Macs). All training runs on CPU, which is ~100-1000x slower than GPU. The full Shakespeare config benchmarks at **~113 seconds per step on an M2 Air** -- roughly 6.5 days for the default 5000 iterations.
+This project uses **EXLA** (Google's XLA compiler) as its Nx backend. EXLA does not support Apple Metal -- it only runs on CPU on Mac. The full Shakespeare config benchmarks at **~113 seconds per step on an M2 Air** (~6.5 days for 5000 iterations), roughly 100-1000x slower than GPU training.
 
-This is an upstream limitation in Google's XLA compiler, not an Elixir issue. PyTorch added Apple GPU support (MPS) in 2022; XLA has not. There is an [experimental Metal PjRt plugin](https://github.com/elixir-nx/xla/issues/8) in progress, but it's incomplete (missing f64 support, no CI infrastructure for Apple Silicon).
+EXLA will likely never support Metal directly. However, the Nx core team released **[EMLX](https://github.com/elixir-nx/emlx)** in November 2024 -- an official Nx backend built on Apple's [MLX](https://github.com/ml-explore/mlx) library that runs on Apple Silicon GPUs via Metal. EMLX is still early (no f64 support, some operations missing, not yet on Hex), but it's the path forward for Mac GPU in the Elixir ecosystem.
 
 **What to watch:**
-- [elixir-nx/xla#8](https://github.com/elixir-nx/xla/issues/8) -- the main tracking issue for Apple Silicon GPU support
-- [alisinabh/nx_metal](https://github.com/alisinabh/nx_metal) -- a community Metal backend for Nx (early stage)
-- [Apple's Metal PjRt plugin](https://developer.apple.com/forums/thread/770344) -- the upstream work that would enable EXLA on Metal
+- [elixir-nx/emlx](https://github.com/elixir-nx/emlx) -- the official Metal GPU backend for Nx (active development by the Nx core team)
+- [elixir-nx/nx#1504](https://github.com/elixir-nx/nx/pull/1504) -- PR adding Metal PjRt plugin support to Nx
+- Once EMLX matures, this project could be adapted to use it as an alternative backend -- the Nx code stays the same, only the backend config changes
 
-**Workarounds:**
+**Workarounds for now:**
 - **Rent a GPU** -- A T4 on Vast.ai (~$0.10/hr) or a Colab notebook will train the full model in minutes. EXLA + CUDA works out of the box with `XLA_TARGET=cuda12`.
 - **Run the smoke test** -- `mix run scripts/train.exs --smoke` trains a tiny model in seconds on CPU, enough to verify the full pipeline works.
 - **Use the notebooks** -- The Livebook lessons work fine on CPU. Exercises use small tensors that compute instantly.
