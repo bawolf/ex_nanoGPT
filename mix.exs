@@ -23,8 +23,9 @@ defmodule ExNanoGPT.MixProject do
 
   defp deps do
     [
-      {:nx, "~> 0.9.2"},
-      {:exla, "~> 0.9.2"}
+      {:nx, "~> 0.10"},
+      {:exla, "~> 0.10"},
+      {:emlx, github: "elixir-nx/emlx", branch: "main"}
     ]
   end
 end

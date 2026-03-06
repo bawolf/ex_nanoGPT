@@ -149,11 +149,13 @@ defmodule ExNanoGPT.Sampler do
     {_batch, vocab_size} = Nx.shape(logits)
     k = min(k, vocab_size)
 
-    # Sort descending, find the k-th value as threshold
-    sorted = Nx.sort(logits, axis: -1, direction: :desc)
-    threshold = Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)
-
-    mask = Nx.less(logits, threshold)
+    # Rank-based top-k without sorting: for each element, count how many
+    # others are strictly greater. If >= k elements are greater, mask it out.
+    # O(vocab^2) but fine for char-level vocab (65 tokens).
+    expanded = Nx.new_axis(logits, -1)
+    compared = Nx.new_axis(logits, -2)
+    rank = Nx.sum(Nx.greater(compared, expanded), axes: [-1])
+    mask = Nx.greater_equal(rank, k)
     Nx.select(mask, Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(logits)), logits)
   end
 

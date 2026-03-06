@@ -1,8 +1,10 @@
 # ExNanoGPT
 
-An Elixir/Nx port of [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) -- the simplest, most readable implementation of a GPT language model, rewritten in Elixir using [Nx](https://github.com/elixir-nx/nx) and [EXLA](https://github.com/elixir-nx/nx/tree/main/exla).
+An Elixir/Nx port of [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) -- the simplest, most readable implementation of a GPT language model, rewritten in Elixir using [Nx](https://github.com/elixir-nx/nx).
 
 Every matrix multiply, every attention head, every gradient update is explicit Nx code. No magic libraries -- the AdamW optimizer, training loop, and sampler are all built from scratch.
+
+**Trains on Apple Silicon GPU** via [EMLX](https://github.com/elixir-nx/emlx) (Metal), or on NVIDIA GPU via [EXLA](https://github.com/elixir-nx/nx/tree/main/exla) (CUDA).
 
 ## Learn by Building
 
@@ -74,7 +76,7 @@ scripts/
 test/                  # Unit tests + golden tests vs Python nanoGPT
 ```
 
-## Quick Start (Code)
+## Quick Start
 
 ```bash
 # Install dependencies
@@ -83,51 +85,71 @@ mix deps.get
 # Run tests (55 tests including golden tests against Python nanoGPT)
 mix test
 
-# Smoke test: train a tiny model for 10 steps to verify the pipeline
+# Smoke test: train a tiny model for 10 steps
 mix run scripts/train.exs --smoke
 
-# Full Shakespeare training (requires GPU or patience -- ~113s/step on M2 Air CPU)
+# Full Shakespeare training (~55s/step on M2 Air GPU, ~21s/step on EXLA+CUDA)
 mix run scripts/train.exs
 ```
+
+## Backend Configuration
+
+The default backend is **EMLX (Metal GPU)** -- no setup required on Apple Silicon Macs. Switch backends with the `NX_BACKEND` environment variable:
+
+| Backend | Env var | Device | Use case |
+|---------|---------|--------|----------|
+| EMLX GPU | `NX_BACKEND=emlx` (default) | Apple Metal GPU | Mac training & inference |
+| EMLX CPU | `NX_BACKEND=emlx_cpu` | CPU | Debugging, non-Mac |
+| EXLA | `NX_BACKEND=exla` | CPU (Mac) / CUDA GPU (Linux) | Linux GPU training |
+
+```bash
+# Default: EMLX on Apple GPU
+mix test
+
+# Switch to EXLA (CPU on Mac, CUDA on Linux)
+NX_BACKEND=exla mix test
+
+# EXLA with CUDA on Linux
+XLA_TARGET=cuda12 NX_BACKEND=exla mix deps.compile
+NX_BACKEND=exla mix run scripts/train.exs
+```
+
+### Performance (M2 Air, Shakespeare char, 10.65M params)
+
+| Backend | Device | Per-step | 5000 iters | Tests (55) |
+|---------|--------|----------|------------|------------|
+| EMLX | Metal GPU | **~55s** | ~3.2 days | 4.9s |
+| EXLA | CPU | ~113s | ~6.5 days | 21.4s |
+
+EMLX is ~2x faster on Mac. On Linux with CUDA, EXLA will be much faster (seconds per step).
 
 ## Known Limitations
 
-### No GPU training on Mac (yet)
+### EMLX Metal sort kernel
 
-This project uses **EXLA** (Google's XLA compiler) as its Nx backend. EXLA does not support Apple Metal -- it only runs on CPU on Mac. The full Shakespeare config benchmarks at **~113 seconds per step on an M2 Air** (~6.5 days for 5000 iterations), roughly 100-1000x slower than GPU training.
+MLX's Metal GPU backend has a bug where `Nx.sort` crashes with `Unable to load kernel carg_block_sort_bool`. This project works around it with a sort-free top-k implementation in the sampler. If you hit sort-related crashes in your own code, transfer to CPU for the sort: `tensor |> Nx.backend_transfer({EMLX.Backend, device: :cpu}) |> Nx.sort() |> Nx.backend_transfer({EMLX.Backend, device: :gpu})`.
 
-EXLA will likely never support Metal directly. However, the Nx core team released **[EMLX](https://github.com/elixir-nx/emlx)** in November 2024 -- an official Nx backend built on Apple's [MLX](https://github.com/ml-explore/mlx) library that runs on Apple Silicon GPUs via Metal. EMLX is still early (no f64 support, some operations missing, not yet on Hex), but it's the path forward for Mac GPU in the Elixir ecosystem.
+### No f64 on Metal
+
+Metal does not support 64-bit floats. This project uses f32 everywhere so this is a non-issue, but if you add code that creates f64 tensors it will fail on EMLX GPU.
+
+### EMLX is still early
+
+[EMLX](https://github.com/elixir-nx/emlx) is not yet on Hex (installed from GitHub). Some Nx operations are missing (interior padding, reduce, window_reduce). None of these are used by this project, but they may affect extensions.
 
 **What to watch:**
-- [elixir-nx/emlx](https://github.com/elixir-nx/emlx) -- the official Metal GPU backend for Nx (active development by the Nx core team)
-- [elixir-nx/nx#1504](https://github.com/elixir-nx/nx/pull/1504) -- PR adding Metal PjRt plugin support to Nx
-- Once EMLX matures, this project could be adapted to use it as an alternative backend -- the Nx code stays the same, only the backend config changes
+- [elixir-nx/emlx](https://github.com/elixir-nx/emlx) -- active development by the Nx core team
+- [elixir-nx/nx#1504](https://github.com/elixir-nx/nx/pull/1504) -- Metal PjRt plugin support for Nx
 
-**Workarounds for now:**
-- **Rent a GPU** -- A T4 on Vast.ai (~$0.10/hr) or a Colab notebook will train the full model in minutes. EXLA + CUDA works out of the box with `XLA_TARGET=cuda12`.
-- **Run the smoke test** -- `mix run scripts/train.exs --smoke` trains a tiny model in seconds on CPU, enough to verify the full pipeline works.
-- **Use the notebooks** -- The Livebook lessons work fine on CPU. Exercises use small tensors that compute instantly.
+### Training is still slow
 
-### EXLA compilation latency
+Even with EMLX GPU, ~55s/step means ~3 days for the full 5000 iterations. This is an Elixir/Nx overhead issue -- the same model trains in seconds per step in PyTorch on the same hardware. The gap will narrow as EMLX's compiler matures, but for now this project is best used for **learning** (the notebooks work instantly) rather than production training.
 
-The first training step is slow (~2.5 minutes) because XLA JIT-compiles the computation graph. Subsequent steps reuse the compiled code. This is normal XLA behavior -- it trades upfront compilation time for faster execution.
-
-### Nx 0.9.2 pinned
-
-This project pins `nx` and `exla` to `~> 0.9.2` because newer versions (0.11+) have build issues on macOS (`llvm-c/DataTypes.h` not found). If you're on Linux, you can try upgrading to the latest versions.
-
-## GPU Support (Linux)
-
-EXLA supports NVIDIA GPUs via CUDA. The code is identical -- no changes needed:
-
-```bash
-XLA_TARGET=cuda12 mix deps.compile
-mix run scripts/train.exs
-```
-
-AMD GPUs are supported via ROCm (`XLA_TARGET=rocm`). Google TPUs work too (`XLA_TARGET=tpu`).
+**Workarounds:**
+- **Rent a GPU** -- A T4 on Vast.ai (~$0.10/hr) trains the full model in minutes with EXLA + CUDA.
+- **Run the smoke test** -- `mix run scripts/train.exs --smoke` trains a tiny model in 5 seconds, enough to verify everything works.
 
 ## Acknowledgements
 
 - [Andrej Karpathy](https://github.com/karpathy) for nanoGPT
-- [Elixir Nx team](https://github.com/elixir-nx) for Nx/EXLA
+- [Elixir Nx team](https://github.com/elixir-nx) for Nx, EXLA, and EMLX

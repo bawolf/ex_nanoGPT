@@ -2,12 +2,31 @@
 
 ```elixir
 Mix.install([
-  {:nx, "~> 0.9.2"},
-  {:exla, "~> 0.9.2"},
+  {:nx, "~> 0.10"},
+  {:exla, "~> 0.10"},
+  {:emlx, github: "elixir-nx/emlx", branch: "main"},
   {:kino, "~> 0.14"}
 ])
 
-Nx.global_default_backend(EXLA.Backend)
+# Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
+backend = System.get_env("NX_BACKEND", "emlx")
+
+case backend do
+  "exla" ->
+    Nx.global_default_backend(EXLA.Backend)
+    Nx.Defn.global_default_options(compiler: EXLA)
+    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
+
+  "emlx_cpu" ->
+    Nx.global_default_backend({EMLX.Backend, device: :cpu})
+    Nx.Defn.global_default_options(compiler: EMLX)
+    IO.puts("Backend: EMLX (CPU)")
+
+  _ ->
+    Nx.global_default_backend({EMLX.Backend, device: :gpu})
+    Nx.Defn.global_default_options(compiler: EMLX)
+    IO.puts("Backend: EMLX (Apple Metal GPU)")
+end
 ```
 
 ## What Does the MLP Do?
