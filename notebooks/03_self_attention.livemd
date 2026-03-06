@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Core Idea
@@ -198,6 +202,32 @@ att = softmax.(att)
 IO.inspect(att[0], label: "attention weights (rows sum to 1)")
 ```
 
+## Visualize: Attention Heatmap
+
+The attention weights form a matrix showing "who attends to whom." Each row is a query (who's looking), each column is a key (who's being looked at). The causal mask creates the distinctive lower-triangle pattern.
+
+```elixir
+# Build heatmap data from the attention weights (att is {1, 4, 4} after softmax)
+att_matrix = att[0]
+tokens = ["tok_0", "tok_1", "tok_2", "tok_3"]
+
+heatmap_data =
+  for i <- 0..3, j <- 0..3 do
+    %{
+      "query" => Enum.at(tokens, i),
+      "key" => Enum.at(tokens, j),
+      "weight" => Nx.to_number(att_matrix[i][j]) |> Float.round(3)
+    }
+  end
+
+Vl.new(width: 300, height: 300, title: "Causal Attention Weights")
+|> Vl.data_from_values(heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tokens, title: "Key (attended to)")
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tokens, title: "Query (attending)")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"}, title: "Attention")
+```
+
 ## Step 5: Weighted Sum of Values
 
 Multiply the attention weights by the values. Token `i`'s output is a weighted combination of all tokens' values, weighted by how much attention `i` pays to each.
@@ -304,11 +334,90 @@ input → c_attn (Q,K,V) → split heads → attention → merge heads → c_pro
 
 The c_proj weight is initialized with a smaller standard deviation (`0.02 / sqrt(2 * n_layer)`) to keep residual connections stable in deep networks.
 
+## Break It: Remove the Causal Mask
+
+Without the causal mask, every token can attend to every other token -- including future ones. The model can cheat by looking ahead.
+
+```elixir
+# Recompute attention WITHOUT the causal mask
+{q_fresh, k_fresh, v_fresh} = split_qkv.(qkv, n_embd)
+att_unmasked = Nx.dot(q_fresh, [-1], k_fresh, [-1])
+scale_val = :math.sqrt(n_embd) |> then(&Nx.tensor(1.0 / &1))
+att_unmasked = Nx.multiply(att_unmasked, scale_val)
+
+# Softmax WITHOUT mask -- all positions attend to all
+att_unmasked = softmax.(att_unmasked)
+
+unmasked_data =
+  for i <- 0..3, j <- 0..3 do
+    %{
+      "query" => Enum.at(tokens, i),
+      "key" => Enum.at(tokens, j),
+      "weight" => Nx.to_number(att_unmasked[0][i][j]) |> Float.round(3)
+    }
+  end
+
+Vl.new(width: 300, height: 300, title: "Attention WITHOUT Causal Mask (cheating!)")
+|> Vl.data_from_values(unmasked_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tokens, title: "Key")
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tokens, title: "Query")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "reds"}, title: "Attention")
+```
+
+Notice the upper triangle is no longer zero. Token 0 now attends to tokens 1, 2, 3 -- it can see the future. In language modeling, this is cheating.
+
+## Break It: Remove the Scaling Factor
+
+Without dividing by √d_k, the dot products are much larger. Softmax pushes all the weight onto one token -- attention becomes nearly one-hot, losing the ability to attend to multiple tokens.
+
+```elixir
+# Attention scores WITHOUT scaling
+att_unscaled = Nx.dot(q_fresh, [-1], k_fresh, [-1])
+# Apply causal mask but no scaling
+mask_fresh = build_causal_mask.(seq_len) |> Nx.reshape({1, seq_len, seq_len})
+neg_inf_fresh = Nx.Constants.neg_infinity(:f32) |> Nx.broadcast({batch, seq_len, seq_len})
+att_unscaled = Nx.select(mask_fresh, att_unscaled, neg_inf_fresh)
+att_unscaled = softmax.(att_unscaled)
+
+IO.puts("WITH scaling (spread attention):")
+for i <- 0..3 do
+  row = Nx.to_flat_list(att[0][i]) |> Enum.map(&Float.round(&1, 3))
+  IO.puts("  token #{i}: #{inspect(row)}")
+end
+
+IO.puts("\nWITHOUT scaling (attention becomes one-hot):")
+for i <- 0..3 do
+  row = Nx.to_flat_list(att_unscaled[0][i]) |> Enum.map(&Float.round(&1, 3))
+  IO.puts("  token #{i}: #{inspect(row)}")
+end
+
+IO.puts("\nWithout scaling, softmax sharpens to a spike. The model can only look at one token.")
+```
+
 ## What's Next
 
 Self-attention is the most complex component in the transformer. If you made it through this notebook, you understand the core mechanism behind every modern LLM.
 
 Next: **The MLP block** -- a simpler feed-forward network that processes each token independently after attention has mixed information across tokens.
+
+## Math Notation: The Attention Equation
+
+The core equation of self-attention:
+
+**Attention(Q, K, V) = softmax(QK^T / √d_k) · V**
+
+Each piece:
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `Q, K, V` | Linear projections of input | Query, Key, Value matrices |
+| `QK^T` | `Nx.dot(q, [-1], k, [-1])` | Dot product = "how similar?" |
+| `√d_k` | `:math.sqrt(head_dim)` | Scaling factor (prevents softmax saturation) |
+| `softmax(...)` | `exp(x) / sum(exp(x))` | Convert scores to probabilities (rows sum to 1) |
+| `^T` (transpose) | `Nx.transpose(k)` | Swap rows and columns |
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V (projections), d_k (head dim), softmax, ^T (transpose)
 
 ## Key Concepts
 

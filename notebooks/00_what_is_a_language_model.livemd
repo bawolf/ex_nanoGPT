@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Big Picture
@@ -58,6 +62,33 @@ text = IO.iodata_to_binary(body)
 IO.puts("Dataset size: #{String.length(text)} characters")
 IO.puts("\nFirst 200 characters:")
 IO.puts(String.slice(text, 0, 200))
+```
+
+## Visualize: Character Frequency Distribution
+
+Not all characters are equally common. Space and 'e' dominate. This distribution is the first thing the model must learn.
+
+```elixir
+freqs =
+  text
+  |> String.graphemes()
+  |> Enum.frequencies()
+  |> Enum.sort_by(fn {_ch, count} -> -count end)
+  |> Enum.take(30)
+  |> Enum.map(fn {ch, count} ->
+    label = case ch do
+      " " -> "SPACE"
+      "\n" -> "\\n"
+      c -> c
+    end
+    %{"char" => label, "count" => count}
+  end)
+
+Vl.new(width: 600, height: 300, title: "Top 30 Character Frequencies in Shakespeare")
+|> Vl.data_from_values(freqs)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "char", type: :nominal, sort: "-y", title: "Character")
+|> Vl.encode_field(:y, "count", type: :quantitative, title: "Frequency")
 ```
 
 ## Character-Level Tokenization
@@ -242,6 +273,31 @@ end
 
 </details>
 
+## Break It: What If Batches Aren't Random?
+
+What happens if every batch starts at position 0 instead of a random position? The model only ever sees the first `block_size` tokens and overfits to them.
+
+```elixir
+# Always start at position 0 -- no randomness
+fixed_x = Nx.stack(List.duplicate(Nx.slice(train_data, [0], [block_size]), batch_size))
+fixed_y = Nx.stack(List.duplicate(Nx.slice(train_data, [1], [block_size]), batch_size))
+
+IO.puts("Fixed batch -- always the same #{batch_size} identical sequences:")
+IO.inspect(Nx.to_flat_list(fixed_x[0]), label: "x[0] (same every time)")
+
+# Random batch -- different every call
+key1 = Nx.Random.key(1)
+key2 = Nx.Random.key(2)
+{rand_x1, _} = get_batch.(train_data, key1)
+{rand_x2, _} = get_batch.(train_data, key2)
+
+IO.puts("\nRandom batches -- different every time:")
+IO.inspect(Nx.to_flat_list(rand_x1[0]), label: "batch 1, x[0]")
+IO.inspect(Nx.to_flat_list(rand_x2[0]), label: "batch 2, x[0]")
+IO.puts("\nWith fixed batches, the model memorizes one passage.")
+IO.puts("With random batches, it sees the whole dataset and learns general patterns.")
+```
+
 ## What's Next
 
 We now have:
@@ -250,6 +306,24 @@ We now have:
 - A way to generate training batches
 
 In the next notebook, we'll build the first neural network component: **embeddings** -- the layer that converts token IDs into dense vectors that the model can actually learn from.
+
+## Math Notation: Your First Symbols
+
+Two symbols you'll see everywhere in ML:
+
+**Sigma notation (Σ)**: "Add these up."
+
+`Σᵢ xᵢ` means "sum all the x values" -- same as `Enum.sum(list)` or `Nx.sum(tensor)`.
+
+The subscript `i` is the loop variable. `xᵢ` means "the i-th element" -- same as `x[i]` or `Nx.slice`.
+
+| Math | Elixir/Nx | Meaning |
+|------|-----------|---------|
+| `Σᵢ xᵢ` | `Nx.sum(x)` | Add up all elements |
+| `xᵢ` | `x[i]` | The i-th element |
+| `n` | `Nx.axis_size(x, 0)` | Number of elements |
+
+These will come back in every notebook. By notebook 10, you'll be reading full equations.
 
 ## Key Concepts
 

@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## What Does the MLP Do?
@@ -72,6 +76,32 @@ end
 ```
 
 Notice that GELU(-1.0) is slightly negative, not zero like ReLU. This smoothness helps gradient flow during training.
+
+## Visualize: GELU vs ReLU
+
+Let's see both activation functions as curves. GELU has a smooth transition; ReLU has a hard corner at zero.
+
+```elixir
+x_vals = Nx.linspace(-3.0, 3.0, n: 100)
+relu_vals = Nx.max(x_vals, 0)
+gelu_vals = Nx.multiply(x_vals, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(x_vals, Nx.sqrt(Nx.tensor(2.0)))))))
+
+chart_data =
+  Enum.zip([Nx.to_flat_list(x_vals), Nx.to_flat_list(relu_vals), Nx.to_flat_list(gelu_vals)])
+  |> Enum.flat_map(fn {x, relu, gelu} ->
+    [
+      %{"x" => Float.round(x, 3), "y" => Float.round(relu, 4), "function" => "ReLU"},
+      %{"x" => Float.round(x, 3), "y" => Float.round(gelu, 4), "function" => "GELU"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "GELU vs ReLU Activation Functions")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Input")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "Output")
+|> Vl.encode_field(:color, "function", type: :nominal)
+```
 
 ### Exercise: Implement GELU
 
@@ -223,6 +253,48 @@ diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_num
 IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
 ```
 
+## Break It: What Happens Without an Activation Function?
+
+If we remove the activation function, the MLP becomes just two linear layers in sequence. But `Linear(Linear(x))` is mathematically equivalent to a single linear layer -- the model gains no new capability from the extra layer.
+
+```elixir
+# MLP with GELU: nonlinear
+mlp_with_gelu = fn x, w1, b1, w2, b2 ->
+  h = Nx.dot(x, [-1], w1, [0]) |> Nx.add(b1)
+  h = h * 0.5 * (1.0 + Nx.erf(h / Nx.sqrt(Nx.tensor(2.0, type: :f32))))
+  Nx.dot(h, [-1], w2, [0]) |> Nx.add(b2)
+end
+
+# MLP without activation: just two linear layers
+mlp_no_activation = fn x, w1, b1, w2, b2 ->
+  h = Nx.dot(x, [-1], w1, [0]) |> Nx.add(b1)
+  Nx.dot(h, [-1], w2, [0]) |> Nx.add(b2)
+end
+
+# Equivalent single linear layer: W_combined = W2 @ W1
+mlp_collapsed = fn x, w1, b1, w2, b2 ->
+  w_combined = Nx.dot(w1, [-1], w2, [0])
+  b_combined = Nx.add(Nx.dot(b1 |> Nx.reshape({1, Nx.axis_size(b1, 0)}), [-1], w2, [0]) |> Nx.squeeze(axes: [0]), b2)
+  Nx.dot(x, [-1], w_combined, [0]) |> Nx.add(b_combined)
+end
+
+# Test
+{test_x, _} = Nx.Random.normal(Nx.Random.key(7), shape: {1, 4, n_embd})
+
+no_act = mlp_no_activation.(test_x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias)
+collapsed = mlp_collapsed.(test_x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias)
+with_gelu = mlp_with_gelu.(test_x, c_fc_weight, c_fc_bias, c_proj_weight, c_proj_bias)
+
+diff_collapsed = Nx.subtract(no_act, collapsed) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+diff_gelu = Nx.subtract(with_gelu, no_act) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+
+IO.puts("No activation vs collapsed single layer: max diff = #{Float.round(diff_collapsed, 8)}")
+IO.puts("  (Nearly zero -- they're the same computation!)")
+IO.puts("\nGELU vs no activation: max diff = #{Float.round(diff_gelu, 4)}")
+IO.puts("  (Different -- GELU adds nonlinearity that can't be collapsed)")
+IO.puts("\nWithout activation, depth is pointless. GELU is what makes the MLP actually useful.")
+```
+
 ## What's Next
 
 We've now built all the individual components of a transformer:
@@ -232,6 +304,24 @@ We've now built all the individual components of a transformer:
 - **MLP** (this notebook) -- process each token independently
 
 Next: **The transformer block** -- combining LayerNorm, attention, and MLP with residual connections into the core repeating unit of GPT.
+
+## Math Notation: GELU
+
+The GELU activation function:
+
+**GELU(x) = x · Φ(x)** where Φ is the Gaussian CDF
+
+Expanded: `GELU(x) = x · 0.5 · (1 + erf(x / √2))`
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `Φ(x)` | `0.5 * (1 + Nx.erf(x / Nx.sqrt(2)))` | Gaussian CDF: smooth 0→1 switch |
+| `erf(x)` | `Nx.erf(x)` | Error function: S-curve from -1 to 1 |
+| `√2` | `Nx.sqrt(Nx.tensor(2.0))` | Square root of 2 |
+
+The key intuition: `Φ(x)` acts as a soft gate. For large positive x, Φ ≈ 1 so GELU ≈ x (pass through). For large negative x, Φ ≈ 0 so GELU ≈ 0 (block). The transition is smooth, unlike ReLU's hard corner.
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ (CDF), erf
 
 ## Key Concepts
 

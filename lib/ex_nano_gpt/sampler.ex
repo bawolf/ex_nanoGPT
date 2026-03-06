@@ -149,9 +149,29 @@ defmodule ExNanoGPT.Sampler do
     {_batch, vocab_size} = Nx.shape(logits)
     k = min(k, vocab_size)
 
-    # Rank-based top-k without sorting: for each element, count how many
-    # others are strictly greater. If >= k elements are greater, mask it out.
-    # O(vocab^2) but fine for char-level vocab (65 tokens).
+    # WORKAROUND: Rank-based top-k (avoids Nx.sort)
+    #
+    # The natural implementation would be:
+    #   sorted = Nx.sort(logits, axis: -1, direction: :desc)
+    #   threshold = sorted[[.., k - 1]]
+    #   mask = Nx.less(logits, Nx.new_axis(threshold, -1))
+    #   Nx.select(mask, Nx.Constants.neg_infinity(:f32), logits)
+    #
+    # This matches nanoGPT's torch.topk approach. However, EMLX's Metal GPU
+    # backend has a bug where Nx.sort crashes with:
+    #   "Unable to load kernel carg_block_sort_bool__uint32_bn32_tn4"
+    # MLX dispatches a boolean sort kernel for float tensors, causing SIGABRT
+    # (exit code 134) that kills the BEAM.
+    #
+    # This rank-based approach uses only Nx.greater/Nx.sum/Nx.select.
+    # For each element, count how many others are strictly greater. If >= k
+    # are greater, that element isn't in the top-k and gets masked out.
+    # O(vocab^2) but fine for char-level vocab (65 tokens = 4,225 comparisons).
+    #
+    # TO REVERT: When EMLX/MLX fixes the Metal sort kernel, replace this
+    # function body with the 4-line sorted version above.
+    # Track: https://github.com/elixir-nx/emlx
+    # Works fine with NX_BACKEND=exla (EXLA's sort has no issues).
     expanded = Nx.new_axis(logits, -1)
     compared = Nx.new_axis(logits, -2)
     rank = Nx.sum(Nx.greater(compared, expanded), axes: [-1])

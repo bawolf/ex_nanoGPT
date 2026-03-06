@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Big Picture
@@ -424,6 +428,19 @@ File.rm!(ckpt_path)
 
 Let's run a few training steps with our tiny model. This won't produce good text, but it demonstrates the complete pipeline: batch → forward → loss → backward → optimizer step.
 
+## Live Training Chart
+
+```elixir
+loss_chart =
+  Vl.new(width: 600, height: 300, title: "Training Loss")
+  |> Vl.mark(:line, point: true)
+  |> Vl.encode_field(:x, "step", type: :quantitative, title: "Step")
+  |> Vl.encode_field(:y, "loss", type: :quantitative, title: "Loss")
+  |> Kino.VegaLite.new()
+```
+
+Run the training loop below -- the chart above will update in real time as the loss decreases.
+
 ```elixir
 # Training config (very small for CPU)
 tiny_train_config = %{
@@ -485,6 +502,7 @@ opt_state = ExNanoGPT.Optimizer.init(tiny_params)
     if rem(iter, tiny_train_config.log_interval) == 0 do
       lr = ExNanoGPT.Optimizer.get_lr(elem(opt_state, 0), optim_config)
       IO.puts("step #{String.pad_leading("#{iter}", 3)}: loss=#{Float.round(loss_val, 4)}, lr=#{Float.round(lr, 8)}")
+      Kino.VegaLite.push(loss_chart, %{"step" => iter, "loss" => Float.round(loss_val, 4)})
     end
 
     # Optimizer step
@@ -501,11 +519,63 @@ IO.puts("Loss decreased: #{List.last(losses) < List.first(losses)}")
 
 If the loss went down, training is working. The model is learning something -- even if it's too small and too few steps to generate coherent text.
 
+## Generated Text at Step 0 vs Trained
+
+Let's see what the model generates before and after even this tiny training run.
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/data.ex")
+Code.require_file("../lib/ex_nano_gpt/sampler.ex")
+
+data_dir = ExNanoGPT.Data.data_dir()
+meta =
+  if File.exists?(Path.join(data_dir, "meta.etf")) do
+    ExNanoGPT.Data.load_meta(Path.join(data_dir, "meta.etf"))
+  else
+    ExNanoGPT.Data.prepare()
+  end
+
+IO.puts("=== Before training (random model) ===")
+random_params = ExNanoGPT.Model.init_params(tiny_config, Nx.Random.key(0))
+random_text = ExNanoGPT.Sampler.generate_text(
+  random_params, tiny_config, meta, "\n", Nx.Random.key(42),
+  max_new_tokens: 100, temperature: 1.0, top_k: 10
+)
+IO.puts(random_text)
+
+IO.puts("\n=== After #{tiny_train_config.max_iters} training steps ===")
+trained_text = ExNanoGPT.Sampler.generate_text(
+  final_params, tiny_config, meta, "\n", Nx.Random.key(42),
+  max_new_tokens: 100, temperature: 1.0, top_k: 10
+)
+IO.puts(trained_text)
+
+IO.puts("\n(Still mostly random -- 30 steps on a tiny model isn't enough for coherent text,")
+IO.puts(" but you should see the character distribution start to shift.)")
+```
+
 ## What's Next
 
 The training loop is complete. With enough time, data, and compute (ideally a GPU), this exact code would train a model that writes passable Shakespeare.
 
 In the next and final notebook, we'll close the loop: take a trained model and **generate text** from it. We'll implement temperature scaling, top-k filtering, and the autoregressive sampling loop.
+
+## Math Notation: Gradients
+
+The gradient symbol you'll see everywhere:
+
+**∇_θ L** means "the gradient of the loss L with respect to all parameters θ"
+
+In Nx: `{loss, grads} = Nx.Defn.value_and_grad(loss_fn).(params)`
+
+The nabla symbol (∇) means "which direction to go to increase the function." We go the opposite direction (subtract the gradient) to decrease the loss.
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `∇_θ L` | `Nx.Defn.value_and_grad(loss_fn).(params)` | Compute loss + gradients |
+| `θ ← θ - α · ∇_θ L` | `Nx.subtract(param, Nx.multiply(lr, grad))` | One SGD step |
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T, L, log, P(y|x), α, β₁/β₂, ∇ (gradient), θ (params), ∇_θ L (gradient of loss)
 
 ## Key Concepts
 

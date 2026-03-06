@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Big Picture
@@ -149,6 +153,58 @@ IO.puts("Confidently wrong:    prob=#{Float.round(Nx.to_number(wrong_probs[0]), 
 ```
 
 The loss goes from near-zero (confident and right) to very high (confidently wrong). An untrained model with vocab size 65 would give roughly uniform probabilities, so the initial loss should be around `-log(1/65) ≈ 4.17`. If you see a starting loss near that number during training, that's a good sanity check.
+
+## Visualize: The -log(p) Curve
+
+-log(p) is the loss for a single prediction. This curve shows why cross-entropy punishes wrong predictions so harshly.
+
+```elixir
+p_values = Nx.linspace(0.01, 1.0, n: 100)
+neg_log_p = Nx.negate(Nx.log(p_values))
+
+chart_data =
+  Enum.zip(Nx.to_flat_list(p_values), Nx.to_flat_list(neg_log_p))
+  |> Enum.map(fn {p, loss} ->
+    %{"p_correct" => Float.round(p, 3), "loss" => Float.round(loss, 4)}
+  end)
+
+Vl.new(width: 500, height: 300, title: "-log(p): Loss vs Probability of Correct Token")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "p_correct", type: :quantitative, title: "P(correct token)")
+|> Vl.encode_field(:y, "loss", type: :quantitative, title: "Loss = -log(p)")
+```
+
+When p(correct) = 0.01, loss = 4.6. When p(correct) = 0.99, loss = 0.01. The curve is steep near zero -- the model is heavily punished for being confidently wrong, but barely rewarded for going from 'pretty sure' to 'very sure'.
+
+## Interactive: Loss Explorer
+
+Use the slider to see how the loss changes as you adjust the model's confidence in the correct token.
+
+```elixir
+p_input = Kino.Input.range("P(correct token)", min: 1, max: 99, step: 1, default: 50)
+```
+
+```elixir
+p_val = Kino.Input.read(p_input) / 100.0
+loss_val = -:math.log(p_val)
+
+Kino.Markdown.new("""
+**P(correct) = #{Float.round(p_val, 2)}**
+
+**Loss = -log(#{Float.round(p_val, 2)}) = #{Float.round(loss_val, 4)}**
+
+#{cond do
+  loss_val < 0.1 -> "Excellent -- the model is very confident and correct."
+  loss_val < 0.7 -> "Good -- the model has a reasonable guess."
+  loss_val < 2.0 -> "Mediocre -- the model is unsure."
+  loss_val < 4.0 -> "Bad -- the model is mostly wrong."
+  true -> "Terrible -- the model has almost no idea."
+end}
+
+For reference: a random model with 65 tokens has loss = log(65) = #{Float.round(:math.log(65), 2)}
+""")
+```
 
 ## Exercise: Implement `log_softmax`
 
@@ -412,6 +468,28 @@ IO.puts("Match: #{abs(Nx.to_number(our_loss_ign) - Nx.to_number(real_loss_ign)) 
 ## What's Next
 
 We now have a way to measure how wrong the model is. But knowing the error isn't enough -- we need to **reduce** it. In the next notebook, we'll build the **AdamW optimizer**, the algorithm that adjusts the model's parameters to make the loss go down.
+
+## Math Notation: Cross-Entropy Loss
+
+The cross-entropy loss formula:
+
+**L = -(1/N) Σᵢ log P(yᵢ | x)**
+
+Each symbol:
+
+| Math | Meaning | Nx code |
+|------|---------|---------|
+| `L` | The loss (scalar) -- what training minimizes | Result of the loss function |
+| `N` | Number of predictions (batch_size × seq_len) | `Nx.axis_size(flat_targets, 0)` |
+| `yᵢ` | The correct token at position i | `targets[i]` |
+| `P(yᵢ \| x)` | Probability the model assigns to the correct token | `softmax(logits)[correct_index]` |
+| `log` | Natural logarithm (base e) | `Nx.log(x)` |
+| `-` | Negate (because log of probability is negative) | `Nx.negate(x)` |
+| `(1/N) Σᵢ` | Average over all positions | `Nx.mean(x)` |
+
+The intuition: "take the average of -log(probability of correct token) across all positions." Lower = better.
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T, L (loss), log, P(y|x) (conditional probability)
 
 ## Key Concepts
 

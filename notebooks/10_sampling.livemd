@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Big Picture
@@ -141,6 +145,38 @@ for temp <- [0.1, 0.5, 1.0, 2.0, 5.0] do
 end
 ```
 
+## Visualize: Temperature Effect on Probability Distribution
+
+Let's see the probability distributions at different temperatures as bar charts.
+
+```elixir
+raw_logits = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+token_names = ["the", "a", "my", "his", "?"]
+
+temp_data =
+  for temp <- [0.1, 0.5, 1.0, 2.0] do
+    scaled = Nx.divide(raw_logits, temp)
+    exps = Nx.exp(Nx.subtract(scaled, Nx.reduce_max(scaled)))
+    probs = Nx.divide(exps, Nx.sum(exps))
+
+    Enum.zip(token_names, Nx.to_flat_list(probs))
+    |> Enum.map(fn {tok, p} ->
+      %{"token" => tok, "probability" => Float.round(p, 4), "temperature" => "T=#{temp}"}
+    end)
+  end
+  |> List.flatten()
+
+Vl.new(width: 120, height: 200, title: "Temperature Effect on Sampling Distribution")
+|> Vl.data_from_values(temp_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, title: "Token")
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+|> Vl.encode_field(:column, "temperature", type: :nominal, title: "Temperature")
+```
+
+After the chart: Low temperature (T=0.1): nearly all probability on 'the'. High temperature (T=2.0): much more spread out. Temperature controls the creativity/determinism tradeoff.
+
 ## Top-k Filtering: Cutting Off the Long Tail
 
 Even with temperature, the model might assign tiny probabilities to many tokens. **Top-k filtering** keeps only the k most likely tokens and zeroes out the rest. This prevents the model from ever picking a truly unlikely token.
@@ -168,6 +204,43 @@ IO.puts("Filtered logits: #{inspect(Nx.to_flat_list(filtered) |> Enum.map(&Float
 exps = Nx.exp(Nx.subtract(filtered, Nx.reduce_max(filtered)))
 probs = Nx.divide(exps, Nx.sum(exps))
 IO.puts("Probabilities: #{inspect(Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4)))}")
+```
+
+## Visualize: Before and After Top-k Filtering
+
+Top-k filtering zeros out the long tail of unlikely tokens. Let's see the probability distribution before and after.
+
+```elixir
+logits_65 = Nx.subtract(Nx.tensor(Enum.map(0..64, fn i -> 3.0 - i * 0.1 end)), 0.0)
+exps_all = Nx.exp(Nx.subtract(logits_65, Nx.reduce_max(logits_65)))
+probs_all = Nx.divide(exps_all, Nx.sum(exps_all))
+
+# After top-k=10: zero out everything except top 10
+sorted = Nx.sort(logits_65, axis: -1, direction: :desc)
+threshold = Nx.to_number(sorted[9])
+filtered = Nx.select(
+  Nx.less(logits_65, threshold),
+  Nx.broadcast(Nx.Constants.neg_infinity(:f32), {65}),
+  logits_65
+)
+exps_filtered = Nx.exp(Nx.subtract(filtered, Nx.reduce_max(filtered)))
+probs_filtered = Nx.divide(exps_filtered, Nx.sum(exps_filtered))
+
+before_data = Enum.with_index(Nx.to_flat_list(probs_all)) |> Enum.map(fn {p, i} ->
+  %{"token_index" => i, "probability" => Float.round(p, 5), "stage" => "Before top-k"}
+end)
+
+after_data = Enum.with_index(Nx.to_flat_list(probs_filtered)) |> Enum.map(fn {p, i} ->
+  %{"token_index" => i, "probability" => Float.round(p, 5), "stage" => "After top-k=10"}
+end)
+
+Vl.new(width: 250, height: 200, title: "Top-k Filtering (k=10, vocab=65)")
+|> Vl.data_from_values(before_data ++ after_data)
+|> Vl.mark(:bar, opacity: 0.8)
+|> Vl.encode_field(:x, "token_index", type: :quantitative, title: "Token Index")
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "stage", type: :nominal)
+|> Vl.encode_field(:column, "stage", type: :nominal)
 ```
 
 ## Exercise: Implement Temperature Scaling and Top-k Filtering
@@ -462,6 +535,39 @@ for temp <- [0.1, 0.5, 1.0, 2.0] do
 end
 ```
 
+## Interactive: Temperature Slider
+
+Adjust the temperature and see how the generated text changes.
+
+```elixir
+temp_slider = Kino.Input.range("Temperature (x10)", min: 1, max: 30, step: 1, default: 10)
+```
+
+```elixir
+temp_val = Kino.Input.read(temp_slider) / 10.0
+
+generated = ExNanoGPT.Sampler.generate_text(
+  tiny_params, tiny_config, meta, "H", Nx.Random.key(42),
+  max_new_tokens: 100, temperature: temp_val, top_k: 10
+)
+
+Kino.Markdown.new("""
+**Temperature = #{Float.round(temp_val, 1)}**
+
+```
+#{generated}
+```
+
+#{cond do
+  temp_val < 0.3 -> "Very low temperature: repetitive, deterministic output."
+  temp_val < 0.8 -> "Low temperature: conservative, sticking to common patterns."
+  temp_val < 1.2 -> "Normal temperature: balanced between variety and coherence."
+  temp_val < 2.0 -> "High temperature: more creative, less predictable."
+  true -> "Very high temperature: approaching random -- nearly uniform sampling."
+end}
+""")
+```
+
 ## From Random to Shakespeare
 
 With a random model, the output is gibberish. But the code is exactly the same code that generates real Shakespeare from a trained model. The only difference is the quality of the parameters.
@@ -497,6 +603,38 @@ You've built a complete GPT from scratch in Elixir. Here's everything you implem
 | **10: Sampling** | Generating text with temperature, top-k, and the Gumbel-max trick |
 
 Every one of these components is present in GPT-2, GPT-3, and the models behind ChatGPT and Claude. The difference is scale -- more layers, more heads, more data, more compute -- but the fundamental ideas are the same ones you just built by hand.
+
+## Math Notation: Temperature-Scaled Softmax
+
+Softmax with temperature:
+
+**P(i) = exp(zᵢ / T) / Σⱼ exp(zⱼ / T)**
+
+| Symbol | Meaning | Effect |
+|--------|---------|--------|
+| `T` | Temperature | Controls distribution sharpness |
+| `zᵢ` | Logit for token i | Raw model output |
+| `T → 0` | Approaches argmax | Always pick the most likely token |
+| `T → ∞` | Approaches uniform | Every token equally likely |
+| `T = 1` | Standard softmax | Use the model's distribution as-is |
+
+The complete math notation you've learned across all 11 notebooks:
+
+| Notebook | Symbols |
+|----------|---------|
+| 00 | Σ (sum), xᵢ (indexing) |
+| 01 | W ∈ ℝ^{m×n} (matrix shape), W[i] (row lookup) |
+| 02 | μ (mean), σ² (variance), ε (epsilon), γ/β (learnable scale/shift) |
+| 03 | Q, K, V (projections), d_k (head dim), softmax, ^T (transpose) |
+| 04 | GELU, Φ (Gaussian CDF), erf (error function) |
+| 05 | x_{l+1} = x_l + F(x_l) (residual connection) |
+| 06 | W_E^T (transposed weight tying) |
+| 07 | L (loss), log, P(y\|x) (conditional probability) |
+| 08 | α (learning rate), β₁/β₂ (decay rates), ∇ (gradient), θ (parameters) |
+| 09 | ∇_θ L (gradient of loss w.r.t. params) |
+| 10 | T (temperature), P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T) |
+
+You can now read ML papers. Every symbol above maps directly to code you wrote.
 
 ## Key Concepts
 

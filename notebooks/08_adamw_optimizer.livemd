@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Big Picture
@@ -66,6 +70,70 @@ end
 history = Enum.reverse(history)
 IO.puts("SGD finds x = #{Float.round(x, 6)} (target: 3.0)")
 IO.puts("First 10 steps: #{inspect(Enum.take(history, 10) |> Enum.map(&Float.round(&1, 3)))}")
+```
+
+## Visualize: SGD vs Adam on a Valley
+
+Let's see how SGD and Adam behave on a 2D loss surface shaped like an elongated valley: `f(x,y) = (x-3)^2 + 10*(y-2)^2`. SGD oscillates; Adam converges smoothly.
+
+```elixir
+# SGD path
+sgd_path =
+  Enum.reduce(1..50, {10.0, 10.0, [{10.0, 10.0}]}, fn _step, {x, y, hist} ->
+    gx = 2.0 * (x - 3.0)
+    gy = 20.0 * (y - 2.0)
+    lr = 0.05
+    new_x = x - lr * gx
+    new_y = y - lr * gy
+    {new_x, new_y, [{new_x, new_y} | hist]}
+  end)
+  |> elem(2)
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {{x, y}, i} ->
+    %{"x" => Float.round(x, 4), "y" => Float.round(y, 4), "step" => i, "optimizer" => "SGD"}
+  end)
+
+# Adam path
+{_x, _y, _m_x, _m_y, _v_x, _v_y, adam_path} =
+  Enum.reduce(1..50, {10.0, 10.0, 0.0, 0.0, 0.0, 0.0, [{10.0, 10.0}]}, fn t, {x, y, mx, my, vx, vy, hist} ->
+    gx = 2.0 * (x - 3.0)
+    gy = 20.0 * (y - 2.0)
+    b1 = 0.9
+    b2 = 0.999
+    lr = 0.5
+    eps = 1.0e-8
+
+    mx = b1 * mx + (1 - b1) * gx
+    my = b1 * my + (1 - b1) * gy
+    vx = b2 * vx + (1 - b2) * gx * gx
+    vy = b2 * vy + (1 - b2) * gy * gy
+
+    mx_hat = mx / (1 - :math.pow(b1, t))
+    my_hat = my / (1 - :math.pow(b1, t))
+    vx_hat = vx / (1 - :math.pow(b2, t))
+    vy_hat = vy / (1 - :math.pow(b2, t))
+
+    new_x = x - lr * mx_hat / (:math.sqrt(vx_hat) + eps)
+    new_y = y - lr * my_hat / (:math.sqrt(vy_hat) + eps)
+    {new_x, new_y, mx, my, vx, vy, [{new_x, new_y} | hist]}
+  end)
+
+adam_data =
+  adam_path
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {{x, y}, i} ->
+    %{"x" => Float.round(x, 4), "y" => Float.round(y, 4), "step" => i, "optimizer" => "Adam"}
+  end)
+
+Vl.new(width: 500, height: 400, title: "SGD vs Adam on (x-3)² + 10(y-2)²")
+|> Vl.data_from_values(sgd_path ++ adam_data)
+|> Vl.mark(:line, point: true, opacity: 0.8)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "x")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "y")
+|> Vl.encode_field(:color, "optimizer", type: :nominal)
+|> Vl.encode_field(:order, "step", type: :quantitative)
 ```
 
 SGD works, but it has problems:
@@ -207,6 +275,38 @@ end
 
 </details>
 
+## Break It: What Happens with a Bad Learning Rate?
+
+The learning rate is the most critical hyperparameter. Too high: the model diverges. Too low: nothing happens. Let's see all three on the simple `(x-3)^2` problem.
+
+```elixir
+run_sgd = fn lr, steps ->
+  Enum.reduce(1..steps, {10.0, [10.0]}, fn _step, {x, hist} ->
+    gradient = 2.0 * (x - 3.0)
+    new_x = x - lr * gradient
+    {new_x, [new_x | hist]}
+  end)
+  |> elem(1)
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {x, i} ->
+    loss = (x - 3.0) * (x - 3.0)
+    %{"step" => i, "loss" => Float.round(loss, 4), "lr" => "lr=#{lr}"}
+  end)
+end
+
+lr_data = run_sgd.(1.0, 20) ++ run_sgd.(0.1, 20) ++ run_sgd.(0.001, 20)
+
+Vl.new(width: 500, height: 300, title: "Learning Rate: Too High, Just Right, Too Low")
+|> Vl.data_from_values(lr_data)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "step", type: :quantitative, title: "Step")
+|> Vl.encode_field(:y, "loss", type: :quantitative, title: "Loss = (x-3)²", scale: %{type: "log"})
+|> Vl.encode_field(:color, "lr", type: :nominal, title: "Learning Rate")
+```
+
+lr=1.0 diverges (loss explodes). lr=0.001 barely moves. lr=0.1 converges nicely. This is why LR schedules and adaptive optimizers like Adam exist -- to navigate this sensitivity.
+
 ## The Cosine Learning Rate Schedule
 
 Using a fixed learning rate isn't ideal. Modern training uses a **schedule** that changes the learning rate over time:
@@ -255,6 +355,44 @@ IO.puts("  ...")
 IO.puts("  step #{warmup_iters}: lr = #{Float.round(lr, 8)} (peak)")
 IO.puts("  step #{div(lr_decay_iters, 2)}: lr = #{Float.round(min_lr + 0.5 * (lr - min_lr), 8)} (midpoint)")
 IO.puts("  step #{lr_decay_iters}: lr = #{Float.round(min_lr, 8)} (minimum)")
+```
+
+## Visualize: Learning Rate Schedule
+
+Let's see the full LR schedule as a chart. The three phases -- warmup, cosine decay, constant minimum -- are clearly visible.
+
+```elixir
+lr = 6.0e-4
+min_lr = 6.0e-5
+warmup_iters = 2000
+lr_decay_iters = 600_000
+
+schedule_data =
+  for iter <- Enum.concat([
+    Enum.to_list(0..2500//50),
+    Enum.to_list(3000..600_000//5_000),
+    Enum.to_list(600_000..650_000//5_000)
+  ]) do
+    computed_lr =
+      cond do
+        iter < warmup_iters ->
+          lr * (iter + 1) / (warmup_iters + 1)
+        iter > lr_decay_iters ->
+          min_lr
+        true ->
+          decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
+          coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          min_lr + coeff * (lr - min_lr)
+      end
+
+    %{"step" => iter, "learning_rate" => computed_lr}
+  end
+
+Vl.new(width: 600, height: 300, title: "Cosine Learning Rate Schedule with Warmup")
+|> Vl.data_from_values(schedule_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "step", type: :quantitative, title: "Training Step")
+|> Vl.encode_field(:y, "learning_rate", type: :quantitative, title: "Learning Rate")
 ```
 
 ## Exercise: Implement the Cosine LR Schedule with Warmup
@@ -455,6 +593,29 @@ We now have all the ingredients for training:
 - An optimizer that knows how to improve parameters (this notebook)
 
 In the next notebook, we'll assemble the **training loop** -- the code that ties these pieces together and actually teaches the model to generate Shakespeare.
+
+## Math Notation: The Adam Update Rule
+
+The full AdamW update, symbol by symbol:
+
+1. **mₜ = β₁ · mₜ₋₁ + (1 - β₁) · gₜ** -- update momentum (smoothed gradient direction)
+2. **vₜ = β₂ · vₜ₋₁ + (1 - β₂) · gₜ²** -- update variance estimate (gradient volatility)
+3. **m̂ₜ = mₜ / (1 - β₁ᵗ)** -- bias-corrected momentum
+4. **v̂ₜ = vₜ / (1 - β₂ᵗ)** -- bias-corrected variance
+5. **θₜ = θₜ₋₁ - α · m̂ₜ / (√v̂ₜ + ε)** -- the update step
+6. **θₜ = θₜ - α · λ · θₜ** -- decoupled weight decay (AdamW only)
+
+| Symbol | Name | Typical value | Nx code |
+|--------|------|--------------|---------|
+| `α` | Learning rate | 6e-4 | `lr` variable |
+| `β₁` | Momentum decay | 0.9 | `Nx.multiply(0.9, m)` |
+| `β₂` | Variance decay | 0.95 | `Nx.multiply(0.95, v)` |
+| `ε` | Safety constant | 1e-8 | `Nx.add(Nx.sqrt(v_hat), 1.0e-8)` |
+| `∇` | Gradient (nabla) | -- | Result of `value_and_grad` |
+| `θ` | Parameters (theta) | -- | The model weights |
+| `λ` | Weight decay | 0.1 | `weight_decay` config |
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T, L, log, P(y|x), α (lr), β₁/β₂ (decay), ∇ (gradient), θ (params)
 
 ## Key Concepts
 

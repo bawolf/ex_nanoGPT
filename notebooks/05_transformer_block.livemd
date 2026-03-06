@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## Putting It All Together
@@ -209,6 +213,81 @@ diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_num
 IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
 ```
 
+## Visualize: Gradient Flow With and Without Residuals
+
+Residual connections aren't just for cleanliness -- they're essential for training deep networks. Without them, gradients vanish as they flow backward through layers. Let's measure this.
+
+```elixir
+# We'll use a simple experiment: compute how much gradient reaches each layer
+# by measuring the norm of gradients for each block's attention weight
+
+n_embd_viz = 8
+n_head_viz = 2
+n_blocks_viz = 6
+
+key_viz = Nx.Random.key(42)
+block_keys = Nx.Random.split(key_viz, parts: n_blocks_viz + 1)
+
+blocks_viz =
+  for i <- 0..(n_blocks_viz - 1) do
+    ExNanoGPT.Block.init_params(n_embd_viz, n_head_viz, block_keys[i], bias: true, n_layer: n_blocks_viz)
+  end
+
+{x_viz, _} = Nx.Random.normal(block_keys[n_blocks_viz], shape: {1, 4, n_embd_viz})
+rng_key = Nx.Random.key(0)
+block_opts = [n_head: n_head_viz, dropout_rate: 0.0, training: false]
+
+# WITH residuals (normal transformer block behavior)
+loss_with_residual = fn blocks ->
+  output = Enum.reduce(blocks, x_viz, fn bp, acc ->
+    ExNanoGPT.Block.forward(acc, bp, rng_key, block_opts)
+  end)
+  Nx.sum(output)
+end
+
+{_, grads_with} = Nx.Defn.value_and_grad(loss_with_residual).(blocks_viz)
+
+norms_with =
+  grads_with
+  |> Enum.with_index()
+  |> Enum.map(fn {block_grad, i} ->
+    w = block_grad.attn.c_attn_weight
+    norm = Nx.to_number(Nx.sqrt(Nx.sum(Nx.multiply(w, w))))
+    %{"layer" => i, "grad_norm" => Float.round(norm, 6), "variant" => "With Residuals"}
+  end)
+
+# WITHOUT residuals: replace the block forward to skip the residual add
+loss_without_residual = fn blocks ->
+  output = Enum.reduce(blocks, x_viz, fn bp, acc ->
+    h = ExNanoGPT.LayerNorm.forward(acc, bp.ln_1)
+    h = ExNanoGPT.Attention.forward(h, bp.attn, rng_key, block_opts)
+    h = ExNanoGPT.LayerNorm.forward(h, bp.ln_2)
+    ExNanoGPT.MLP.forward(h, bp.mlp, rng_key, dropout_rate: 0.0, training: false)
+  end)
+  Nx.sum(output)
+end
+
+{_, grads_without} = Nx.Defn.value_and_grad(loss_without_residual).(blocks_viz)
+
+norms_without =
+  grads_without
+  |> Enum.with_index()
+  |> Enum.map(fn {block_grad, i} ->
+    w = block_grad.attn.c_attn_weight
+    norm = Nx.to_number(Nx.sqrt(Nx.sum(Nx.multiply(w, w))))
+    %{"layer" => i, "grad_norm" => Float.round(norm, 6), "variant" => "Without Residuals"}
+  end)
+
+Vl.new(width: 500, height: 300, title: "Gradient Norm per Layer (6-layer model)")
+|> Vl.data_from_values(norms_with ++ norms_without)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer (0 = first)")
+|> Vl.encode_field(:y, "grad_norm", type: :quantitative, title: "Gradient Norm", scale: %{type: "log"})
+|> Vl.encode_field(:color, "variant", type: :nominal)
+```
+
+Without residuals, gradient norms drop exponentially through the layers -- the earliest layers barely learn anything. With residuals, gradients stay roughly similar across layers. This is why deep transformers work.
+
 ## Stacking Blocks
 
 A full GPT model stacks N transformer blocks. Each block refines the representation -- early blocks tend to learn local patterns (syntax), while later blocks learn more abstract patterns (semantics, reasoning).
@@ -248,6 +327,23 @@ The shape doesn't change -- every block takes `{batch, seq_len, n_embd}` and ret
 ## What's Next
 
 We now have the complete repeating unit of GPT. In the next notebook, we'll assemble the **full model**: embeddings at the input, a stack of transformer blocks in the middle, and a projection head at the output that converts the final representations back into token probabilities. We'll also implement the loss function used for training.
+
+## Math Notation: Residual Connections
+
+The residual connection in math:
+
+**x_{l+1} = x_l + F(x_l)**
+
+This reads: "the output of layer l+1 is the input of layer l **plus** whatever the layer computed." The `F(x_l)` part is the attention or MLP sub-layer.
+
+Why gradients flow: when computing ∂x_{l+1}/∂x_l, the chain rule gives us `1 + ∂F/∂x_l`. That `1 +` is the gradient highway -- even if `∂F/∂x_l` is tiny, the gradient is at least 1.
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `x_{l+1} = x_l + F(x_l)` | `Nx.add(x, sublayer.(x))` | Residual connection |
+| `F ∘ G` | `f.(g.(x))` | Function composition |
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x_{l+1} = x_l + F(x_l) (residual)
 
 ## Key Concepts
 

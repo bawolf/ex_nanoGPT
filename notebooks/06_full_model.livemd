@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## The Complete Architecture
@@ -382,6 +386,40 @@ IO.puts("Close enough? #{abs(Nx.to_number(your_loss) - expected_loss) < 0.5}")
 
 If the loss is close to `log(vocab_size)`, the model is initialized correctly -- it's starting from a reasonable place. Training will bring this loss down as the model learns to predict the right tokens.
 
+## Visualize: What Does the Model Predict?
+
+Even untrained, the model outputs predictions for every token. Let's look at its top-5 guesses for the next token after a short prompt.
+
+```elixir
+# Run the model on a prompt
+prompt_ids = Nx.tensor([[39, 37, 35, 31, 37, 10]])  # "ROMEO:" in Shakespeare vocab
+prompt_logits = gpt_forward.(prompt_ids, params, config)
+
+# Get logits for the last position
+last_logits = prompt_logits[0][-1]
+exps = Nx.exp(Nx.subtract(last_logits, Nx.reduce_max(last_logits)))
+probs = Nx.divide(exps, Nx.sum(exps))
+
+# Top-5 predictions
+sorted_idx = Nx.argsort(probs, direction: :desc)
+top5_data =
+  for i <- 0..4 do
+    idx_val = Nx.to_number(sorted_idx[i])
+    prob_val = Nx.to_number(probs[idx_val])
+    # Map index back to character (simplified: printable ASCII offset)
+    char = <<idx_val + 10::utf8>> |> String.slice(0, 1)
+    %{"token" => "id=#{idx_val}", "probability" => Float.round(prob_val, 4), "rank" => i + 1}
+  end
+
+Vl.new(width: 400, height: 250, title: "Top-5 Predicted Next Tokens (untrained model)")
+|> Vl.data_from_values(top5_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, sort: "-y", title: "Token")
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "Probability")
+```
+
+These are random guesses -- the model hasn't learned anything yet. After training, the top prediction would be a space or newline (common after 'ROMEO:' in Shakespeare).
+
 ## Parameter Count
 
 Let's count how many learnable parameters our model has:
@@ -405,6 +443,27 @@ The next step is **training**: using gradient descent to update all these parame
 - Computing gradients with `Nx.Defn.value_and_grad`
 - An optimizer (AdamW) to update parameters
 - A training loop with batching and evaluation
+
+## Math Notation: The Full Forward Pass
+
+The complete GPT forward pass in one line:
+
+**logits = LN(Block_N(... Block_1(E_tok + E_pos) ...)) · W_E^T**
+
+Each symbol:
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `E_tok` | `Nx.take(wte, idx, axis: 0)` | Token embedding lookup |
+| `E_pos` | `Nx.take(wpe, positions, axis: 0)` | Position embedding lookup |
+| `Block_i(x)` | `Block.forward(x, block_params, ...)` | One transformer block |
+| `LN(x)` | `LayerNorm.forward(x, params.ln_f)` | Final layer normalization |
+| `W_E^T` | `params.wte` transposed | Weight-tied output projection |
+| `· W_E^T` | `Nx.dot(x, [-1], wte, [-1])` | Project back to vocabulary scores |
+
+The `^T` means transpose -- we dot the hidden state against each token's embedding to ask "how similar is this to each token?"
+
+**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T (weight tying)
 
 ## Key Concepts
 

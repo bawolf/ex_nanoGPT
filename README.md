@@ -127,7 +127,17 @@ EMLX is ~2x faster on Mac. On Linux with CUDA, EXLA will be much faster (seconds
 
 ### EMLX Metal sort kernel
 
-MLX's Metal GPU backend has a bug where `Nx.sort` crashes with `Unable to load kernel carg_block_sort_bool`. This project works around it with a sort-free top-k implementation in the sampler. If you hit sort-related crashes in your own code, transfer to CPU for the sort: `tensor |> Nx.backend_transfer({EMLX.Backend, device: :cpu}) |> Nx.sort() |> Nx.backend_transfer({EMLX.Backend, device: :gpu})`.
+MLX's Metal GPU backend has a bug where `Nx.sort` crashes with `Unable to load kernel carg_block_sort_bool` -- it dispatches a boolean sort kernel for float tensors, causing a hard crash (SIGABRT, exit code 134).
+
+**Affected code**: `ExNanoGPT.Sampler.apply_top_k/2` in `lib/ex_nano_gpt/sampler.ex`. The natural implementation uses `Nx.sort` (matching nanoGPT's `torch.topk`), but we use a rank-based O(vocab^2) workaround instead.
+
+**Only affects EMLX GPU** -- `NX_BACKEND=exla` works fine with `Nx.sort`.
+
+**To revert**: When the upstream MLX sort kernel is fixed, replace `apply_top_k` with the 4-line `Nx.sort` version documented in the source comment.
+
+**Workaround for your own code**: Transfer to CPU for the sort: `tensor |> Nx.backend_transfer({EMLX.Backend, device: :cpu}) |> Nx.sort() |> Nx.backend_transfer({EMLX.Backend, device: :gpu})`.
+
+Track: [elixir-nx/emlx](https://github.com/elixir-nx/emlx)
 
 ### No f64 on Metal
 

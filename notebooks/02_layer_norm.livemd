@@ -5,7 +5,9 @@ Mix.install([
   {:nx, "~> 0.10"},
   {:exla, "~> 0.10"},
   {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"}
+  {:kino, "~> 0.14"},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"}
 ])
 
 # Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
@@ -27,6 +29,8 @@ case backend do
     Nx.Defn.global_default_options(compiler: EMLX)
     IO.puts("Backend: EMLX (Apple Metal GPU)")
 end
+
+alias VegaLite, as: Vl
 ```
 
 ## Why Normalize?
@@ -67,6 +71,32 @@ normalized = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(variance, eps)))
 IO.inspect(Nx.to_flat_list(normalized) |> Enum.map(&Float.round(&1, 4)), label: "after normalization")
 IO.inspect(Float.round(Nx.to_number(Nx.mean(normalized)), 6), label: "mean (should be ~0)")
 IO.inspect(Float.round(Nx.to_number(Nx.variance(normalized)), 4), label: "variance (should be ~1)")
+```
+
+## Visualize: Before and After Layer Norm
+
+Let's see what layer norm does to a distribution of values. Before: scattered everywhere. After: centered at 0, width ~1.
+
+```elixir
+# Generate a wide, off-center distribution
+key = Nx.Random.key(42)
+{raw_values, _} = Nx.Random.normal(key, 50.0, 25.0, shape: {500})
+
+# Apply layer norm (simplified: just normalize, no learnable params)
+mean = Nx.mean(raw_values)
+var = Nx.variance(raw_values)
+normed_values = Nx.divide(Nx.subtract(raw_values, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))
+
+before_list = Nx.to_flat_list(raw_values) |> Enum.map(&%{"value" => &1, "stage" => "Before LayerNorm"})
+after_list = Nx.to_flat_list(normed_values) |> Enum.map(&%{"value" => &1, "stage" => "After LayerNorm"})
+
+Vl.new(width: 500, height: 250, title: "Layer Norm: Before vs After")
+|> Vl.data_from_values(before_list ++ after_list)
+|> Vl.mark(:bar, opacity: 0.7)
+|> Vl.encode_field(:x, "value", type: :quantitative, bin: %{maxbins: 40}, title: "Value")
+|> Vl.encode_field(:y, "count()", type: :quantitative, title: "Count")
+|> Vl.encode_field(:color, "stage", type: :nominal)
+|> Vl.encode_field(:column, "stage", type: :nominal)
 ```
 
 ## Exercise: Implement Layer Norm
@@ -169,6 +199,53 @@ diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_num
 IO.puts(if diff < 1.0e-6, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
 ```
 
+## Break It: What Happens Without Layer Norm?
+
+Without layer norm, values grow or shrink as they flow through multiple layers. Let's simulate passing data through several linear transforms with and without normalization.
+
+```elixir
+# Simulate 6 layers of linear transforms
+key = Nx.Random.key(99)
+{x, key} = Nx.Random.normal(key, shape: {1, 8})
+
+results_with_ln = [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]
+results_without_ln = [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]
+
+{_, _, with_ln, without_ln} =
+  Enum.reduce(1..6, {x, x, results_with_ln, results_without_ln}, fn _layer, {x_ln, x_raw, acc_ln, acc_raw} ->
+    {w, key_next} = Nx.Random.normal(Nx.Random.key(elem(Nx.shape(x_ln), 1)), 0.0, 0.5, shape: {8, 8})
+
+    # Without layer norm: just multiply
+    x_raw = Nx.dot(x_raw, [-1], w, [0])
+    max_raw = Nx.to_number(Nx.reduce_max(Nx.abs(x_raw))) |> Float.round(2)
+
+    # With layer norm: normalize then multiply
+    mean = Nx.mean(x_ln, axes: [-1], keep_axes: true)
+    var = Nx.variance(x_ln, axes: [-1], keep_axes: true)
+    x_ln = Nx.divide(Nx.subtract(x_ln, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))
+    x_ln = Nx.dot(x_ln, [-1], w, [0])
+    max_ln = Nx.to_number(Nx.reduce_max(Nx.abs(x_ln))) |> Float.round(2)
+
+    {x_ln, x_raw, acc_ln ++ [max_ln], acc_raw ++ [max_raw]}
+  end)
+
+chart_data =
+  Enum.zip([0..6, with_ln, without_ln])
+  |> Enum.flat_map(fn {layer, val_ln, val_raw} ->
+    [
+      %{"layer" => layer, "max_abs_value" => val_ln, "variant" => "With LayerNorm"},
+      %{"layer" => layer, "max_abs_value" => val_raw, "variant" => "Without LayerNorm"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "Max Absolute Value Per Layer")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
+|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
+|> Vl.encode_field(:color, "variant", type: :nominal)
+```
+
 ## Where LayerNorm Appears in GPT
 
 In nanoGPT's transformer, LayerNorm appears in three places:
@@ -181,6 +258,26 @@ This is called "pre-norm" style -- normalize before the computation, not after. 
 ## What's Next
 
 We've built two simple but important components: embeddings (notebook 01) and layer normalization (this notebook). Next comes the main event: **self-attention** -- the mechanism that lets each token look at other tokens in the sequence to decide what comes next.
+
+## Math Notation: The Layer Norm Formula
+
+Layer norm has four symbols worth knowing:
+
+- **μ** (mu) = mean: `μ = (1/n) Σ xᵢ` → `Nx.mean(x, axes: [-1])`
+- **σ²** (sigma squared) = variance: `σ² = (1/n) Σ (xᵢ - μ)²` → `Nx.variance(x, axes: [-1])`
+- **ε** (epsilon) = tiny safety constant to avoid dividing by zero: `1.0e-5`
+- **γ, β** (gamma, beta) = learnable scale and shift, initialized to 1 and 0
+
+The full formula, symbol by symbol:
+
+| Math | Nx code | What it does |
+|------|---------|-------------|
+| `μ = (1/n) Σ xᵢ` | `Nx.mean(x, axes: [-1])` | Average value |
+| `σ² = (1/n) Σ (xᵢ - μ)²` | `Nx.variance(x, axes: [-1])` | How spread out |
+| `x̂ = (x - μ) / √(σ² + ε)` | `(x - mean) / Nx.sqrt(var + 1.0e-5)` | Normalize |
+| `y = γ · x̂ + β` | `Nx.multiply(gamma, x_hat) + beta` | Scale and shift |
+
+**Running reference**: Σ (sum), xᵢ (indexing), W ∈ ℝ (matrix), μ (mean), σ² (variance), ε (epsilon), γ/β (learnable scale/shift)
 
 ## Key Concepts
 
