@@ -1,4 +1,4 @@
-# 14: BPE Tokenization
+# 14: BPE Tokenization — From a 1994 Compression Hack to the Heart of Every LLM
 
 ```elixir
 Mix.install([
@@ -19,53 +19,51 @@ case backend do
 end
 ```
 
-## Math Notation
+## Tokenize Your Name
 
-BPE introduces vocabulary and merge notation used throughout:
+Type your name below. Our v1 character-level model treats every byte as one token. How expensive is that?
+
+```elixir
+name_input = Kino.Input.text("Your name")
+```
+
+```elixir
+name = Kino.Input.read(name_input)
+bytes = :binary.bin_to_list(name)
+
+IO.puts("\"#{name}\" = #{length(bytes)} bytes = #{length(bytes)} tokens")
+IO.puts("Bytes: #{inspect(bytes)}")
+IO.puts("As chars: #{inspect(Enum.map(bytes, &<<&1>>))}")
+IO.puts("\nEvery single character is a separate token.")
+IO.puts("The word 'the' costs 3 tokens. Every. Single. Time.")
+```
+
+Now think about this: in the complete works of Shakespeare (~1MB), the word " the" (with a leading space) appears about 23,000 times. That's 92,000 tokens for one word. Shouldn't "the" just be... one token?
+
+In February 1994, a programmer named **Philip Gage** published a short article in the *C Users Journal* — a hobbyist magazine for C programmers. His algorithm was called **Byte Pair Encoding**: find the most common pair of bytes, replace them with a new symbol, repeat. It was a simple data compression trick.
+
+Twenty-two years later, in 2016, **Rico Sennrich** (yes — the same Sennrich who co-authored RMSNorm in 2019) and colleagues at the University of Edinburgh realized this compression algorithm could solve the "open vocabulary" problem in machine translation. Before BPE, models had fixed vocabularies and choked on new words. After BPE, any text could be represented as a sequence of subword tokens.
+
+Today, GPT-4 uses ~100,000 BPE tokens. Every modern LLM uses some variant of BPE. Let's build it from scratch.
+
+## Math Notation
 
 | Symbol | Meaning | Example |
 |--------|---------|---------|
-| V | Vocabulary — the set of all tokens | {0, 1, …, 255, 256, …} |
+| V | Vocabulary — the set of all tokens | {0, 1, ..., 255, 256, ...} |
 | \|V\| | Vocabulary size | 256 + num_merges + num_special |
-| b = [b₁, …, bₙ] | Byte sequence (UTF-8 encoded text) | "hi" → [104, 105] |
 | (p, q) | An adjacent pair of token IDs | (116, 104) |
 | f(p, q) | Frequency of pair (p, q) in the corpus | f(116, 104) = 5 |
-| M = [(pair₁, id₁), …] | Merge table — ordered list of merge rules | [({32, 116}, 256), …] |
-| encode(text) | Apply M to convert text → token IDs | "the" → [256, 101] |
-| decode(ids) | Reverse: token IDs → text | [256, 101] → "the" |
+| **(p\*, q\*) = argmax f(p, q)** | **Find the most frequent pair** | **The key equation** |
 
-The key equation for each BPE training step:
+## See the Pairs
 
-**(p\*, q\*) = argmax₍ₚ,q₎ f(p, q)**
-
-Find the most frequent adjacent pair and replace all its occurrences with a new token.
-
-## What is BPE?
-
-**Byte-Pair Encoding** is a compression algorithm repurposed for tokenization. The idea:
-
-1. Start with **raw bytes** — 256 possible values, one token per byte
-2. Scan the corpus and count every adjacent pair of tokens
-3. Find the **most frequent pair**
-4. **Merge** every occurrence into a single new token (ID = 256, 257, …)
-5. Repeat until reaching the desired vocabulary size
-
-Common subwords like `th`, `the`, ` the` (with leading space), `ing` emerge naturally as merged tokens. This gives a vocabulary that can represent any byte sequence (no unknown tokens) while keeping common words as single tokens.
-
-```elixir
-text = "hello"
-bytes = :binary.bin_to_list(text)
-
-IO.puts("Text:        #{inspect(text)}")
-IO.puts("UTF-8 bytes: #{inspect(bytes)}")
-IO.puts("As chars:    #{inspect(Enum.map(bytes, &<<&1>>))}")
-IO.puts("\nBPE starts here: each byte is one token (256 possible base tokens).")
-```
+Let's look at what happens when we scan text for adjacent byte pairs:
 
 ```elixir
 text = "the cat sat on the mat"
 bytes = :binary.bin_to_list(text)
-IO.puts("#{inspect(text)}  →  #{length(bytes)} byte-tokens\n")
+IO.puts("\"#{text}\" = #{length(bytes)} byte-tokens\n")
 
 pairs =
   bytes
@@ -79,29 +77,24 @@ IO.puts("Top 5 adjacent byte pairs:")
 for {{a, b}, count} <- pairs do
   a_s = if a in 32..126, do: <<a>>, else: "0x#{Integer.to_string(a, 16)}"
   b_s = if b in 32..126, do: <<b>>, else: "0x#{Integer.to_string(b, 16)}"
-  IO.puts("  (#{a}, #{b}) = '#{a_s}#{b_s}'  ×#{count}")
+  IO.puts("  (#{a}, #{b}) = '#{a_s}#{b_s}'  x#{count}")
 end
 
-IO.puts("\nBPE would merge the most frequent pair first.")
+IO.puts("\nBPE would merge the most frequent pair first, creating a new token.")
 ```
 
-## Build a BPE Tokenizer
-
-We'll build BPE from scratch in three steps: count pairs, merge pairs, repeat.
+## Build BPE from Scratch
 
 ### Step 1: Count Byte-Pair Frequencies
-
-Given a list of token IDs, count how often each adjacent pair occurs.
 
 ```elixir
 count_pairs = fn ids ->
   # TODO:
-  # 1. Enum.chunk_every(ids, 2, 1, :discard) → list of [a, b] pairs
+  # 1. Enum.chunk_every(ids, 2, 1, :discard) to get [a, b] pairs
   # 2. Enum.reduce into a map: %{ {a, b} => count, ... }
   %{}
 end
 
-# Test
 test_ids = [104, 101, 108, 108, 111, 104, 101]
 counts = count_pairs.(test_ids)
 IO.inspect(counts, label: "pair counts")
@@ -125,20 +118,18 @@ end
 
 ### Step 2: The Merge Operation
 
-Replace every occurrence of a pair `{p1, p2}` with a new token ID. Scan left to right: when you see `p1` followed by `p2`, emit `new_id` and skip both; otherwise emit the current token and continue.
-
-Pattern matching on list heads makes this natural in Elixir — define it as a module.
+Replace every occurrence of a pair `{p1, p2}` with a new token ID. Pattern matching on list heads makes this natural in Elixir.
 
 ```elixir
 defmodule BPE do
   def merge(ids, {p1, p2}, new_id) do
-    # TODO: call do_merge(ids, p1, p2, new_id, [])
+    # TODO: implement using do_merge(ids, p1, p2, new_id, [])
     #
     # Base cases:
-    #   do_merge([], ..., acc) → Enum.reverse(acc)
-    #   do_merge([a], ..., acc) → Enum.reverse([a | acc])
+    #   do_merge([], ..., acc) -> Enum.reverse(acc)
+    #   do_merge([a], ..., acc) -> Enum.reverse([a | acc])
     #
-    # Match: when a == p1 and b == p2 →
+    # Match: when a == p1 and b == p2 ->
     #   do_merge(rest, ..., [new_id | acc])
     #
     # No match:
@@ -147,7 +138,6 @@ defmodule BPE do
   end
 end
 
-# Test
 IO.puts("merge([1,2,3,1,2,4], {1,2}, 256)")
 IO.puts("Expected: [256, 3, 256, 4]")
 IO.puts("Got:      #{inspect(BPE.merge([1, 2, 3, 1, 2, 4], {1, 2}, 256))}")
@@ -179,14 +169,14 @@ end
 
 </details>
 
-### Step 3: Train Step by Step
+### Step 3: Train — Watch Merges Happen
 
-Combine counting and merging into a training loop. Each iteration finds the most frequent pair and merges it.
+Now combine counting and merging into a training loop. Each iteration finds the most frequent pair and creates a new token.
 
 ```elixir
 training_text = "the cat sat on the mat. the cat ate the rat. the fat cat and the hat."
 ids = :binary.bin_to_list(training_text)
-IO.puts("Training text (#{byte_size(training_text)} bytes):\n  #{inspect(training_text)}\n")
+IO.puts("Training text (#{byte_size(training_text)} bytes):\n  \"#{training_text}\"\n")
 
 num_merges = 20
 
@@ -205,8 +195,8 @@ num_merges = 20
 
       IO.puts(
         "Merge #{String.pad_leading("#{step}", 2)}: " <>
-          "(#{p1}, #{p2}) '#{p1_s}'+'#{p2_s}' → #{next_id}  " <>
-          "freq=#{freq}  tokens: #{length(ids)} → #{length(new_ids)}"
+          "'#{p1_s}'+'#{p2_s}' -> #{next_id}  " <>
+          "freq=#{freq}  tokens: #{length(ids)} -> #{length(new_ids)}"
       )
 
       {[{best_pair, next_id} | merges], new_ids, next_id + 1}
@@ -214,52 +204,13 @@ num_merges = 20
   end)
 
 merges = Enum.reverse(merges)
-
-IO.puts("\nDone: #{byte_size(training_text)} bytes → #{length(final_ids)} tokens")
-IO.puts("Compression: #{Float.round(byte_size(training_text) / max(length(final_ids), 1), 2)}×")
+IO.puts("\n#{byte_size(training_text)} bytes -> #{length(final_ids)} tokens")
+IO.puts("Compression: #{Float.round(byte_size(training_text) / max(length(final_ids), 1), 2)}x")
 ```
 
-### Visualize: Merge History
+Watch how "t"+"h" merge first, then " "+"t" (space+t), building up to common words. This is BPE discovering the structure of English, one merge at a time.
 
-Which pairs were most frequent when they were merged?
-
-```elixir
-ids = :binary.bin_to_list(training_text)
-
-{merge_data, _, _} =
-  Enum.reduce(1..num_merges, {[], ids, 256}, fn step, {data, ids, next_id} ->
-    counts = count_pairs.(ids)
-
-    if map_size(counts) == 0 do
-      {data, ids, next_id}
-    else
-      {{p1, p2} = best_pair, freq} = Enum.max_by(counts, fn {_, c} -> c end)
-      new_ids = BPE.merge(ids, best_pair, next_id)
-
-      p1_s = if p1 in 32..126, do: <<p1>>, else: "#{p1}"
-      p2_s = if p2 in 32..126, do: <<p2>>, else: "#{p2}"
-      label = "'#{p1_s}'+'#{p2_s}'"
-
-      entry = %{"step" => step, "frequency" => freq, "pair" => label}
-      {[entry | data], new_ids, next_id + 1}
-    end
-  end)
-
-Vl.new(width: 600, height: 300, title: "Merge History: Pair Frequency at Each Step")
-|> Vl.data_from_values(Enum.reverse(merge_data))
-|> Vl.mark(:bar)
-|> Vl.encode_field(:x, "step", type: :ordinal, title: "Merge Step")
-|> Vl.encode_field(:y, "frequency", type: :quantitative, title: "Pair Frequency")
-|> Vl.encode_field(:color, "frequency", type: :quantitative,
-  scale: %{scheme: "blues"},
-  legend: nil
-)
-|> Vl.encode_field(:tooltip, "pair", type: :nominal)
-```
-
-Early merges capture the most frequent pairs (high bars). Later merges target rarer patterns (lower bars). The declining frequency is natural — each merge reduces the count of remaining pairs.
-
-### Visualize: Compression Ratio Over Merges
+### Visualize: Compression Over Merges
 
 ```elixir
 ids = :binary.bin_to_list(training_text)
@@ -286,20 +237,20 @@ original_len = length(ids)
       end
   end)
 
-Vl.new(width: 600, height: 300, title: "Compression Ratio vs. Number of Merges")
+Vl.new(width: 600, height: 300, title: "Compression Ratio vs Number of Merges")
 |> Vl.data_from_values(Enum.reverse(ratio_data))
 |> Vl.mark(:line, point: true)
 |> Vl.encode_field(:x, "merges", type: :quantitative, title: "Number of Merges")
 |> Vl.encode_field(:y, "ratio", type: :quantitative, title: "Compression Ratio (bytes / tokens)")
 ```
 
-Each merge improves compression. The rate of improvement decreases as the most impactful merges happen first.
+The steepest gains come from the first few merges — the most impactful patterns. Returns diminish as merges target rarer pairs.
 
 ## Encoding and Decoding
 
-### Encoding: Apply the Merge Table
+### Encoding: Apply Merges in Order
 
-To encode new text, convert it to bytes and apply each merge rule in order. The order matters — merges are applied greedily left-to-right in the same order they were learned.
+To encode new text, convert to bytes, then apply each merge rule left-to-right in the same order they were learned.
 
 ```elixir
 encode = fn text, merges ->
@@ -313,12 +264,11 @@ end
 encoded = encode.(training_text, merges)
 IO.puts("Original: #{byte_size(training_text)} bytes")
 IO.puts("Encoded:  #{length(encoded)} tokens")
-IO.puts("IDs: #{inspect(encoded)}")
 ```
 
 ### Decoding: Build the Vocabulary
 
-Each token maps to a byte sequence. Base tokens (0–255) map to a single byte. Merged tokens map to the concatenation of their constituents' bytes.
+Each merged token maps to the concatenation of its children's bytes.
 
 ```elixir
 vocab = for i <- 0..255, into: %{}, do: {i, [i]}
@@ -341,7 +291,7 @@ IO.puts("Sample vocabulary entries:")
 for {_pair, id} <- Enum.take(merges, 8) do
   bytes = Map.fetch!(vocab, id)
   text = :binary.list_to_bin(bytes)
-  IO.puts("  token #{id} → #{inspect(bytes)} → #{inspect(text)}")
+  IO.puts("  token #{id} -> #{inspect(bytes)} -> #{inspect(text)}")
 end
 ```
 
@@ -358,23 +308,44 @@ test_texts = [
 for text <- test_texts do
   tokens = encode.(text, merges)
   decoded = decode.(tokens, vocab)
-  status = if decoded == text, do: "✓", else: "✗"
+  status = if decoded == text, do: "OK", else: "FAIL"
   ratio = Float.round(byte_size(text) / max(length(tokens), 1), 1)
 
   IO.puts(
-    "#{status} #{byte_size(text)} bytes → #{length(tokens)} tokens (#{ratio}×)" <>
+    "#{status} #{byte_size(text)} bytes -> #{length(tokens)} tokens (#{ratio}x)" <>
       "  #{inspect(String.slice(text, 0, 50))}"
   )
 end
+
+IO.puts("\nBPE is lossless. Every byte sequence roundtrips perfectly.")
 ```
 
-The roundtrip always succeeds because BPE is lossless — every byte sequence can be represented, and decoding exactly reverses encoding.
+## Interactive: Type Text, Watch Tokenization
+
+```elixir
+text_input = Kino.Input.text("Type any text", default: "the cat sat on the mat")
+```
+
+```elixir
+user_text = Kino.Input.read(text_input)
+user_bytes = :binary.bin_to_list(user_text)
+user_encoded = encode.(user_text, merges)
+
+IO.puts("\"#{user_text}\"")
+IO.puts("  Raw bytes: #{length(user_bytes)} tokens")
+IO.puts("  After BPE: #{length(user_encoded)} tokens")
+IO.puts("  Compression: #{Float.round(length(user_bytes) / max(length(user_encoded), 1), 2)}x")
+IO.puts("\nTokens:")
+
+for id <- user_encoded do
+  text = :binary.list_to_bin(Map.fetch!(vocab, id))
+  IO.puts("  #{String.pad_leading("#{id}", 4)}  #{inspect(text)}")
+end
+```
 
 ## Special Tokens
 
-Real tokenizers need synthetic tokens that don't correspond to any byte sequence. These mark **conversation structure**: where a conversation starts, where user and assistant turns begin and end.
-
-They get IDs assigned after all merge tokens.
+Real tokenizers need synthetic tokens for conversation structure — marking where user and assistant turns begin and end. These don't correspond to any byte sequence.
 
 ```elixir
 special_tokens =
@@ -388,69 +359,45 @@ special_map =
   |> Enum.with_index(special_start)
   |> Map.new()
 
-IO.puts("Special token IDs:")
-
-for {name, id} <- Enum.sort_by(special_map, fn {_, id} -> id end) do
-  IO.puts("  #{name}  →  #{id}")
-end
-
-IO.puts("\nVocabulary breakdown:")
-IO.puts("  Base bytes:  0–255           (256 tokens)")
-IO.puts("  Merges:      256–#{255 + length(merges)}         (#{length(merges)} tokens)")
-IO.puts("  Special:     #{special_start}–#{special_start + length(special_tokens) - 1}         (#{length(special_tokens)} tokens)")
+IO.puts("Vocabulary breakdown:")
+IO.puts("  Base bytes:  0-255            (256 tokens)")
+IO.puts("  Merges:      256-#{255 + length(merges)}          (#{length(merges)} tokens)")
+IO.puts("  Special:     #{special_start}-#{special_start + length(special_tokens) - 1}          (#{length(special_tokens)} tokens)")
 IO.puts("  Total:       #{special_start + length(special_tokens)} tokens")
-```
-
-```elixir
-user_msg = "hello"
-assistant_msg = "hi there"
-
-user_ids = encode.(user_msg, merges)
-asst_ids = encode.(assistant_msg, merges)
-
-conversation_ids =
-  [special_map["<|bos|>"]] ++
-    [special_map["<|user_start|>"]] ++
-    user_ids ++
-    [special_map["<|user_end|>"]] ++
-    [special_map["<|assistant_start|>"]] ++
-    asst_ids ++
-    [special_map["<|assistant_end|>"]]
-
-special_inv = Map.new(special_map, fn {k, v} -> {v, k} end)
-
-IO.puts("Conversation: user=#{inspect(user_msg)}, assistant=#{inspect(assistant_msg)}")
-IO.puts("Token IDs: #{inspect(conversation_ids)}\n")
-
-for id <- conversation_ids do
-  label =
-    cond do
-      Map.has_key?(special_inv, id) -> special_inv[id]
-      Map.has_key?(vocab, id) -> inspect(:binary.list_to_bin(Map.fetch!(vocab, id)))
-      true -> "byte(#{id})"
-    end
-
-  IO.puts("  #{String.pad_leading("#{id}", 4)}  #{label}")
-end
-
-IO.puts("\nDuring fine-tuning, loss is computed only on assistant tokens.")
-IO.puts("The model learns to generate responses, not to predict prompts.")
 ```
 
 ## Break It
 
-### Experiment 1: Tiny Vocabulary (256 + 2 merges)
+### Weird Splits: Why ChatGPT Tokenizes Words Strangely
 
-With barely any merges, the tokenizer can't compress. Each character is roughly one token — long sequences, expensive attention.
+BPE merges are learned from training data. This means tokenization depends on what patterns appeared in the corpus. Try encoding something that wasn't in the training data:
+
+```elixir
+for text <- ["the cat", "ChatGPT", "indivisible", "Elixir"] do
+  tokens = encode.(text, merges)
+  decoded_parts = Enum.map(tokens, fn id ->
+    :binary.list_to_bin(Map.fetch!(vocab, id)) |> inspect()
+  end)
+  IO.puts("\"#{text}\" -> #{inspect(decoded_parts)}")
+end
+
+IO.puts("\nWords not in the training data get split into whatever subwords the")
+IO.puts("tokenizer learned. This is why ChatGPT sometimes breaks words in")
+IO.puts("unexpected places — it's the BPE merges from its training data.")
+IO.puts("\nDifferent languages also tokenize differently. English words that")
+IO.puts("were common in training get single tokens; rare scripts cost more.")
+```
+
+### Tiny Vocabulary (barely any merges)
 
 ```elixir
 text = "the cat sat on the mat. the cat ate the rat."
-ids = :binary.bin_to_list(text)
+full_encoded = encode.(text, merges)
 
+ids = :binary.bin_to_list(text)
 {tiny_merges, _, _} =
   Enum.reduce(1..2, {[], ids, 256}, fn _, {m, ids, nid} ->
     counts = count_pairs.(ids)
-
     if map_size(counts) == 0 do
       {m, ids, nid}
     else
@@ -464,108 +411,58 @@ tiny_encoded =
     BPE.merge(ids, {p1, p2}, nid)
   end)
 
-full_encoded = encode.(text, merges)
-
 IO.puts("Tiny vocab  (258 tokens): #{length(tiny_encoded)} tokens for #{byte_size(text)} bytes")
 IO.puts("Full vocab  (#{256 + length(merges)} tokens): #{length(full_encoded)} tokens for #{byte_size(text)} bytes")
-IO.puts("Original bytes:           #{byte_size(text)}")
-IO.puts("\nWith only 2 merges, almost no compression.")
-IO.puts("In a real model, longer sequences mean quadratically more attention compute.")
+IO.puts("\nWith almost no merges, no compression. Longer sequences = quadratically more attention compute.")
 ```
 
-### Experiment 2: Giant Vocabulary on Tiny Corpus
+### Challenge: Train on Code vs English
 
-Too many merges on a small corpus: the tokenizer creates tokens for entire phrases that only exist in the training data.
+What would BPE merges look like for Elixir source code vs English text? Think about it: code has `def`, `end`, `|>`, `fn`, `do` — completely different frequent pairs than English prose.
 
 ```elixir
-tiny_text = "ab ab ab"
-ids = :binary.bin_to_list(tiny_text)
+english = "the cat sat on the mat. the cat ate the rat. the fat cat and the hat."
 
-IO.puts("Training on #{inspect(tiny_text)} with 10 merges:\n")
+elixir_code = """
+defmodule Foo do
+  def bar(x) do
+    x |> Enum.map(fn i -> i * 2 end) |> Enum.filter(fn i -> rem(i, 3) == 0 end)
+  end
+end
+"""
 
-{giant_merges, final_ids, _} =
-  Enum.reduce(1..10, {[], ids, 256}, fn step, {m, ids, nid} ->
-    counts = count_pairs.(ids)
+for {name, text} <- [{"English", english}, {"Elixir", elixir_code}] do
+  ids = :binary.bin_to_list(text)
+  {top_merges, _, _} =
+    Enum.reduce(1..10, {[], ids, 256}, fn _, {m, ids, nid} ->
+      counts = count_pairs.(ids)
+      if map_size(counts) == 0 do
+        {m, ids, nid}
+      else
+        {best, freq} = Enum.max_by(counts, fn {_, c} -> c end)
+        {[{best, freq} | m], BPE.merge(ids, best, nid), nid + 1}
+      end
+    end)
 
-    if map_size(counts) == 0 do
-      IO.puts("  Step #{step}: no pairs left to merge!")
-      {m, ids, nid}
-    else
-      {best, freq} = Enum.max_by(counts, fn {_, c} -> c end)
-      new_ids = BPE.merge(ids, best, nid)
+  IO.puts("#{name} — top 5 merges:")
+  for {{a, b}, freq} <- Enum.take(Enum.reverse(top_merges), 5) do
+    a_s = if a in 32..126, do: <<a>>, else: "#{a}"
+    b_s = if b in 32..126, do: <<b>>, else: "#{b}"
+    IO.puts("  '#{a_s}'+'#{b_s}'  x#{freq}")
+  end
+  IO.puts("")
+end
 
-      IO.puts(
-        "  Step #{step}: #{inspect(best)} → #{nid}" <>
-          "  (freq=#{freq}, #{length(ids)} → #{length(new_ids)} tokens)"
-      )
-
-      {[{best, nid} | m], new_ids, nid + 1}
-    end
-  end)
-
-IO.puts("\nFinal: #{length(final_ids)} tokens. Ran out of pairs quickly.\n")
-
-giant_merges_ordered = Enum.reverse(giant_merges)
-new_text = "cd cd cd"
-
-new_encoded =
-  Enum.reduce(giant_merges_ordered, :binary.bin_to_list(new_text), fn {{p1, p2}, nid}, ids ->
-    BPE.merge(ids, {p1, p2}, nid)
-  end)
-
-IO.puts("Encoding unseen '#{new_text}': #{length(new_encoded)} tokens (#{byte_size(new_text)} bytes)")
-IO.puts("No compression — the learned merges don't apply to unseen byte patterns.")
+IO.puts("Different corpora produce different merge tables.")
+IO.puts("A tokenizer trained on English wastes tokens on code, and vice versa.")
+IO.puts("This is why some models use separate tokenizers for code vs natural language.")
 ```
 
-### Experiment 3: Missing Merge (Skip a Rule)
-
-Later merges often depend on earlier ones. Skipping a merge in the middle breaks the dependency chain.
-
-```elixir
-ids = :binary.bin_to_list(training_text)
-
-{all_10, _, _} =
-  Enum.reduce(1..10, {[], ids, 256}, fn _, {m, ids, nid} ->
-    counts = count_pairs.(ids)
-
-    if map_size(counts) == 0 do
-      {m, ids, nid}
-    else
-      {best, _} = Enum.max_by(counts, fn {_, c} -> c end)
-      {[{best, nid} | m], BPE.merge(ids, best, nid), nid + 1}
-    end
-  end)
-
-all_10 = Enum.reverse(all_10)
-
-normal =
-  Enum.reduce(all_10, :binary.bin_to_list(training_text), fn {{p1, p2}, nid}, ids ->
-    BPE.merge(ids, {p1, p2}, nid)
-  end)
-
-skipped_merge = Enum.at(all_10, 2)
-broken_merges = List.delete_at(all_10, 2)
-
-broken =
-  Enum.reduce(broken_merges, :binary.bin_to_list(training_text), fn {{p1, p2}, nid}, ids ->
-    BPE.merge(ids, {p1, p2}, nid)
-  end)
-
-IO.puts("Skipped merge #3: #{inspect(skipped_merge)}")
-IO.puts("Normal encoding:  #{length(normal)} tokens")
-IO.puts("Broken encoding:  #{length(broken)} tokens  (+#{length(broken) - length(normal)})")
-IO.puts("\nMerges that depend on the skipped pair can no longer fire,")
-IO.puts("cascading into a longer, suboptimal encoding.")
-```
-
-## Compare with Our Tokenizer
-
-The `ExNanoGPT.V2.Tokenizer` module implements the same BPE algorithm. Let's train it on the same text and verify our implementation matches.
+## Verify: Our BPE Matches the Library
 
 ```elixir
 alias ExNanoGPT.V2.Tokenizer
 
-# 256 base + 20 merges + 9 special = 285
 tok = Tokenizer.train(training_text, vocab_size: 256 + num_merges + 9)
 
 IO.puts("V2 Tokenizer: vocab_size=#{tok.vocab_size}, merges=#{length(tok.merges)}\n")
@@ -582,36 +479,34 @@ IO.puts("\nFirst 5 merges — ours vs library:")
 for i <- 0..min(4, length(merges) - 1) do
   ours = Enum.at(merges, i)
   lib = Enum.at(tok.merges, i)
-  match = if ours == lib, do: "✓", else: "✗"
+  match = if ours == lib, do: "OK", else: "DIFF"
   IO.puts("  #{match} #{inspect(ours)}  vs  #{inspect(lib)}")
 end
 
-IO.puts("\nSame algorithm, same corpus, same merge count → identical results.")
+IO.puts("\nSame algorithm, same corpus, same merge count = identical results.")
 ```
 
-## Math Notation: Running Reference
+## Real-World Connection
 
-New symbols from this notebook:
+BPE is the reason ChatGPT sometimes splits words in unexpected ways. "indivisible" might become `["indiv", "isible"]` — not because it's buggy, but because those were the subword patterns learned from internet text.
 
-| Math | Elixir | What it means |
-|------|--------|---------------|
-| V, \|V\| | `vocab_size` | Vocabulary and its size |
-| (p, q) | `{a, b}` | Adjacent token pair |
-| f(p, q) | `count_pairs.(ids)[{a,b}]` | Pair frequency |
-| M | `merges` | Ordered merge rules |
-| argmax f(p,q) | `Enum.max_by(counts, ...)` | Find most frequent pair |
+It's also why different languages cost different numbers of tokens. English "hello" might be 1 token, but its equivalent in a less-represented language might be 3-5 tokens. This directly affects the cost and speed of using the API — you're billed per token.
 
-**Running reference**: Σ (sum), xᵢ (indexing), W ∈ ℝ (matrix), μ (mean), σ² (variance), ε (epsilon), γ/β (scale/shift), Q/K/V (attention), d_k (head dim), GELU/Φ/erf (activations), x_{l+1} = x_l + F(x_l) (residual), L (loss), ∇ (gradient), α (LR), β₁/β₂ (Adam), T (temperature), V (vocabulary), M (merges)
+The journey from a hobbyist compression algorithm in a 1994 C magazine to the foundation of trillion-dollar AI systems is one of the most remarkable stories in computer science.
+
+## What's Next
+
+We have a model and a tokenizer. But generating text is painfully slow — we're recomputing everything from scratch at every step. Next: **KV caching**, the optimization that was baked into the original Transformer from day one.
 
 ## Key Concepts
 
 | Concept | What it means |
 |---------|--------------|
-| **Byte-Pair Encoding** | Iteratively merge the most frequent adjacent pair to build a vocabulary |
-| **Base vocabulary** | 256 tokens, one per possible byte value (0–255) |
-| **Merge table** | Ordered list of (pair → new_id) rules learned from training |
+| **Byte-Pair Encoding** | Iteratively merge the most frequent adjacent pair. Philip Gage, 1994. |
+| **Subword tokenization** | BPE applied to NLP. Rico Sennrich et al., ACL 2016. |
+| **Merge table** | Ordered list of (pair -> new_id) rules learned from training |
 | **Encoding** | Convert text to bytes, apply merges left-to-right in order |
-| **Decoding** | Map token IDs → byte sequences → concatenate → UTF-8 string |
+| **Decoding** | Map token IDs -> byte sequences -> UTF-8 string |
 | **Special tokens** | Synthetic tokens for conversation structure (BOS, turn delimiters) |
 | **Compression ratio** | bytes / tokens — higher means fewer tokens per character |
-| **Vocab size tradeoff** | Larger vocab = shorter sequences but bigger embedding table |
+| **Corpus dependence** | Merges reflect training data; unseen patterns get poor compression |

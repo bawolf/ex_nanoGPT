@@ -1,4 +1,4 @@
-# 11: RoPE & RMSNorm
+# 11: RoPE & RMSNorm — Taming Explosions, Encoding Position with Rotation
 
 ```elixir
 Mix.install([
@@ -30,16 +30,52 @@ end
 alias VegaLite, as: Vl
 ```
 
-## The v2 Upgrade
+## Something Is Wrong
 
-In notebooks 00–10 we built a GPT-2-style transformer. Now we're upgrading to a **modern** architecture (nanochat / LLaMA-style). Two of the biggest changes happen in normalization and position encoding:
+Let's simulate what happens inside a deep neural network. We'll pass a random vector through 8 layers of random weight matrices — like a transformer without normalization.
 
-| v1 (nanoGPT / GPT-2) | v2 (nanochat / LLaMA) |
-|---|---|
-| **LayerNorm** with learnable γ, β | **RMSNorm** — no learnable params |
-| **Learned position embeddings** | **Rotary Position Embeddings (RoPE)** |
+```elixir
+key = Nx.Random.key(7)
+{x, key} = Nx.Random.normal(key, shape: {1, 64})
 
-These are simpler, faster, and scale better. Let's build them from scratch.
+magnitudes =
+  Enum.reduce(1..8, {x, [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]}, fn _, {x, acc} ->
+    {w, _} = Nx.Random.normal(Nx.Random.key(42), 0.0, 0.5, shape: {64, 64})
+    x = Nx.dot(x, [-1], w, [0])
+    max_val = Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)
+    {x, acc ++ [max_val]}
+  end)
+  |> elem(1)
+
+chart_data =
+  magnitudes
+  |> Enum.with_index()
+  |> Enum.map(fn {val, layer} -> %{"layer" => layer, "max_abs_value" => val} end)
+
+Vl.new(width: 500, height: 300, title: "Max Activation Magnitude by Layer")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line, point: true, stroke_width: 2)
+|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
+|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
+```
+
+The values are exploding. By layer 8, activations can be thousands of times larger than the input. This is the *activation explosion* problem, and it makes training impossible — gradients blow up, loss becomes NaN, the model learns nothing.
+
+**Your mission: figure out a way to keep these values under control.**
+
+Here's a hint: what if, after each layer, we rescaled the vector so its magnitude stays near 1?
+
+## The Edinburgh Simplification (2019)
+
+In 2019, Biao Zhang and Rico Sennrich at the University of Edinburgh were studying LayerNorm — the normalization technique our v1 model uses. LayerNorm does two things: (1) subtract the mean, (2) divide by the standard deviation.
+
+They asked a simple question: **does subtracting the mean actually matter?**
+
+They ran experiments across machine translation, language modeling, and image classification. The answer: no. The re-centering step was dispensable. What mattered was controlling the *magnitude* of activations.
+
+Their solution, published at NeurIPS 2019: **RMSNorm** — Root Mean Square Normalization. Drop the mean subtraction entirely. Just divide by the root-mean-square. It was 7-64% faster across different architectures, with no quality loss.
+
+Today, RMSNorm is the default in LLaMA, Mistral, Gemma, and every modern LLM.
 
 ## Math Notation
 
@@ -47,9 +83,7 @@ New symbols for this notebook:
 
 | Symbol | Meaning | Nx code |
 |--------|---------|---------|
-| `x` | Input vector | a tensor |
 | `x²` | Element-wise square | `Nx.multiply(x, x)` |
-| `σ²` | Variance (but computed as mean of squares) | `Nx.mean(x * x)` |
 | `ε` | Epsilon, tiny safety constant | `1.0e-5` |
 | `RMS(x)` | `√(mean(x²) + ε)` | `Nx.sqrt(Nx.mean(x*x) + 1e-5)` |
 | `θᵢ` | RoPE frequency for channel i | `1 / (base^(2i/d))` |
@@ -57,21 +91,15 @@ New symbols for this notebook:
 
 **Running reference** from notebooks 00–10: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, softmax, ∇, T
 
-## RMSNorm from Scratch
+## Discover RMSNorm
 
-### Why drop the mean?
+### Warm-up: What's the RMS of a vector?
 
-LayerNorm subtracts the mean **and** divides by the standard deviation, then applies learnable scale (γ) and shift (β). RMSNorm simplifies this: it only divides by the root-mean-square, and uses no learnable parameters at all.
-
-The intuition: the mean-subtraction in LayerNorm doesn't contribute much to training stability. What matters is controlling the **magnitude** of the activations. RMSNorm does just that — and it's cheaper to compute.
-
-### Step 1: Compute the RMS
-
-The root-mean-square of a vector x is:
+The root-mean-square is a measure of *magnitude* — how big are the values, on average?
 
 `RMS(x) = √(mean(x²) + ε)`
 
-Note this is **not** the standard deviation — there's no mean subtraction. It's purely a measure of magnitude.
+No mean subtraction. No learnable parameters. Just a single number that tells you how large the activations are.
 
 ```elixir
 x = Nx.tensor([[100.0, 0.5, -30.0, 7.0]])
@@ -81,13 +109,7 @@ IO.inspect(Nx.to_number(Nx.squeeze(variance)), label: "mean(x²)")
 
 rms = Nx.sqrt(Nx.add(variance, 1.0e-5))
 IO.inspect(Nx.to_number(Nx.squeeze(rms)), label: "RMS(x)")
-```
 
-### Step 2: Normalize
-
-Divide by the RMS. The result has unit root-mean-square — the magnitudes are controlled, but the direction is preserved.
-
-```elixir
 normalized = Nx.divide(x, rms)
 IO.inspect(Nx.to_flat_list(normalized) |> Enum.map(&Float.round(&1, 4)), label: "after RMSNorm")
 
@@ -95,19 +117,19 @@ check_rms = Nx.sqrt(Nx.mean(Nx.multiply(normalized, normalized)))
 IO.inspect(Nx.to_number(check_rms) |> Float.round(6), label: "RMS after norm (should be ~1.0)")
 ```
 
-### Comparing with LayerNorm
+After dividing by RMS, the magnitude is controlled near 1.0, but the *direction* (relative proportions) is preserved. That's the whole trick.
 
-LayerNorm subtracts the mean first, so the output is centered at 0. RMSNorm doesn't center — it only scales.
+### What did we throw away?
+
+LayerNorm subtracts the mean first, centering the output at 0. RMSNorm doesn't center — it only scales. Let's see both side by side.
 
 ```elixir
 x = Nx.tensor([[100.0, 0.5, -30.0, 7.0]])
 
-# LayerNorm
 mean = Nx.mean(x, axes: [-1], keep_axes: true)
 var = Nx.variance(x, axes: [-1], keep_axes: true)
 ln_out = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))
 
-# RMSNorm
 rms_var = Nx.mean(Nx.multiply(x, x), axes: [-1], keep_axes: true)
 rms_out = Nx.divide(x, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
 
@@ -115,19 +137,22 @@ IO.inspect(Nx.to_flat_list(ln_out) |> Enum.map(&Float.round(&1, 4)), label: "Lay
 IO.inspect(Nx.to_flat_list(rms_out) |> Enum.map(&Float.round(&1, 4)), label: "RMSNorm")
 IO.puts("\nLayerNorm: mean=#{Float.round(Nx.to_number(Nx.mean(ln_out)), 6)} (centered at 0)")
 IO.puts("RMSNorm:  mean=#{Float.round(Nx.to_number(Nx.mean(rms_out)), 6)} (NOT centered)")
+IO.puts("\nLayerNorm has learnable γ and β parameters. RMSNorm has zero learnable parameters.")
+IO.puts("Simpler, faster, same result. That's the Edinburgh insight.")
 ```
 
 ### Exercise: Implement RMSNorm
 
+Now you build it. Two lines of Nx code.
+
 ```elixir
 rms_norm = fn x ->
   # TODO:
-  # 1. Compute variance as mean(x²) across the last axis (keep_axes: true)
-  # 2. Divide x by sqrt(variance + 1.0e-5)
+  # 1. Compute mean(x²) across the last axis (keep_axes: true)
+  # 2. Divide x by sqrt(mean(x²) + 1.0e-5)
   nil
 end
 
-# Test
 x = Nx.tensor([
   [10.0, 20.0, 30.0, 40.0],
   [1.0, 1.0, 1.0, 1.0],
@@ -168,53 +193,74 @@ yours = rms_norm.(x)
 reference = ExNanoGPT.V2.Model.rms_norm(x)
 
 diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
-IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+IO.puts(if diff < 1.0e-5, do: "MATCH! Max diff: #{diff}", else: "MISMATCH. Max diff: #{diff}")
 ```
 
-### Visualize: Pre-Norm vs Post-Norm Activations
+### The Fix In Action
+
+Remember our exploding activations? Let's add RMSNorm and watch what happens.
 
 ```elixir
-key = Nx.Random.key(42)
-{raw_values, _} = Nx.Random.normal(key, 50.0, 25.0, shape: {500})
+key = Nx.Random.key(7)
+{x, _key} = Nx.Random.normal(key, shape: {1, 64})
 
-rms_var = Nx.mean(Nx.multiply(raw_values, raw_values), keep_axes: true)
-normed_values = Nx.divide(raw_values, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
+{_, _, normed_vals, raw_vals} =
+  Enum.reduce(1..8, {x, x, [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)],
+    [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]}, fn _, {x_n, x_r, acc_n, acc_r} ->
+    {w, _} = Nx.Random.normal(Nx.Random.key(42), 0.0, 0.5, shape: {64, 64})
 
-before_list =
-  Nx.to_flat_list(raw_values)
-  |> Enum.map(&%{"value" => &1, "stage" => "Before RMSNorm"})
+    x_r = Nx.dot(x_r, [-1], w, [0])
+    max_r = Nx.to_number(Nx.reduce_max(Nx.abs(x_r))) |> Float.round(2)
 
-after_list =
-  Nx.to_flat_list(normed_values)
-  |> Enum.map(&%{"value" => &1, "stage" => "After RMSNorm"})
+    rms_var = Nx.mean(Nx.multiply(x_n, x_n), axes: [-1], keep_axes: true)
+    x_n = Nx.divide(x_n, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
+    x_n = Nx.dot(x_n, [-1], w, [0])
+    max_n = Nx.to_number(Nx.reduce_max(Nx.abs(x_n))) |> Float.round(2)
 
-Vl.new(width: 300, height: 250, title: "RMSNorm: Before vs After")
-|> Vl.data_from_values(before_list ++ after_list)
-|> Vl.mark(:bar, opacity: 0.7)
-|> Vl.encode_field(:x, "value", type: :quantitative, bin: %{maxbins: 40}, title: "Value")
-|> Vl.encode_field(:y, "count()", type: :quantitative, title: "Count")
-|> Vl.encode_field(:color, "stage", type: :nominal)
-|> Vl.encode_field(:column, "stage", type: :nominal)
+    {x_n, x_r, acc_n ++ [max_n], acc_r ++ [max_r]}
+  end)
+
+chart_data =
+  Enum.zip([0..8, normed_vals, raw_vals])
+  |> Enum.flat_map(fn {layer, vn, vr} ->
+    [
+      %{"layer" => layer, "max_abs_value" => vn, "variant" => "With RMSNorm"},
+      %{"layer" => layer, "max_abs_value" => vr, "variant" => "Without RMSNorm"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "The Fix: RMSNorm Tames Activation Explosion")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
+|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
+|> Vl.encode_field(:color, "variant", type: :nominal)
 ```
 
-## RoPE from Scratch
+With RMSNorm, activations stay bounded. Without it, they explode. Two lines of code, massive impact.
 
-### Why replace learned positions?
+## The Position Problem
 
-In v1, each position (0, 1, 2, ...) gets a learned embedding vector that's added to the token embedding. This works, but has a hard limit: the model can't handle sequences longer than the maximum position it was trained on.
+Now for the second upgrade. Our v1 model uses *learned position embeddings* — a lookup table where position 0 gets one vector, position 1 gets another, and so on, up to the maximum sequence length.
 
-**Rotary Position Embeddings (RoPE)** encode position by *rotating* the query and key vectors. Two properties make this elegant:
+What's wrong with that? Two things:
 
-1. **Relative**: the dot product between Q at position m and K at position n depends only on (m − n), not on the absolute positions.
-2. **Extrapolation**: the rotation formula generalizes to any position, even ones never seen during training.
+1. **Hard ceiling**: if you trained with a maximum sequence length of 1024, position 1025 doesn't exist. The model crashes.
+2. **Absolute, not relative**: the model learns that position 5 is special, but it doesn't naturally learn that "two tokens apart" is a relationship.
+
+In April 2021, Jianlin Su at Zhuiyi Technology in Shenzhen published a series of blog posts with an elegant idea: **what if positions were rotations?**
+
+A 2D rotation by angle θ has a beautiful property: when you take the dot product of two rotated vectors, the result depends only on the *difference* in angles. Rotate Q by angle 5θ and K by angle 3θ, and their dot product depends on (5-3)θ = 2θ. The absolute positions disappear — only the relative distance matters.
+
+He formalized this as **RoPE** (Rotary Position Embeddings) in the paper "RoFormer" (April 2021). Today, RoPE is used in virtually every modern LLM: LLaMA, Mistral, Gemma, Qwen, and more.
+
+## Build RoPE
 
 ### Step 1: Inverse Frequencies
 
-RoPE assigns a different rotation frequency to each pair of embedding dimensions. Low-index pairs rotate fast (capturing nearby positions), high-index pairs rotate slowly (capturing long-range structure).
+RoPE assigns a different rotation speed to each pair of embedding dimensions. Low-index pairs rotate fast (capturing nearby tokens), high-index pairs rotate slowly (capturing long-range structure).
 
-`θᵢ = 1 / (base^(2i/d))`
-
-where `base = 10000` and `d` is the head dimension.
+`θᵢ = 1 / (base^(2i/d))`   where base = 10000
 
 ```elixir
 head_dim = 16
@@ -226,54 +272,44 @@ exponents = Nx.divide(channel_range, head_dim)
 inv_freq = Nx.exp(Nx.multiply(-:math.log(base), exponents))
 
 IO.inspect(Nx.to_flat_list(inv_freq) |> Enum.map(&Float.round(&1, 6)), label: "inv_freq")
-IO.puts("Channel 0 (fast): #{Float.round(Nx.to_number(inv_freq[0]), 6)}")
-IO.puts("Channel #{half - 1} (slow): #{Float.round(Nx.to_number(inv_freq[half - 1]), 6)}")
+IO.puts("Channel 0 (fastest): #{Float.round(Nx.to_number(inv_freq[0]), 6)}")
+IO.puts("Channel #{half - 1} (slowest):  #{Float.round(Nx.to_number(inv_freq[half - 1]), 6)}")
+IO.puts("\nFast channels change rapidly between nearby positions — local patterns.")
+IO.puts("Slow channels barely change — they encode long-range structure.")
 ```
 
 ### Step 2: Frequency Matrix
 
-For each position, multiply position index by each inverse frequency to get the rotation angles. This gives us a {seq_len, half} matrix of angles.
+For each position, multiply the position index by each inverse frequency to get rotation angles.
 
 ```elixir
 seq_len = 32
 positions = Nx.iota({seq_len}, type: :f32)
 freqs = Nx.multiply(Nx.new_axis(positions, 1), Nx.new_axis(inv_freq, 0))
 
-IO.inspect(Nx.shape(freqs), label: "freqs shape (seq_len × half)")
-IO.puts("Position 0, all channels: #{inspect(Nx.to_flat_list(freqs[0]) |> Enum.map(&Float.round(&1, 3)))}")
-IO.puts("Position 5, all channels: #{inspect(Nx.to_flat_list(freqs[5]) |> Enum.map(&Float.round(&1, 3)))}")
+IO.inspect(Nx.shape(freqs), label: "freqs shape (seq_len x half)")
+IO.puts("Position 0: all angles are 0 (no rotation)")
+IO.puts("Position 5: #{inspect(Nx.to_flat_list(freqs[5]) |> Enum.map(&Float.round(&1, 3)))}")
 ```
 
-### Visualize: Cos/Sin Frequency Heatmap
+### Visualize: The Frequency Spectrum
 
-Each row is a position, each column is a channel pair. Fast channels (left) oscillate rapidly; slow channels (right) change gradually.
+Each row is a position, each column is a channel pair. Watch how fast channels (left) oscillate rapidly while slow channels (right) barely change.
 
 ```elixir
 cos_vals = Nx.cos(freqs)
-sin_vals = Nx.sin(freqs)
 
 cos_data =
   for pos <- 0..(seq_len - 1), ch <- 0..(half - 1) do
     %{
       "position" => pos,
       "channel" => ch,
-      "value" => Nx.to_number(cos_vals[pos][ch]) |> Float.round(4),
-      "function" => "cos"
+      "value" => Nx.to_number(cos_vals[pos][ch]) |> Float.round(4)
     }
   end
 
-sin_data =
-  for pos <- 0..(seq_len - 1), ch <- 0..(half - 1) do
-    %{
-      "position" => pos,
-      "channel" => ch,
-      "value" => Nx.to_number(sin_vals[pos][ch]) |> Float.round(4),
-      "function" => "sin"
-    }
-  end
-
-Vl.new(width: 250, height: 200, title: "RoPE Frequency Patterns")
-|> Vl.data_from_values(cos_data ++ sin_data)
+Vl.new(width: 300, height: 250, title: "RoPE Cosine Values: Fast Channels (left) vs Slow (right)")
+|> Vl.data_from_values(cos_data)
 |> Vl.mark(:rect)
 |> Vl.encode_field(:x, "channel", type: :ordinal, title: "Channel pair")
 |> Vl.encode_field(:y, "position", type: :ordinal, title: "Position", sort: "descending")
@@ -281,26 +317,24 @@ Vl.new(width: 250, height: 200, title: "RoPE Frequency Patterns")
   type: :quantitative,
   scale: %{scheme: "blueorange", domain: [-1, 1]}
 )
-|> Vl.encode_field(:column, "function", type: :nominal)
 ```
 
 ### Step 3: The Rotation
 
-RoPE splits each head vector into pairs of dimensions (x₁, x₂) and rotates each pair by angle θ:
+RoPE splits each head vector into first-half and second-half dimensions, then applies a 2D rotation to each pair:
 
 ```
-y₁ = x₁ · cos(θ) + x₂ · sin(θ)
-y₂ = -x₁ · sin(θ) + x₂ · cos(θ)
+y₁ = x₁ · cos(θ) - x₂ · sin(θ)
+y₂ = x₁ · sin(θ) + x₂ · cos(θ)
 ```
 
-This is a 2D rotation matrix applied to consecutive pairs. The clever part: instead of splitting into consecutive pairs (dim 0-1, 2-3, ...), we split into first-half/second-half (dims 0..d/2-1 and d/2..d-1).
+Wait — that's just matrix multiplication by a rotation matrix! Each embedding pair gets rotated by an angle that depends on position and channel.
 
-### Visualize: 2D Rotation of Embedding Pairs
+### Visualize: Watch a Point Rotate
 
-Let's watch a single embedding pair get rotated to different positions.
+Here's a single embedding pair `[1.0, 0.0]` being rotated to different positions. Each point on the circle is one position.
 
 ```elixir
-# A single embedding pair [1.0, 0.0] at different positions
 x1 = 1.0
 x2 = 0.0
 theta_base = Nx.to_number(inv_freq[0])
@@ -308,18 +342,50 @@ theta_base = Nx.to_number(inv_freq[0])
 rotation_data =
   for pos <- 0..15 do
     theta = pos * theta_base
-    y1 = x1 * :math.cos(theta) + x2 * :math.sin(theta)
-    y2 = -x1 * :math.sin(theta) + x2 * :math.cos(theta)
+    y1 = x1 * :math.cos(theta) - x2 * :math.sin(theta)
+    y2 = x1 * :math.sin(theta) + x2 * :math.cos(theta)
     %{"x" => Float.round(y1, 4), "y" => Float.round(y2, 4), "position" => pos}
   end
 
-Vl.new(width: 350, height: 350, title: "RoPE Rotation: Embedding Pair [1,0] at Different Positions")
+Vl.new(width: 350, height: 350, title: "RoPE: Embedding Pair [1,0] Rotated to Each Position")
 |> Vl.data_from_values(rotation_data)
 |> Vl.mark(:point, size: 100, filled: true)
 |> Vl.encode_field(:x, "x", type: :quantitative, scale: %{domain: [-1.2, 1.2]})
 |> Vl.encode_field(:y, "y", type: :quantitative, scale: %{domain: [-1.2, 1.2]})
 |> Vl.encode_field(:color, "position", type: :quantitative, scale: %{scheme: "viridis"})
 |> Vl.encode_field(:tooltip, "position", type: :quantitative)
+```
+
+Each position is a different angle on the unit circle. The model can distinguish positions by the rotation, and the *difference* between two rotations gives relative position.
+
+### Interactive: RoPE Rotation Slider
+
+Use the slider to pick a position and see where the embedding pair lands.
+
+```elixir
+pos_slider = Kino.Input.range("Position", min: 0, max: 31, step: 1, default: 0)
+```
+
+```elixir
+pos = Kino.Input.read(pos_slider)
+theta_base = Nx.to_number(inv_freq[0])
+
+all_points =
+  for p <- 0..31 do
+    theta = p * theta_base
+    y1 = :math.cos(theta)
+    y2 = :math.sin(theta)
+    %{"x" => Float.round(y1, 4), "y" => Float.round(y2, 4), "position" => p,
+      "selected" => if(p == pos, do: "selected", else: "other")}
+  end
+
+Vl.new(width: 350, height: 350, title: "Position #{pos}: angle = #{Float.round(pos * theta_base, 3)} radians")
+|> Vl.data_from_values(all_points)
+|> Vl.mark(:point, filled: true)
+|> Vl.encode_field(:x, "x", type: :quantitative, scale: %{domain: [-1.2, 1.2]})
+|> Vl.encode_field(:y, "y", type: :quantitative, scale: %{domain: [-1.2, 1.2]})
+|> Vl.encode_field(:size, "selected", type: :nominal, scale: %{domain: ["other", "selected"], range: [30, 200]}, legend: nil)
+|> Vl.encode_field(:color, "selected", type: :nominal, scale: %{domain: ["other", "selected"], range: ["#d1d5db", "#ef4444"]}, legend: nil)
 ```
 
 ### Exercise: Implement apply_rope
@@ -332,13 +398,15 @@ apply_rope = fn x, cos, sin ->
   #
   # TODO:
   # 1. Split x into first half and second half along the last axis
-  # 2. y1 = x1 * cos + x2 * sin
-  # 3. y2 = -x1 * sin + x2 * cos   (note the negation on x1!)
+  # 2. y1 = x1 * cos - x2 * sin      (note: SUBTRACT for standard rotation)
+  # 3. y2 = x1 * sin + x2 * cos
   # 4. Concatenate y1 and y2 along the last axis
+  #
+  # Hint: Nx.slice_along_axis(x, start, length, axis: 3) to split
+  #       Nx.concatenate([y1, y2], axis: 3) to rejoin
   nil
 end
 
-# Test with a small example
 head_dim = 8
 seq_len = 4
 {cos, sin} = ExNanoGPT.V2.Model.precompute_rope(seq_len, head_dim)
@@ -378,12 +446,12 @@ yours = apply_rope.(x, cos, sin)
 reference = ExNanoGPT.V2.Model.apply_rope(x, cos, sin)
 
 diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
-IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
+IO.puts(if diff < 1.0e-5, do: "MATCH! Max diff: #{diff}", else: "MISMATCH. Max diff: #{diff}")
 ```
 
-### RoPE Gives Relative Position Sensitivity
+## The Magic Property: Relative Position
 
-The key property: `dot(RoPE(q, pos_m), RoPE(k, pos_n))` depends only on `m - n`. Let's verify.
+Here's why rotation is elegant. Take two vectors, rotate them to different positions, then dot-product them. The result depends only on the *difference* in positions — not the absolute positions.
 
 ```elixir
 head_dim = 16
@@ -392,6 +460,8 @@ head_dim = 16
 key = Nx.Random.key(99)
 {q_raw, key} = Nx.Random.normal(key, shape: {1, 1, 1, head_dim})
 {k_raw, _} = Nx.Random.normal(key, shape: {1, 1, 1, head_dim})
+
+IO.puts("All three pairs have the same position difference (2):\n")
 
 for {m, n} <- [{5, 3}, {10, 8}, {20, 18}] do
   q_cos = Nx.slice_along_axis(cos, m, 1, axis: 1)
@@ -403,87 +473,41 @@ for {m, n} <- [{5, 3}, {10, 8}, {20, 18}] do
   k_rot = apply_rope.(k_raw, k_cos, k_sin)
 
   dot = Nx.to_number(Nx.sum(Nx.multiply(q_rot, k_rot))) |> Float.round(4)
-  IO.puts("positions (#{m}, #{n}), diff=#{m - n}: dot=#{dot}")
+  IO.puts("  positions (#{m}, #{n}), diff=#{m - n}: dot=#{dot}")
 end
 
-IO.puts("\nAll three have the same position difference (2), so the dot products are identical.")
+IO.puts("\nSame difference, same dot product. The absolute positions don't matter.")
+IO.puts("This is why RoPE naturally captures relative position information.")
 ```
 
 ## Break It
 
-### Remove normalization entirely
+### What happens with eps=0?
 
-Without normalization, values explode as they pass through layers.
-
-```elixir
-key = Nx.Random.key(7)
-{x, key} = Nx.Random.normal(key, shape: {1, 64})
-
-results_normed = [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]
-results_raw = [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]
-
-{_, _, normed_vals, raw_vals} =
-  Enum.reduce(1..8, {x, x, results_normed, results_raw}, fn _, {x_n, x_r, acc_n, acc_r} ->
-    {w, _} = Nx.Random.normal(Nx.Random.key(42), 0.0, 0.5, shape: {64, 64})
-
-    x_r = Nx.dot(x_r, [-1], w, [0])
-    max_r = Nx.to_number(Nx.reduce_max(Nx.abs(x_r))) |> Float.round(2)
-
-    rms_var = Nx.mean(Nx.multiply(x_n, x_n), axes: [-1], keep_axes: true)
-    x_n = Nx.divide(x_n, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
-    x_n = Nx.dot(x_n, [-1], w, [0])
-    max_n = Nx.to_number(Nx.reduce_max(Nx.abs(x_n))) |> Float.round(2)
-
-    {x_n, x_r, acc_n ++ [max_n], acc_r ++ [max_r]}
-  end)
-
-chart_data =
-  Enum.zip([0..8, normed_vals, raw_vals])
-  |> Enum.flat_map(fn {layer, vn, vr} ->
-    [
-      %{"layer" => layer, "max_abs_value" => vn, "variant" => "With RMSNorm"},
-      %{"layer" => layer, "max_abs_value" => vr, "variant" => "Without RMSNorm"}
-    ]
-  end)
-
-Vl.new(width: 500, height: 300, title: "Value Explosion Without Normalization")
-|> Vl.data_from_values(chart_data)
-|> Vl.mark(:line, point: true)
-|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
-|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
-|> Vl.encode_field(:color, "variant", type: :nominal)
-```
-
-### Use eps=0 (division by zero)
-
-With a constant input, mean(x²) is constant and sqrt(constant) is fine — but what if the input is exactly zero? Without epsilon, we divide by zero.
+Without the tiny epsilon constant, normalization by a zero vector produces NaN.
 
 ```elixir
 zero_input = Nx.tensor([[0.0, 0.0, 0.0, 0.0]])
 
-# With epsilon
 rms_var = Nx.mean(Nx.multiply(zero_input, zero_input), axes: [-1], keep_axes: true)
 safe = Nx.divide(zero_input, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
 IO.inspect(Nx.to_flat_list(safe), label: "eps=1e-5 (safe)")
 
-# Without epsilon
 unsafe = Nx.divide(zero_input, Nx.sqrt(rms_var))
 IO.inspect(Nx.to_flat_list(unsafe), label: "eps=0 (NaN!)")
 ```
 
-### Wrong RoPE base (broken position sensitivity)
+### Challenge: What happens with a tiny RoPE base?
 
-The base controls how quickly different channels rotate. If we use a tiny base, all channels rotate too fast and positions become indistinguishable.
+The base (10000 by default) controls how quickly channels rotate. What if we use a much smaller base? The channels rotate too fast, and positions become indistinguishable.
 
 ```elixir
 head_dim = 16
 seq_len = 32
+half = div(head_dim, 2)
 
-# Normal base: 10000
 {cos_normal, sin_normal} = ExNanoGPT.V2.Model.precompute_rope(seq_len, head_dim)
 
-# Broken base: 2 (way too small — everything rotates too fast)
-half = div(head_dim, 2)
 channel_range = Nx.multiply(Nx.iota({half}, type: :f32), 2)
 exponents = Nx.divide(channel_range, head_dim)
 bad_inv_freq = Nx.exp(Nx.multiply(-:math.log(2), exponents))
@@ -497,6 +521,7 @@ key = Nx.Random.key(42)
 {k_raw, _} = Nx.Random.normal(key, shape: {1, 1, 1, head_dim})
 
 IO.puts("Dot products with NORMAL base (10000):")
+
 for {m, n} <- [{0, 0}, {1, 0}, {5, 0}, {15, 0}] do
   q_c = Nx.slice_along_axis(cos_normal, m, 1, axis: 1)
   q_s = Nx.slice_along_axis(sin_normal, m, 1, axis: 1)
@@ -509,6 +534,7 @@ for {m, n} <- [{0, 0}, {1, 0}, {5, 0}, {15, 0}] do
 end
 
 IO.puts("\nDot products with BROKEN base (2):")
+
 for {m, n} <- [{0, 0}, {1, 0}, {5, 0}, {15, 0}] do
   q_c = Nx.slice_along_axis(cos_bad, m, 1, axis: 1)
   q_s = Nx.slice_along_axis(sin_bad, m, 1, axis: 1)
@@ -520,36 +546,28 @@ for {m, n} <- [{0, 0}, {1, 0}, {5, 0}, {15, 0}] do
   IO.puts("  (#{m},#{n}) diff=#{m - n}: #{dot}")
 end
 
-IO.puts("\nWith base=2, the dot products oscillate chaotically — the model can't distinguish positions.")
+IO.puts("\nWith base=2, the dot products oscillate chaotically.")
+IO.puts("The model can't distinguish nearby positions from distant ones.")
+IO.puts("\nThis is why recent work on extending context length (YaRN, NTK-aware scaling)")
+IO.puts("focuses on manipulating the RoPE base to support longer sequences.")
 ```
 
-## v1 vs v2 Comparison
+## Real-World Connection
 
-| Feature | v1 (LayerNorm) | v2 (RMSNorm) |
-|---------|---------------|--------------|
-| Centers at 0? | Yes (subtracts mean) | No |
-| Learnable params? | Yes (γ, β) | No |
-| Parameters per norm | 2 × n_embd | 0 |
-| Formula | `(x - μ) / σ · γ + β` | `x / √(mean(x²) + ε)` |
+RoPE is why modern LLMs can handle conversations that are tens of thousands of tokens long. Learned position embeddings have a hard ceiling — you can't go past what you trained on. RoPE's rotations have no upper limit. Position 100,000 is just a larger rotation angle.
 
-| Feature | v1 (Learned Positions) | v2 (RoPE) |
-|---------|----------------------|-----------|
-| Type | Absolute | Relative (via rotation) |
-| Storage | {block_size, n_embd} tensor | No learned params |
-| Max sequence length | Fixed at training | Can extrapolate |
-| Applied to | Added to embeddings | Rotates Q and K only |
-| Position info | In residual stream | Only in attention scores |
+This property enabled the "context length race" of 2023-2024: Claude went to 200k tokens, Gemini to 1M tokens, and GPT-4 Turbo to 128k — all using RoPE or RoPE variants.
 
 ## What's Next
 
-We've built the normalization and position encoding for the modern transformer. Next up: **modern attention** — grouped-query attention (GQA), QK normalization, and sliding window attention.
+We've built the normalization and position encoding for the modern transformer. Next up: **modern attention** — how Noam Shazeer (co-author of the original Transformer paper) cut the memory cost of attention by 8x, and why it matters for running LLMs on your laptop.
 
 ## Key Concepts
 
 | Concept | What it means |
 |---------|--------------|
-| **RMSNorm** | Normalize by root-mean-square — no mean subtraction, no learnable params |
-| **RoPE** | Rotary Position Embeddings — encode position by rotating Q and K |
+| **RMSNorm** | Normalize by root-mean-square — no mean subtraction, no learnable params. Zhang & Sennrich, NeurIPS 2019. |
+| **RoPE** | Rotary Position Embeddings — encode position by rotating Q and K. Jianlin Su, April 2021. |
 | **Inverse frequency** | `θᵢ = 1/(base^(2i/d))` — low channels rotate fast, high channels rotate slow |
 | **Relative positions** | RoPE makes dot(Q, K) depend only on position *difference*, not absolute positions |
 | **Base** | Controls the frequency spectrum — 10000 is standard, too small = positions blur together |

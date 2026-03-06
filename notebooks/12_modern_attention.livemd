@@ -1,4 +1,4 @@
-# 12: Modern Attention — GQA, QK Norm, Sliding Window
+# 12: Modern Attention — How Shazeer's Memory Trick Enables LLMs on Your Laptop
 
 ```elixir
 Mix.install([
@@ -30,20 +30,40 @@ end
 alias VegaLite, as: Vl
 ```
 
-## The Attention Upgrade
+## A Memory Budget Problem
 
-In notebook 03 we built standard multi-head attention (MHA). The v2 model upgrades this with three techniques used in LLaMA, Gemma, and other modern architectures:
+Imagine you're deploying a language model. It has 24 layers, 16 attention heads, embedding dimension 1536, and you want to support 2048-token conversations. During inference, you cache every token's K and V projections (we'll learn why in notebook 15).
 
-| v1 (Standard MHA) | v2 (Modern Attention) |
-|---|---|
-| Single combined Q/K/V projection | Separate Q, K, V projections |
-| n_head Q heads, n_head K heads, n_head V heads | n_head Q heads, **n_kv_head** K/V heads (fewer!) |
-| No normalization on Q/K | **QK normalization** (RMSNorm) |
-| Full causal mask | **Sliding window** attention on some layers |
+How much memory does that take?
+
+```elixir
+n_layers = 24
+n_heads = 16
+head_dim = 96
+seq_len = 2048
+bytes_per_float = 2
+
+kv_bytes = n_layers * 2 * n_heads * seq_len * head_dim * bytes_per_float
+kv_mb = Float.round(kv_bytes / (1024 * 1024), 1)
+kv_gb = Float.round(kv_bytes / (1024 * 1024 * 1024), 2)
+
+IO.puts("KV cache per user session:")
+IO.puts("  #{n_layers} layers x 2 (K+V) x #{n_heads} heads x #{seq_len} tokens x #{head_dim} dims x #{bytes_per_float} bytes")
+IO.puts("  = #{kv_mb} MB (#{kv_gb} GB)")
+IO.puts("")
+IO.puts("Serve 10 users simultaneously: #{Float.round(kv_gb * 10, 1)} GB just for KV caches.")
+IO.puts("That's more than many GPUs have!")
+```
+
+In 2019, **Noam Shazeer** — one of the eight authors of the original "Attention Is All You Need" paper (2017) — had a radical idea. He noticed the bottleneck during inference wasn't compute. It was memory bandwidth: loading K and V from memory for every head at every step.
+
+His solution: **what if all query heads shared a single set of K and V?** Instead of 16 separate K/V projections, just use one. He called it Multi-Query Attention (MQA).
+
+It worked — inference speed doubled. But quality dropped noticeably.
+
+Four years later, in 2023, Joshua Ainslie at Google Research found the sweet spot: instead of 1 K/V head or 16 K/V heads, use something in between. **Grouped-Query Attention (GQA)** was published at EMNLP 2023, and it's now the default in LLaMA 3, Mistral, and Gemma 2.
 
 ## Math Notation
-
-New symbols for this notebook:
 
 | Symbol | Meaning | Nx code |
 |--------|---------|---------|
@@ -53,39 +73,62 @@ New symbols for this notebook:
 | `W_Q` | Q projection, shape `{d, n_h × d_h}` | `c_q` |
 | `W_K` | K projection, shape `{d, n_kv × d_h}` | `c_k` |
 | `W_V` | V projection, shape `{d, n_kv × d_h}` | `c_v` |
-| `QK_norm` | RMSNorm applied to Q and K before attention | `rms_norm(q)`, `rms_norm(k)` |
+| `QK_norm` | RMSNorm applied to Q and K | `rms_norm(q)`, `rms_norm(k)` |
 | `w` | Sliding window size | `window_size` |
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, Q/K/V, d_k, softmax, RMS(x), θᵢ, R(θ)
+## Interactive: Memory Budget Calculator
 
-## Grouped-Query Attention (GQA)
+Use the sliders to see how GQA trades off memory against head diversity.
 
-### The Problem with Standard MHA
+```elixir
+n_kv_slider = Kino.Input.range("KV heads", min: 1, max: 16, step: 1, default: 16)
+```
 
-In standard multi-head attention, every head has its own Q, K, and V projections. During autoregressive generation, we cache K and V for each previous token (the "KV cache"). With many heads, this cache gets enormous.
+```elixir
+n_kv = Kino.Input.read(n_kv_slider)
+n_q_heads = 16
 
-**GQA** reduces memory by using **fewer K/V heads** than Q heads. Multiple Q heads share the same K/V head. This saves memory and compute with minimal quality loss.
+kv_bytes_gqa = n_layers * 2 * n_kv * seq_len * head_dim * bytes_per_float
+kv_mb_gqa = Float.round(kv_bytes_gqa / (1024 * 1024), 1)
+savings = Float.round((1 - kv_bytes_gqa / kv_bytes) * 100, 1)
+label = cond do
+  n_kv == n_q_heads -> "MHA (standard, no sharing)"
+  n_kv == 1 -> "MQA (Shazeer 2019, maximum sharing)"
+  true -> "GQA (Ainslie 2023, balanced)"
+end
+
+IO.puts("#{label}")
+IO.puts("  Q heads: #{n_q_heads}, KV heads: #{n_kv}")
+IO.puts("  Each Q group of #{div(n_q_heads, n_kv)} heads shares 1 K/V head")
+IO.puts("  KV cache: #{kv_mb_gqa} MB per user (#{savings}% savings)")
+```
+
+## Grouped-Query Attention from Scratch
+
+### The Key Insight
+
+In standard MHA, every head has its own Q, K, and V. In GQA, we keep all Q heads but reduce K/V heads. Multiple Q heads *share* the same K/V:
 
 ```
 Standard MHA (n_head=6, n_kv_head=6):
-  Q heads: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
-  K heads: [K0] [K1] [K2] [K3] [K4] [K5]
-  V heads: [V0] [V1] [V2] [V3] [V4] [V5]
+  Q: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
+  K: [K0] [K1] [K2] [K3] [K4] [K5]
+  V: [V0] [V1] [V2] [V3] [V4] [V5]
 
 GQA (n_head=6, n_kv_head=2):
-  Q heads: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
-  K heads: [K0      ] [K1      ] [K2      ]  ← only 2 K heads, repeated
-  V heads: [V0      ] [V1      ] [V2      ]  ← only 2 V heads, repeated
+  Q: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
+  K: [K0      ] [K1      ] [K2      ]  <- 2 KV heads, each shared by 3 Q heads
+  V: [V0      ] [V1      ] [V2      ]
 
-MQA (n_head=6, n_kv_head=1):
-  Q heads: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
-  K heads: [K0                            ]  ← single K head shared by all
-  V heads: [V0                            ]  ← single V head shared by all
+MQA (n_head=6, n_kv_head=1) — Shazeer's original:
+  Q: [Q0] [Q1] [Q2] [Q3] [Q4] [Q5]
+  K: [K0                            ]  <- 1 KV head shared by all
+  V: [V0                            ]
 ```
 
-### Step 1: Separate Q, K, V Projections
+### Step 1: Separate Projections
 
-In v1, we had a single combined projection `c_attn` of shape `{n_embd, 3*n_embd}` that produces Q, K, V at once. In v2, we have three separate projections — and K/V have fewer output dimensions:
+In v1, we had one big `c_attn` projection. In v2, Q/K/V are separate — and K/V are *smaller*.
 
 ```elixir
 n_embd = 64
@@ -94,15 +137,15 @@ n_kv_head = 2
 head_dim = div(n_embd, n_head)
 
 IO.puts("head_dim: #{head_dim}")
-IO.puts("Q projection: {#{n_embd}, #{n_head * head_dim}} → #{n_head} heads")
-IO.puts("K projection: {#{n_embd}, #{n_kv_head * head_dim}} → #{n_kv_head} heads")
-IO.puts("V projection: {#{n_embd}, #{n_kv_head * head_dim}} → #{n_kv_head} heads")
-IO.puts("")
-IO.puts("v1 combined c_attn: {#{n_embd}, #{3 * n_embd}} = #{n_embd * 3 * n_embd} params")
+IO.puts("Q projection: {#{n_embd}, #{n_head * head_dim}} -> #{n_head} heads")
+IO.puts("K projection: {#{n_embd}, #{n_kv_head * head_dim}} -> #{n_kv_head} heads")
+IO.puts("V projection: {#{n_embd}, #{n_kv_head * head_dim}} -> #{n_kv_head} heads")
 
 kv_dim = n_kv_head * head_dim
 v2_params = n_embd * n_head * head_dim + 2 * n_embd * kv_dim
-IO.puts("v2 separate Q+K+V: #{v2_params} params (#{Float.round(v2_params / (n_embd * 3 * n_embd) * 100, 1)}% of v1)")
+v1_params = n_embd * 3 * n_embd
+IO.puts("\nv1 combined c_attn: #{v1_params} params")
+IO.puts("v2 separate Q+K+V: #{v2_params} params (#{Float.round(v2_params / v1_params * 100, 1)}% of v1)")
 ```
 
 ### Step 2: Project and Reshape
@@ -114,7 +157,6 @@ seq_len = 8
 key = Nx.Random.key(42)
 {x, key} = Nx.Random.normal(key, shape: {batch, seq_len, n_embd})
 
-# Separate projection weights
 s = :math.sqrt(3) * :math.pow(n_embd, -0.5)
 {c_q, key} = Nx.Random.uniform(key, -s, s, shape: {n_embd, n_head * head_dim})
 {c_k, key} = Nx.Random.uniform(key, -s, s, shape: {n_embd, n_kv_head * head_dim})
@@ -127,38 +169,29 @@ v = Nx.dot(x, [-1], c_v, [0]) |> Nx.reshape({batch, seq_len, n_kv_head, head_dim
 IO.inspect(Nx.shape(q), label: "Q shape {B, T, n_head, head_dim}")
 IO.inspect(Nx.shape(k), label: "K shape {B, T, n_kv_head, head_dim}")
 IO.inspect(Nx.shape(v), label: "V shape {B, T, n_kv_head, head_dim}")
+IO.puts("\nQ has #{n_head} heads, K/V have only #{n_kv_head}. We need to broadcast K/V to match.")
 ```
 
 ### Step 3: Expand K/V Heads
 
-To compute attention, Q and K must have the same number of heads. We repeat each K/V head `r = n_head / n_kv_head` times:
+To compute attention, Q and K must have the same number of heads. We repeat each K/V head `r = n_head / n_kv_head` times. This is a no-cost broadcast — no new computation, just viewing the same data multiple times.
 
 ```elixir
 repeat = div(n_head, n_kv_head)
-IO.puts("Each K/V head is shared by #{repeat} Q heads")
+IO.puts("Each K/V head is shared by #{repeat} Q heads\n")
 
-# Expand by: reshape to add a repeat dim, broadcast, then flatten back
 k_expanded =
   k
   |> Nx.reshape({batch, seq_len, n_kv_head, 1, head_dim})
   |> Nx.broadcast({batch, seq_len, n_kv_head, repeat, head_dim})
   |> Nx.reshape({batch, seq_len, n_head, head_dim})
 
-v_expanded =
-  v
-  |> Nx.reshape({batch, seq_len, n_kv_head, 1, head_dim})
-  |> Nx.broadcast({batch, seq_len, n_kv_head, repeat, head_dim})
-  |> Nx.reshape({batch, seq_len, n_head, head_dim})
-
-IO.inspect(Nx.shape(k_expanded), label: "K expanded (now matches Q heads)")
-
-# Verify: K head 0 is repeated for Q heads 0 and 1
 k_h0 = Nx.to_flat_list(k[0][0][0]) |> Enum.map(&Float.round(&1, 4))
 k_exp_h0 = Nx.to_flat_list(k_expanded[0][0][0]) |> Enum.map(&Float.round(&1, 4))
 k_exp_h1 = Nx.to_flat_list(k_expanded[0][0][1]) |> Enum.map(&Float.round(&1, 4))
-IO.puts("\nOriginal K[head=0]: #{inspect(k_h0)}")
-IO.puts("Expanded K[head=0]: #{inspect(k_exp_h0)}")
-IO.puts("Expanded K[head=1]: #{inspect(k_exp_h1)} ← same! (shared K/V head)")
+IO.puts("Original K[kv_head=0]:  #{inspect(k_h0)}")
+IO.puts("Expanded K[q_head=0]:   #{inspect(k_exp_h0)}")
+IO.puts("Expanded K[q_head=1]:   #{inspect(k_exp_h1)} <- same! (shared KV head)")
 ```
 
 ### Exercise: Implement GQA Head Expansion
@@ -166,17 +199,15 @@ IO.puts("Expanded K[head=1]: #{inspect(k_exp_h1)} ← same! (shared K/V head)")
 ```elixir
 expand_kv_heads = fn k, v, n_head, n_kv_head ->
   # k shape: {batch, seq_len, n_kv_head, head_dim}
-  # v shape: {batch, seq_len, n_kv_head, head_dim}
   # Return: {k_expanded, v_expanded} each with shape {batch, seq_len, n_head, head_dim}
   #
   # TODO:
   # 1. Compute repeat = div(n_head, n_kv_head)
   # 2. If repeat == 1, return {k, v} unchanged
-  # 3. Otherwise: reshape → broadcast → reshape for both k and v
+  # 3. Otherwise: reshape to add repeat dim, broadcast, reshape back
   {nil, nil}
 end
 
-# Test
 {k_exp, v_exp} = expand_kv_heads.(k, v, n_head, n_kv_head)
 IO.inspect(Nx.shape(k_exp), label: "K expanded shape (should be {1, 8, 4, 16})")
 IO.inspect(Nx.shape(v_exp), label: "V expanded shape (should be {1, 8, 4, 16})")
@@ -213,123 +244,76 @@ end
 
 </details>
 
-### Visualize: GQA Attention Weight Pattern
+## QK Normalization: When Softmax Breaks
 
-Let's compute attention weights and see how Q heads that share a K/V head produce correlated patterns.
+Now let's discover QK normalization by watching things go wrong *without* it.
 
-```elixir
-# Compute attention scores with GQA
-{k_exp, v_exp} = expand_kv_heads.(k, v, n_head, n_kv_head)
-
-# Transpose to {B, H, T, D}
-q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
-k_t = Nx.transpose(k_exp, axes: [0, 2, 1, 3])
-
-scale = 1.0 / :math.sqrt(head_dim)
-scores = Nx.multiply(Nx.dot(q_t, [3], [0, 1], k_t, [3], [0, 1]), scale)
-
-# Apply causal mask
-rows = Nx.iota({seq_len, seq_len}, axis: 0)
-cols = Nx.iota({seq_len, seq_len}, axis: 1)
-causal = Nx.greater_equal(rows, cols)
-mask = Nx.broadcast(Nx.reshape(causal, {1, 1, seq_len, seq_len}), Nx.shape(scores))
-neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(scores))
-masked = Nx.select(mask, scores, neg_inf)
-
-# Softmax
-max_val = Nx.reduce_max(masked, axes: [-1], keep_axes: true)
-exps = Nx.exp(Nx.subtract(masked, max_val))
-attn_weights = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
-
-# Build heatmap data for all heads
-attn_data =
-  for h <- 0..(n_head - 1),
-      qi <- 0..(seq_len - 1),
-      ki <- 0..(seq_len - 1) do
-    kv_group = div(h, div(n_head, n_kv_head))
-    %{
-      "query_pos" => qi,
-      "key_pos" => ki,
-      "weight" => Nx.to_number(attn_weights[0][h][qi][ki]) |> Float.round(4),
-      "head" => "Q_head=#{h} (KV_group=#{kv_group})"
-    }
-  end
-
-Vl.new(width: 120, height: 120, title: "GQA Attention Weights (n_head=4, n_kv_head=2)")
-|> Vl.data_from_values(attn_data)
-|> Vl.mark(:rect)
-|> Vl.encode_field(:x, "key_pos", type: :ordinal, title: "Key")
-|> Vl.encode_field(:y, "query_pos", type: :ordinal, title: "Query", sort: "descending")
-|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"})
-|> Vl.encode_field(:facet, "head", type: :nominal, columns: 4)
-```
-
-## QK Normalization
-
-### Why normalize Q and K?
-
-Without normalization, the dot product `Q · K^T` can produce very large values, especially early in training when weights are random. Large attention scores lead to sharp softmax outputs (nearly one-hot), which means gradients flow through only one position. This makes training unstable.
-
-**QK normalization** applies RMSNorm to Q and K before computing attention scores. This keeps the dot products in a stable range regardless of the parameter magnitudes.
-
-### The Effect on Score Distributions
+Imagine early in training: weights are random and potentially large. The dot product Q·K can produce extreme scores. What happens to softmax with extreme inputs?
 
 ```elixir
 key = Nx.Random.key(123)
-n_embd = 64
-n_head = 4
-head_dim = div(n_embd, n_head)
-seq_len = 16
 
 {x, _} = Nx.Random.normal(key, 0.0, 5.0, shape: {1, seq_len, n_embd})
+{c_q_big, key} = Nx.Random.normal(Nx.Random.key(1), 0.0, 2.0, shape: {n_embd, n_head * head_dim})
+{c_k_big, _} = Nx.Random.normal(Nx.Random.key(2), 0.0, 2.0, shape: {n_embd, n_head * head_dim})
 
-{c_q, key} = Nx.Random.normal(Nx.Random.key(1), 0.0, 2.0, shape: {n_embd, n_head * head_dim})
-{c_k, _} = Nx.Random.normal(Nx.Random.key(2), 0.0, 2.0, shape: {n_embd, n_head * head_dim})
+q_big = Nx.dot(x, [-1], c_q_big, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
+k_big = Nx.dot(x, [-1], c_k_big, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
 
-q = Nx.dot(x, [-1], c_q, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
-k = Nx.dot(x, [-1], c_k, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
+q_t = Nx.transpose(q_big, axes: [0, 2, 1, 3])
+k_t = Nx.transpose(k_big, axes: [0, 2, 1, 3])
+scores_raw = Nx.dot(q_t, [3], [0, 1], k_t, [3], [0, 1])
 
-# Without QK norm
-q_raw = Nx.transpose(q, axes: [0, 2, 1, 3])
-k_raw = Nx.transpose(k, axes: [0, 2, 1, 3])
-scores_raw = Nx.dot(q_raw, [3], [0, 1], k_raw, [3], [0, 1])
+IO.puts("Score statistics WITHOUT QK norm (simulating early training):")
+IO.puts("  max:  #{Nx.to_number(Nx.reduce_max(scores_raw)) |> Float.round(1)}")
+IO.puts("  min:  #{Nx.to_number(Nx.reduce_min(scores_raw)) |> Float.round(1)}")
+IO.puts("  std:  #{Nx.to_number(Nx.standard_deviation(scores_raw)) |> Float.round(1)}")
 
-# With QK norm (RMSNorm on Q and K)
+max_s = Nx.reduce_max(scores_raw, axes: [-1], keep_axes: true)
+exps = Nx.exp(Nx.subtract(scores_raw, max_s))
+attn = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+max_attn = Nx.to_number(Nx.reduce_max(attn)) |> Float.round(4)
+IO.puts("\n  Max attention weight: #{max_attn}")
+IO.puts("  That's nearly 1.0 — softmax collapsed to a one-hot vector!")
+IO.puts("  Gradients flow through only ONE position. Training is broken.")
+```
+
+Now apply RMSNorm to Q and K before computing scores:
+
+```elixir
 rms_norm = fn x ->
   var = Nx.mean(Nx.multiply(x, x), axes: [-1], keep_axes: true)
   Nx.divide(x, Nx.sqrt(Nx.add(var, 1.0e-5)))
 end
 
-q_normed = rms_norm.(q)
-k_normed = rms_norm.(k)
+q_normed = rms_norm.(q_big)
+k_normed = rms_norm.(k_big)
 q_n = Nx.transpose(q_normed, axes: [0, 2, 1, 3])
 k_n = Nx.transpose(k_normed, axes: [0, 2, 1, 3])
 scores_normed = Nx.dot(q_n, [3], [0, 1], k_n, [3], [0, 1])
 
-IO.puts("Score statistics WITHOUT QK norm:")
-IO.puts("  max:  #{Nx.to_number(Nx.reduce_max(scores_raw)) |> Float.round(2)}")
-IO.puts("  min:  #{Nx.to_number(Nx.reduce_min(scores_raw)) |> Float.round(2)}")
-IO.puts("  std:  #{Nx.to_number(Nx.standard_deviation(scores_raw)) |> Float.round(2)}")
-
-IO.puts("\nScore statistics WITH QK norm:")
+IO.puts("Score statistics WITH QK norm:")
 IO.puts("  max:  #{Nx.to_number(Nx.reduce_max(scores_normed)) |> Float.round(2)}")
 IO.puts("  min:  #{Nx.to_number(Nx.reduce_min(scores_normed)) |> Float.round(2)}")
 IO.puts("  std:  #{Nx.to_number(Nx.standard_deviation(scores_normed)) |> Float.round(2)}")
+
+max_s2 = Nx.reduce_max(scores_normed, axes: [-1], keep_axes: true)
+exps2 = Nx.exp(Nx.subtract(scores_normed, max_s2))
+attn2 = Nx.divide(exps2, Nx.sum(exps2, axes: [-1], keep_axes: true))
+max_attn2 = Nx.to_number(Nx.reduce_max(attn2)) |> Float.round(4)
+IO.puts("\n  Max attention weight: #{max_attn2}")
+IO.puts("  Much more spread out — gradients can flow to multiple positions. Training works.")
 ```
 
-### Visualize: Before/After QK Norm Score Distributions
+### Visualize: Score Distributions
 
 ```elixir
 raw_scores_list =
-  scores_raw
-  |> Nx.flatten()
-  |> Nx.to_flat_list()
+  scores_raw |> Nx.flatten() |> Nx.to_flat_list()
   |> Enum.map(&%{"score" => &1, "variant" => "Without QK Norm"})
 
 normed_scores_list =
-  scores_normed
-  |> Nx.flatten()
-  |> Nx.to_flat_list()
+  scores_normed |> Nx.flatten() |> Nx.to_flat_list()
   |> Enum.map(&%{"score" => &1, "variant" => "With QK Norm"})
 
 Vl.new(width: 300, height: 250, title: "Attention Score Distributions")
@@ -341,15 +325,17 @@ Vl.new(width: 300, height: 250, title: "Attention Score Distributions")
 |> Vl.encode_field(:column, "variant", type: :nominal)
 ```
 
-## Sliding Window Attention
+Without QK norm: scores range into the hundreds. With it: tight and controlled.
 
-### Why limit the attention range?
+## Sliding Window Attention: Don't Waste Computation
 
-Full causal attention lets every token attend to all previous tokens. This costs O(T²) in memory and compute. For long sequences, this gets expensive fast.
+Here's another question. Full causal attention lets every token attend to all previous tokens. That costs O(T²) in memory and compute. But does token 1000 really need to attend all the way back to token 1?
 
-**Sliding window attention** restricts each token to only attend to the last `w` tokens. Tokens outside the window are masked out (set to -∞ before softmax). This gives O(T × w) cost.
+In 2020, Beltagy et al. introduced **sliding window attention** in their Longformer paper. The idea: each token only attends to the last `w` tokens. Stacking multiple layers with windows creates a large receptive field (like CNNs), while each individual layer stays cheap.
 
-In the v2 model, layers alternate between short and long windows. The last layer always uses the full sequence length. This lets the model capture both local patterns (short window) and global structure (long window).
+In September 2023, the Mistral team showed this works beautifully in general-purpose LLMs: **Mistral 7B matched LLaMA 2 13B** — a model nearly twice its size — using sliding window as one of its key tricks.
+
+In our v2 model, layers alternate between short and long windows. The last layer always uses the full sequence length.
 
 ```elixir
 config = ExNanoGPT.V2.Model.tiny_config()
@@ -364,55 +350,31 @@ for {ws, i} <- Enum.with_index(window_sizes) do
 end
 ```
 
-### Building the Masks
+### Build and Visualize the Masks
 
 ```elixir
 seq_len = 16
 
-# Full causal mask: token at position i can attend to positions 0..i
 rows = Nx.iota({seq_len, seq_len}, axis: 0)
 cols = Nx.iota({seq_len, seq_len}, axis: 1)
 causal_mask = Nx.greater_equal(rows, cols)
 
-# Sliding window mask (window_size=4): token at position i can attend to positions max(0, i-3)..i
 window_size = 4
 window_constraint = Nx.greater(cols, Nx.subtract(rows, window_size))
 sliding_mask = Nx.logical_and(causal_mask, window_constraint)
 
-IO.puts("Full causal mask (1 = can attend):")
-for r <- 0..(seq_len - 1) do
-  row = for c <- 0..(seq_len - 1), do: if(Nx.to_number(causal_mask[r][c]) == 1, do: "█", else: "·")
-  IO.puts("  #{Enum.join(row)}")
-end
-
-IO.puts("\nSliding window mask (window=#{window_size}):")
-for r <- 0..(seq_len - 1) do
-  row = for c <- 0..(seq_len - 1), do: if(Nx.to_number(sliding_mask[r][c]) == 1, do: "█", else: "·")
-  IO.puts("  #{Enum.join(row)}")
-end
-```
-
-### Visualize: Full Causal vs Sliding Window Masks
-
-```elixir
 causal_data =
   for r <- 0..(seq_len - 1), c <- 0..(seq_len - 1) do
-    %{
-      "query" => r,
-      "key" => c,
+    %{"query" => r, "key" => c,
       "allowed" => Nx.to_number(causal_mask[r][c]),
-      "mask_type" => "Full Causal"
-    }
+      "mask_type" => "Full Causal"}
   end
 
 sliding_data =
   for r <- 0..(seq_len - 1), c <- 0..(seq_len - 1) do
-    %{
-      "query" => r,
-      "key" => c,
+    %{"query" => r, "key" => c,
       "allowed" => Nx.to_number(sliding_mask[r][c]),
-      "mask_type" => "Sliding Window (w=4)"
-    }
+      "mask_type" => "Sliding Window (w=4)"}
   end
 
 Vl.new(width: 200, height: 200, title: "Attention Masks")
@@ -427,13 +389,15 @@ Vl.new(width: 200, height: 200, title: "Attention Masks")
 |> Vl.encode_field(:column, "mask_type", type: :nominal)
 ```
 
-### Exercise: Build a Sliding Window Causal Mask
+The sliding window cuts off the lower-left corner. Token 15 can see tokens 12-15 but not token 0. That's fine — lower layers handle local context, and the last layer (with a full window) provides global reach.
+
+### Exercise: Build a Sliding Window Mask
 
 ```elixir
 build_sliding_mask = fn seq_len, window_size ->
   # Return a {seq_len, seq_len} boolean tensor
   # Position (i, j) is true when:
-  #   1. j <= i (causal: can't look into the future)
+  #   1. j <= i (causal: can't see the future)
   #   2. j > i - window_size (within the window)
   #
   # TODO: implement using Nx.iota, Nx.greater_equal, Nx.greater, Nx.logical_and
@@ -464,68 +428,26 @@ end
 
 </details>
 
-## Putting It All Together
+### Challenge: Effective Receptive Field
 
-Let's build a complete modern attention forward pass from the pieces:
+If you stack 6 layers of window size 256, what's the effective receptive field? Is that enough for a 2048-token sequence?
+
+*Hint: each layer extends the receptive field by window_size positions in each direction. After L layers with window size w, the effective field is L × w.*
 
 ```elixir
-modern_attention = fn x, c_q, c_k, c_v, c_proj, cos, sin, n_head, n_kv_head, window_size ->
-  {batch, seq_len, n_embd} = Nx.shape(x)
-  head_dim = div(n_embd, n_head)
+layers = 6
+w = 256
+effective = layers * w
+IO.puts("#{layers} layers x window #{w} = #{effective} token receptive field")
+IO.puts("Sequence length 2048: #{if effective >= 2048, do: "covered!", else: "NOT enough!"}")
+IO.puts("\nThis is why the last layer uses the full window — it provides global coverage.")
+```
 
-  # 1. Separate projections
-  q = Nx.dot(x, [-1], c_q, [0]) |> Nx.reshape({batch, seq_len, n_head, head_dim})
-  k = Nx.dot(x, [-1], c_k, [0]) |> Nx.reshape({batch, seq_len, n_kv_head, head_dim})
-  v = Nx.dot(x, [-1], c_v, [0]) |> Nx.reshape({batch, seq_len, n_kv_head, head_dim})
+## Putting It All Together
 
-  # 2. RoPE
-  q = ExNanoGPT.V2.Model.apply_rope(q, cos, sin)
-  k = ExNanoGPT.V2.Model.apply_rope(k, cos, sin)
+Let's build a complete modern attention forward pass combining all three upgrades: GQA, QK norm, and sliding window.
 
-  # 3. QK normalization
-  rms_norm = fn t ->
-    var = Nx.mean(Nx.multiply(t, t), axes: [-1], keep_axes: true)
-    Nx.divide(t, Nx.sqrt(Nx.add(var, 1.0e-5)))
-  end
-
-  q = rms_norm.(q)
-  k = rms_norm.(k)
-
-  # 4. GQA head expansion
-  {k, v} = expand_kv_heads.(k, v, n_head, n_kv_head)
-
-  # 5. Transpose to {B, H, T, D}
-  q = Nx.transpose(q, axes: [0, 2, 1, 3])
-  k = Nx.transpose(k, axes: [0, 2, 1, 3])
-  v = Nx.transpose(v, axes: [0, 2, 1, 3])
-
-  # 6. Scaled dot-product attention
-  scale = 1.0 / :math.sqrt(head_dim)
-  scores = Nx.multiply(Nx.dot(q, [3], [0, 1], k, [3], [0, 1]), scale)
-
-  # 7. Sliding window causal mask
-  rows = Nx.iota({seq_len, seq_len}, axis: 0)
-  cols = Nx.iota({seq_len, seq_len}, axis: 1)
-  causal = Nx.greater_equal(rows, cols)
-  window = Nx.greater(cols, Nx.subtract(rows, window_size))
-  mask = Nx.logical_and(causal, window)
-  mask = Nx.broadcast(Nx.reshape(mask, {1, 1, seq_len, seq_len}), Nx.shape(scores))
-  neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(scores))
-  scores = Nx.select(mask, scores, neg_inf)
-
-  # 8. Softmax
-  max_s = Nx.reduce_max(scores, axes: [-1], keep_axes: true)
-  exps = Nx.exp(Nx.subtract(scores, max_s))
-  attn = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
-
-  # 9. Weighted sum and project
-  y = Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])
-  y = Nx.transpose(y, axes: [0, 2, 1, 3])
-  y = Nx.reshape(y, {batch, seq_len, n_head * head_dim})
-  Nx.dot(y, [-1], c_proj, [0])
-end
-
-# Test
+```elixir
 n_embd = 64
 n_head = 4
 n_kv_head = 2
@@ -543,118 +465,116 @@ s = :math.sqrt(3) * :math.pow(n_embd, -0.5)
 {c_proj, _} = Nx.Random.uniform(key, -s, s, shape: {n_head * head_dim, n_embd})
 {cos, sin} = ExNanoGPT.V2.Model.precompute_rope(seq_len, head_dim)
 
-result = modern_attention.(x, c_q, c_k, c_v, c_proj, cos, sin, n_head, n_kv_head, seq_len)
+q = Nx.dot(x, [-1], c_q, [0]) |> Nx.reshape({batch, seq_len, n_head, head_dim})
+k = Nx.dot(x, [-1], c_k, [0]) |> Nx.reshape({batch, seq_len, n_kv_head, head_dim})
+v = Nx.dot(x, [-1], c_v, [0]) |> Nx.reshape({batch, seq_len, n_kv_head, head_dim})
+
+q = ExNanoGPT.V2.Model.apply_rope(q, cos, sin)
+k = ExNanoGPT.V2.Model.apply_rope(k, cos, sin)
+
+q = rms_norm.(q)
+k = rms_norm.(k)
+
+{k, v} = expand_kv_heads.(k, v, n_head, n_kv_head)
+
+q = Nx.transpose(q, axes: [0, 2, 1, 3])
+k = Nx.transpose(k, axes: [0, 2, 1, 3])
+v = Nx.transpose(v, axes: [0, 2, 1, 3])
+
+scale = 1.0 / :math.sqrt(head_dim)
+scores = Nx.multiply(Nx.dot(q, [3], [0, 1], k, [3], [0, 1]), scale)
+
+rows = Nx.iota({seq_len, seq_len}, axis: 0)
+cols = Nx.iota({seq_len, seq_len}, axis: 1)
+causal = Nx.greater_equal(rows, cols)
+window = Nx.greater(cols, Nx.subtract(rows, seq_len))
+mask = Nx.logical_and(causal, window)
+mask = Nx.broadcast(Nx.reshape(mask, {1, 1, seq_len, seq_len}), Nx.shape(scores))
+neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(scores))
+scores = Nx.select(mask, scores, neg_inf)
+
+max_s = Nx.reduce_max(scores, axes: [-1], keep_axes: true)
+exps = Nx.exp(Nx.subtract(scores, max_s))
+attn = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+
+y = Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])
+y = Nx.transpose(y, axes: [0, 2, 1, 3])
+y = Nx.reshape(y, {batch, seq_len, n_head * head_dim})
+result = Nx.dot(y, [-1], c_proj, [0])
+
 IO.inspect(Nx.shape(result), label: "output shape (should be {1, 8, 64})")
+IO.puts("\nThat's the full modern attention pipeline:")
+IO.puts("  1. Separate Q/K/V projections (GQA)")
+IO.puts("  2. RoPE on Q and K")
+IO.puts("  3. RMSNorm on Q and K (QK normalization)")
+IO.puts("  4. Expand K/V heads to match Q")
+IO.puts("  5. Scaled dot-product attention with sliding window mask")
+IO.puts("  6. Output projection")
 ```
+
+### Visualize: GQA Attention Heatmap
+
+Q heads that share a K/V head produce correlated attention patterns:
+
+```elixir
+attn_data =
+  for h <- 0..(n_head - 1),
+      qi <- 0..(seq_len - 1),
+      ki <- 0..(seq_len - 1) do
+    kv_group = div(h, div(n_head, n_kv_head))
+    %{
+      "query_pos" => qi, "key_pos" => ki,
+      "weight" => Nx.to_number(attn[0][h][qi][ki]) |> Float.round(4),
+      "head" => "Q_head=#{h} (KV=#{kv_group})"
+    }
+  end
+
+Vl.new(width: 120, height: 120, title: "GQA Attention Weights")
+|> Vl.data_from_values(attn_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key_pos", type: :ordinal, title: "Key")
+|> Vl.encode_field(:y, "query_pos", type: :ordinal, title: "Query", sort: "descending")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"})
+|> Vl.encode_field(:facet, "head", type: :nominal, columns: 4)
+```
+
+Heads 0 and 1 share a K/V group — notice their similar patterns. Same for heads 2 and 3.
 
 ## Break It
 
-### n_kv_head = 1 (extreme sharing — Multi-Query Attention)
+### Window size = 1
 
-With only one K/V head shared by all Q heads, every head computes attention over the same keys and values. The Q heads can still specialize via different Q projections, but diversity is limited.
-
-```elixir
-IO.puts("=== GQA with different n_kv_head values ===\n")
-
-for n_kv <- [4, 2, 1] do
-  kv_dim = n_kv * head_dim
-  repeat = div(n_head, n_kv)
-
-  {c_k_test, _} = Nx.Random.uniform(Nx.Random.key(1), -s, s, shape: {n_embd, kv_dim})
-  k_test = Nx.dot(x, [-1], c_k_test, [0]) |> Nx.reshape({batch, seq_len, n_kv, head_dim})
-
-  # Expand
-  k_exp =
-    if repeat == 1 do
-      k_test
-    else
-      k_test
-      |> Nx.reshape({batch, seq_len, n_kv, 1, head_dim})
-      |> Nx.broadcast({batch, seq_len, n_kv, repeat, head_dim})
-      |> Nx.reshape({batch, seq_len, n_head, head_dim})
-    end
-
-  # Check uniqueness across heads
-  head_sims =
-    for h1 <- 0..(n_head - 2) do
-      h1_vec = Nx.flatten(k_exp[0][0][h1])
-      h2_vec = Nx.flatten(k_exp[0][0][h1 + 1])
-      diff = Nx.subtract(h1_vec, h2_vec) |> Nx.abs() |> Nx.sum() |> Nx.to_number()
-      diff
-    end
-
-  identical = Enum.count(head_sims, &(&1 < 1.0e-6))
-  label = case n_kv do
-    4 -> "MHA"
-    2 -> "GQA"
-    1 -> "MQA"
-  end
-
-  IO.puts("n_kv_head=#{n_kv} (#{label}): #{identical} of #{n_head - 1} adjacent head pairs are identical K vectors")
-  IO.puts("  KV params: #{n_embd * kv_dim * 2}, KV cache per token: #{kv_dim * 2} floats")
-end
-```
-
-### No QK norm (training instability potential)
-
-Without QK norm, attention scores can have extreme values, leading to very sharp or very flat softmax distributions.
-
-```elixir
-# Simulate with large initial weights (as might happen early in training)
-key = Nx.Random.key(77)
-{x_big, _} = Nx.Random.normal(key, 0.0, 10.0, shape: {1, seq_len, n_embd})
-
-{c_q_big, key} = Nx.Random.normal(Nx.Random.key(1), 0.0, 5.0, shape: {n_embd, n_head * head_dim})
-{c_k_big, _} = Nx.Random.normal(Nx.Random.key(2), 0.0, 5.0, shape: {n_embd, n_head * head_dim})
-
-q_big = Nx.dot(x_big, [-1], c_q_big, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
-k_big = Nx.dot(x_big, [-1], c_k_big, [0]) |> Nx.reshape({1, seq_len, n_head, head_dim})
-
-# Scores without QK norm
-q_t = Nx.transpose(q_big, axes: [0, 2, 1, 3])
-k_t = Nx.transpose(k_big, axes: [0, 2, 1, 3])
-scores_no_norm = Nx.dot(q_t, [3], [0, 1], k_t, [3], [0, 1])
-
-# Scores with QK norm
-q_norm = rms_norm.(q_big)
-k_norm = rms_norm.(k_big)
-q_t2 = Nx.transpose(q_norm, axes: [0, 2, 1, 3])
-k_t2 = Nx.transpose(k_norm, axes: [0, 2, 1, 3])
-scores_with_norm = Nx.dot(q_t2, [3], [0, 1], k_t2, [3], [0, 1])
-
-IO.puts("With large weights (simulating early training):")
-IO.puts("  Without QK norm — score range: [#{Float.round(Nx.to_number(Nx.reduce_min(scores_no_norm)), 1)}, #{Float.round(Nx.to_number(Nx.reduce_max(scores_no_norm)), 1)}]")
-IO.puts("  With QK norm    — score range: [#{Float.round(Nx.to_number(Nx.reduce_min(scores_with_norm)), 1)}, #{Float.round(Nx.to_number(Nx.reduce_max(scores_with_norm)), 1)}]")
-IO.puts("\nExtreme scores → near-one-hot softmax → vanishing gradients for most positions.")
-```
-
-### Window size = 1 (each token only sees itself)
+With window=1, every token can only attend to itself. No information flows between positions.
 
 ```elixir
 window_1_mask = build_sliding_mask.(seq_len, 1)
 
-IO.puts("Window size = 1 mask (each token sees only itself):")
+IO.puts("Window size = 1:")
 for r <- 0..(seq_len - 1) do
   row = for c <- 0..(seq_len - 1), do: if(Nx.to_number(window_1_mask[r][c]) == 1, do: "█", else: "·")
   IO.puts("  #{Enum.join(row)}")
 end
 
-IO.puts("\nWith window=1, every token can only attend to itself.")
-IO.puts("No information flows between positions — the model degrades to a bag-of-tokens.")
-IO.puts("It's equivalent to a position-wise feed-forward network with no sequence modeling.")
+IO.puts("\nThe model degenerates to a bag-of-tokens — no sequence understanding.")
 ```
+
+## Real-World Connection
+
+GQA is why LLaMA 3 70B can run on a single 80GB GPU. Without it, the KV cache for a 70B model at 8k context length would need ~40GB of memory — leaving almost nothing for the model weights themselves. With GQA (8 KV heads instead of 64), the cache shrinks to ~5GB, making deployment feasible.
+
+This is the difference between a model that exists only in data centers and one that runs on your machine.
 
 ## What's Next
 
-We've built all the attention upgrades. Next up: **assembling the full modern transformer** — value embeddings, residual scaling, ReLU² activation, logit softcapping, and the complete v2 forward pass.
+We've built all the attention upgrades. Next: **assembling the full modern transformer** — value embeddings, ReLU-squared activation, logit softcapping, and the complete forward pass.
 
 ## Key Concepts
 
 | Concept | What it means |
 |---------|--------------|
-| **Grouped-Query Attention** | Fewer K/V heads than Q heads — multiple Q heads share K/V, reducing KV cache |
-| **Multi-Query Attention** | Extreme GQA with n_kv_head=1 — all Q heads share one K/V head |
-| **QK Normalization** | Apply RMSNorm to Q and K before dot product — stabilizes training |
-| **Sliding Window** | Restrict attention to last w tokens — O(T×w) instead of O(T²) |
-| **Window pattern** | Alternating short/long windows across layers — local + global context |
-| **Head expansion** | Broadcasting K/V heads to match Q head count via reshape→broadcast→reshape |
+| **GQA** | Fewer K/V heads than Q heads — saves memory. Ainslie et al., EMNLP 2023. |
+| **MQA** | Extreme case: 1 K/V head. Shazeer, 2019. Fast but lower quality. |
+| **QK Norm** | RMSNorm on Q and K before dot product — prevents softmax collapse |
+| **Sliding Window** | Attend only to last w tokens. Longformer 2020, Mistral 2023. |
+| **Head expansion** | Broadcasting K/V heads to match Q head count via reshape-broadcast-reshape |
+| **Window pattern** | Alternating short/long windows across layers for local + global context |
