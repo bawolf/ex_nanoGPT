@@ -55,6 +55,7 @@ defmodule ExNanoGPT.ModelTest do
     }
   end
 
+  @tag :golden
   test "GPT training forward matches PyTorch" do
     input = load_golden("gpt_input")
     params = load_gpt_params()
@@ -72,6 +73,7 @@ defmodule ExNanoGPT.ModelTest do
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
   end
 
+  @tag :golden
   test "GPT inference forward matches PyTorch" do
     input = load_golden("gpt_input")
     params = load_gpt_params()
@@ -84,6 +86,7 @@ defmodule ExNanoGPT.ModelTest do
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
   end
 
+  @tag :golden
   test "cross-entropy loss matches PyTorch" do
     input = load_golden("gpt_input")
     targets = load_golden("gpt_targets")

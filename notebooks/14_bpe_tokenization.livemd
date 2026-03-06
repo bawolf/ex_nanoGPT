@@ -1,6 +1,8 @@
 # 14: BPE Tokenization — From a 1994 Compression Hack to the Heart of Every LLM
 
 ```elixir
+Code.require_file("setup.exs", __DIR__)
+
 Mix.install([
   {:ex_nano_gpt, path: "."},
   {:vega_lite, "~> 0.1"},
@@ -8,15 +10,8 @@ Mix.install([
   {:kino, "~> 0.14"}
 ])
 
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
-
-backend = System.get_env("NX_BACKEND", "emlx")
-
-case backend do
-  "exla" -> Nx.global_default_backend(EXLA.Backend)
-  "emlx_cpu" -> Nx.global_default_backend({EMLX.Backend, device: :cpu})
-  _ -> Nx.global_default_backend({EMLX.Backend, device: :gpu})
-end
 ```
 
 ## Tokenize Your Name

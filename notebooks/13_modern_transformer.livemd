@@ -1,6 +1,8 @@
 # 13: Assembling the Modern Transformer — From Sparsity to Softcapping
 
 ```elixir
+Code.require_file("setup.exs", __DIR__)
+
 Mix.install([
   {:ex_nano_gpt, path: "."},
   {:vega_lite, "~> 0.1"},
@@ -8,25 +10,7 @@ Mix.install([
   {:kino, "~> 0.14"}
 ])
 
-backend = System.get_env("NX_BACKEND", "emlx")
-
-case backend do
-  "exla" ->
-    Nx.global_default_backend(EXLA.Backend)
-    Nx.Defn.global_default_options(compiler: EXLA)
-    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
-
-  "emlx_cpu" ->
-    Nx.global_default_backend({EMLX.Backend, device: :cpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (CPU)")
-
-  _ ->
-    Nx.global_default_backend({EMLX.Backend, device: :gpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (Apple Metal GPU)")
-end
-
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
@@ -399,6 +383,60 @@ Every symbol you've learned across all 14 notebooks:
 | 13 | ReLU²(x), λ_r/λ_0 (residual scaling), softcap(x), W_E/W_H (untied) |
 
 Every symbol maps directly to Nx code you wrote. You can now read modern ML papers and understand the architecture behind LLaMA, Gemma, and Mistral.
+
+## The Whole Thing
+
+Everything from notebooks 11-13 — RoPE, RMSNorm, GQA, QK norm, sliding window, ReLU-squared, value embeddings, residual scaling, softcapping — fits in **one file, 292 lines**. Open `lib/ex_nano_gpt/v2_compact.ex` and read it top to bottom.
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/v2_compact.ex")
+
+# Run the compact model
+compact_logits = ExNanoGPT.V2Compact.forward(idx, params, config)
+
+diff =
+  Nx.subtract(compact_logits, logits)
+  |> Nx.abs()
+  |> Nx.reduce_max()
+  |> Nx.to_number()
+
+IO.puts("Max diff between reference and v2_compact.ex: #{diff}")
+IO.puts(if diff < 1.0e-4, do: "✓ Identical. You just built this 292-line model piece by piece.", else: "✗ Mismatch — #{diff}")
+```
+
+<details>
+<summary>The entire forward pass from v2_compact.ex</summary>
+
+```elixir
+# lib/ex_nano_gpt/v2_compact.ex — forward/3
+def forward(idx, params, %__MODULE__{} = config) do
+  %{n_layer: n, n_head: nh, n_kv_head: nkv, n_embd: d} = config
+  head_dim = div(d, nh)
+  seq_len = Nx.axis_size(idx, 1)
+  ws = window_sizes(config)
+  {cos, sin} = precompute_rope(seq_len, head_dim)
+
+  x = Nx.take(params.wte, idx, axis: 0) |> rms_norm()
+  x0 = x
+
+  x =
+    Enum.reduce(0..(n - 1), x, fn i, x ->
+      rl = Nx.reshape(params.resid_lambdas[i], {1, 1, 1})
+      xl = Nx.reshape(params.x0_lambdas[i], {1, 1, 1})
+      x = Nx.add(Nx.multiply(rl, x), Nx.multiply(xl, x0))
+
+      block(x, elem(params.blocks, i), elem(params.value_embeds, i), idx, cos, sin,
+        n_head: nh, n_kv_head: nkv, window_size: Enum.at(ws, i))
+    end)
+
+  logits = Nx.dot(rms_norm(x), [-1], params.lm_head, [1])
+  Nx.multiply(@softcap, Nx.tanh(Nx.divide(logits, @softcap)))
+end
+```
+
+RoPE frequencies, RMSNorm, per-layer residual scaling with x0 skip, value embeddings, sliding window attention, softcapping. Every line maps to something you built and verified in notebooks 11-13.
+
+</details>
 
 ## What's Next
 

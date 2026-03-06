@@ -3,6 +3,8 @@ defmodule ExNanoGPT.V2.WeightLoaderTest do
 
   alias ExNanoGPT.V2.{Model, WeightLoader}
 
+  @moduletag :golden
+
   @fake_ckpt_dir Path.join([File.cwd!(), "test", "support", "golden_v2", "fake_ckpt"])
 
   describe "load/2" do

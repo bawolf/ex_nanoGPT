@@ -56,6 +56,7 @@ defmodule ExNanoGPT.DataTest do
     assert loaded.itos == meta.itos
   end
 
+  @tag :external
   test "Shakespeare vocab should have 65 characters" do
     text = Data.download(@test_data_dir)
     meta = Data.build_vocab(text)

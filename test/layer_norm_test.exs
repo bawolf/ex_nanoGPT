@@ -4,6 +4,7 @@ defmodule ExNanoGPT.LayerNormTest do
   alias ExNanoGPT.LayerNorm
   import ExNanoGPT.Test.GoldenHelpers
 
+  @tag :golden
   test "layer norm with bias matches PyTorch" do
     input = load_golden("ln_input")
     weight = load_golden("ln_weight")

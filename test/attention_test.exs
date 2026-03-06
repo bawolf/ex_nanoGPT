@@ -25,6 +25,7 @@ defmodule ExNanoGPT.AttentionTest do
     }
   end
 
+  @tag :golden
   test "full attention forward matches PyTorch" do
     input = load_golden("attn_input")
     params = load_attention_params()

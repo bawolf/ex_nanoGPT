@@ -1,22 +1,17 @@
 # 16: From Completion to Chat — The Technique That Created ChatGPT
 
 ```elixir
+Code.require_file("setup.exs", __DIR__)
+
 Mix.install([
   {:ex_nano_gpt, path: "."},
   {:vega_lite, "~> 0.1"},
   {:kino_vega_lite, "~> 0.1"},
   {:kino, "~> 0.14"}
 ])
-alias VegaLite, as: Vl
-```
 
-```elixir
-backend = System.get_env("NX_BACKEND", "emlx")
-case backend do
-  "exla" -> Nx.global_default_backend(EXLA.Backend)
-  "emlx_cpu" -> Nx.global_default_backend({EMLX.Backend, device: :cpu})
-  _ -> Nx.global_default_backend({EMLX.Backend, device: :gpu})
-end
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
 ```
 
 ## Ask It a Question

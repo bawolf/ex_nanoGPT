@@ -10,6 +10,7 @@ defmodule ExNanoGPT.V2.ModelTest do
   defp load(name), do: Npy.load!(Path.join(@golden_dir, "#{name}.npy"))
 
   describe "rms_norm/1" do
+    @tag :golden
     test "matches PyTorch F.rms_norm" do
       input = load("rmsnorm_input")
       expected = load("rmsnorm_output")
@@ -19,6 +20,7 @@ defmodule ExNanoGPT.V2.ModelTest do
   end
 
   describe "precompute_rope/2 + apply_rope/3" do
+    @tag :golden
     test "matches nanochat RoPE implementation" do
       cos = load("rope_cos")
       sin = load("rope_sin")
@@ -35,6 +37,7 @@ defmodule ExNanoGPT.V2.ModelTest do
   end
 
   describe "attention_forward/7" do
+    @tag :golden
     test "GQA attention with QK norm and sliding window matches Python" do
       x = load("att_input")
       c_q = load("att_c_q_w")
@@ -76,6 +79,7 @@ defmodule ExNanoGPT.V2.ModelTest do
   end
 
   describe "mlp_forward/2" do
+    @tag :golden
     test "ReLU² MLP matches Python" do
       x = load("mlp_input")
       c_fc = load("mlp_c_fc_w")
@@ -90,6 +94,7 @@ defmodule ExNanoGPT.V2.ModelTest do
   end
 
   describe "forward/3" do
+    @tag :golden
     test "full forward pass matches Python (tiny config)" do
       idx = load("fwd_idx") |> Nx.as_type(:s64)
       wte = load("fwd_wte")

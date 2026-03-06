@@ -1,6 +1,8 @@
 # 12: Modern Attention — How Shazeer's Memory Trick Enables LLMs on Your Laptop
 
 ```elixir
+Code.require_file("setup.exs", __DIR__)
+
 Mix.install([
   {:ex_nano_gpt, path: "."},
   {:vega_lite, "~> 0.1"},
@@ -8,25 +10,7 @@ Mix.install([
   {:kino, "~> 0.14"}
 ])
 
-backend = System.get_env("NX_BACKEND", "emlx")
-
-case backend do
-  "exla" ->
-    Nx.global_default_backend(EXLA.Backend)
-    Nx.Defn.global_default_options(compiler: EXLA)
-    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
-
-  "emlx_cpu" ->
-    Nx.global_default_backend({EMLX.Backend, device: :cpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (CPU)")
-
-  _ ->
-    Nx.global_default_backend({EMLX.Backend, device: :gpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (Apple Metal GPU)")
-end
-
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 

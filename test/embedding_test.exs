@@ -4,6 +4,7 @@ defmodule ExNanoGPT.EmbeddingTest do
   alias ExNanoGPT.Embedding
   import ExNanoGPT.Test.GoldenHelpers
 
+  @tag :golden
   test "token embedding matches PyTorch" do
     wte = load_golden("emb_wte")
     idx = load_golden("emb_idx") |> Nx.as_type(:s64)
@@ -13,6 +14,7 @@ defmodule ExNanoGPT.EmbeddingTest do
     assert_close(actual, expected)
   end
 
+  @tag :golden
   test "position embedding matches PyTorch" do
     wpe = load_golden("emb_wpe")
     expected = load_golden("emb_pos")
@@ -21,6 +23,7 @@ defmodule ExNanoGPT.EmbeddingTest do
     assert_close(actual, expected)
   end
 
+  @tag :golden
   test "combined tok + pos embedding matches PyTorch" do
     wte = load_golden("emb_wte")
     wpe = load_golden("emb_wpe")
