@@ -15,7 +15,8 @@ defmodule ExNanoGPTWeb.ChatLive do
        temperature: 0.7,
        top_k: 40,
        model_loaded: false,
-       status: "No model loaded. Load weights via the configuration panel."
+       weights_path: "",
+       status: "No model loaded. Enter a checkpoint path below."
      )}
   end
 
@@ -63,9 +64,22 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   @impl true
   def handle_event("load_model", %{"path" => path}, socket) do
-    socket = assign(socket, status: "Loading model from #{path}...")
+    socket = assign(socket, status: "Loading model from #{path}...", weights_path: path)
     send(self(), {:do_load_model, path})
     {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("reset_model", _params, socket) do
+    {:noreply,
+     assign(socket,
+       model_loaded: false,
+       model_params: nil,
+       model_config: nil,
+       tokenizer: nil,
+       messages: [],
+       status: "Model unloaded. Load a new checkpoint below."
+     )}
   end
 
   @impl true
@@ -221,14 +235,32 @@ defmodule ExNanoGPTWeb.ChatLive do
 
       <!-- Messages -->
       <div class="flex-1 overflow-y-auto px-6 py-4 space-y-4 chat-scroll" id="messages">
-        <%= if @messages == [] do %>
+        <%= if @messages == [] and not @model_loaded do %>
+          <div class="flex items-center justify-center h-full">
+            <div class="max-w-lg space-y-6 text-gray-400 text-sm">
+              <h2 class="text-lg text-gray-200 font-medium text-center">Load a nanochat (v2) Model</h2>
+              <p class="text-center text-gray-500">This chat UI runs the v2 nanochat model. Choose one of the two paths below to get started.</p>
+
+              <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+                <p class="text-gray-300 font-medium mb-2">Option 1: Download Karpathy's pre-trained weights</p>
+                <code class="block bg-gray-950 rounded-lg px-3 py-2 text-xs text-green-400 font-mono">./scripts/download_weights.sh</code>
+                <p class="mt-2 text-gray-500 text-xs">Downloads nanochat-d32 (~700 MB) and converts to .npy format in <code class="text-gray-400">weights/</code>.</p>
+              </div>
+
+              <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+                <p class="text-gray-300 font-medium mb-2">Option 2: Train from scratch (cloud GPU)</p>
+                <code class="block bg-gray-950 rounded-lg px-3 py-2 text-xs text-green-400 font-mono">mix run scripts/cloud_train.exs</code>
+                <p class="mt-2 text-gray-500 text-xs">Trains a nanochat model on rented GPU. See <code class="text-gray-400">scripts/cloud_train.exs</code> for cost estimates.</p>
+              </div>
+
+              <p class="text-center text-gray-600 text-xs">For v1 Shakespeare, use <code class="text-gray-500">mix run scripts/train.exs</code> instead (it generates text directly).</p>
+            </div>
+          </div>
+        <% end %>
+
+        <%= if @messages == [] and @model_loaded do %>
           <div class="flex items-center justify-center h-full text-gray-600">
-            <p class="text-center">
-              Send a message to start chatting.<br/>
-              <span class="text-sm text-gray-700">
-                Load a model checkpoint first, or chat will return placeholder responses.
-              </span>
-            </p>
+            <p class="text-center">Model loaded. Send a message to start chatting.</p>
           </div>
         <% end %>
 
@@ -249,7 +281,26 @@ defmodule ExNanoGPTWeb.ChatLive do
       </div>
 
       <!-- Controls -->
-      <div class="px-6 py-2 border-t border-gray-800 flex gap-4 text-xs text-gray-500">
+      <div class="px-6 py-2 border-t border-gray-800 flex flex-wrap items-center gap-4 text-xs text-gray-500">
+        <%= unless @model_loaded do %>
+          <form phx-submit="load_model" class="flex items-center gap-2">
+            <input type="text" name="path" placeholder="weights/"
+                   value={@weights_path}
+                   class="bg-gray-800 rounded-lg px-3 py-1.5 text-xs border border-gray-700
+                          focus:outline-none focus:border-blue-500 w-64 placeholder-gray-500" />
+            <button type="submit"
+                    class="bg-green-700 hover:bg-green-600 rounded-lg px-3 py-1.5 text-xs
+                           font-medium transition-colors text-white">
+              Load Model
+            </button>
+          </form>
+        <% else %>
+          <button phx-click="reset_model"
+                  class="bg-gray-700 hover:bg-gray-600 rounded-lg px-3 py-1.5 text-xs
+                         font-medium transition-colors text-gray-300">
+            Unload Model
+          </button>
+        <% end %>
         <label>
           Temperature: <%= @temperature %>
           <input type="range" min="0.0" max="2.0" step="0.1" value={@temperature}

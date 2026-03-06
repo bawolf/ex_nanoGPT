@@ -9,6 +9,7 @@ defmodule ExNanoGPTWeb.Layouts do
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>ExNanoGPT Chat</title>
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
         <script src="https://cdn.tailwindcss.com"></script>
         <script defer phx-track-static src="https://cdn.jsdelivr.net/npm/phoenix@1.7.20/priv/static/phoenix.min.js"></script>
         <script defer phx-track-static src="https://cdn.jsdelivr.net/npm/phoenix_live_view@1.0.4/priv/static/phoenix_live_view.min.js"></script>
@@ -33,5 +34,25 @@ defmodule ExNanoGPTWeb.Layouts do
       </body>
     </html>
     """
+  end
+
+  def render("404.html", assigns) do
+    ~H"""
+    <div class="flex items-center justify-center min-h-screen bg-gray-950 text-gray-400">
+      <p class="text-lg">404 — Not Found</p>
+    </div>
+    """
+  end
+
+  def render("500.html", assigns) do
+    ~H"""
+    <div class="flex items-center justify-center min-h-screen bg-gray-950 text-gray-400">
+      <p class="text-lg">500 — Internal Server Error</p>
+    </div>
+    """
+  end
+
+  def render(template, _assigns) do
+    Phoenix.Controller.status_message_from_template(template)
   end
 end

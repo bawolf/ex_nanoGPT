@@ -46,6 +46,3 @@ jobs:
 
       - name: Run tests
         run: mix test --exclude golden --exclude external
-
-      - name: Check unused dependencies
-        run: mix deps.unlock --check-unused

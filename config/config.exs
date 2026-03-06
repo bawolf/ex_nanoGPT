@@ -1,5 +1,7 @@
 import Config
 
+config :logger, level: :info
+
 case System.get_env("NX_BACKEND", "emlx") do
   "exla" ->
     config :nx, default_backend: EXLA.Backend
@@ -20,5 +22,4 @@ config :ex_nano_gpt, ExNanoGPTWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   secret_key_base: String.duplicate("nanochat_elixir_secret_", 4),
   live_view: [signing_salt: "nanochat_lv"],
-  render_errors: [formats: [html: ExNanoGPTWeb.Layouts]],
-  server: false
+  render_errors: [formats: [html: ExNanoGPTWeb.Layouts]]

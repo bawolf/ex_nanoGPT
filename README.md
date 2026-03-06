@@ -150,20 +150,40 @@ NX_BACKEND=exla mix run scripts/train.exs
 
 ## v2: Chat UI & Pre-trained Weights
 
-```bash
-# Phoenix LiveView chat interface
-iex -S mix phx.server  # http://localhost:4000
+Start the Phoenix LiveView chat interface:
 
-# Load a nanochat checkpoint
-python scripts/convert_checkpoint.py path/to/checkpoint.pt converted_weights/
+```bash
+iex -S mix phx.server  # http://localhost:4000
 ```
+
+**Option A: Download Karpathy's pre-trained weights** (recommended)
+
+```bash
+./scripts/download_weights.sh            # downloads nanochat-d32 → weights/
+./scripts/download_weights.sh nanochat-d34  # or the larger 2.2B model
+```
+
+Then enter `weights/` as the path in the chat UI and click "Load Model".
+
+**Option B: Train from scratch** (cloud GPU)
+
+```bash
+mix run scripts/cloud_train.exs  # see script for cost estimates (~$0.55 for 100M quick test)
+```
+
+**v1 Shakespeare** doesn't use the chat UI -- it generates text directly:
+
+```bash
+mix run scripts/train.exs        # trains & generates Shakespeare
+mix run scripts/train.exs --smoke  # quick 10-step smoke test
+```
+
+**Load weights programmatically:**
 
 ```elixir
-{params, config} = ExNanoGPT.V2.WeightLoader.load("converted_weights/")
+{params, config} = ExNanoGPT.V2.WeightLoader.load("weights/")
 logits = ExNanoGPT.V2.Model.forward(token_ids, params, config)
 ```
-
-Cloud training: see `scripts/cloud_train.exs` (~$56-74 for 10B tokens, ~$0.55 for 100M quick test).
 
 ## Known Limitations
 
