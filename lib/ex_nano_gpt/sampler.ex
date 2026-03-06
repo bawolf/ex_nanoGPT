@@ -43,7 +43,14 @@ defmodule ExNanoGPT.Sampler do
     * `:temperature` - sampling temperature (default: 0.8)
     * `:top_k` - top-k filtering (default: 200)
   """
-  @spec generate_text(Model.params(), Model.config(), Data.t(), String.t(), Nx.Tensor.t(), keyword()) :: String.t()
+  @spec generate_text(
+          Model.params(),
+          Model.config(),
+          Data.t(),
+          String.t(),
+          Nx.Tensor.t(),
+          keyword()
+        ) :: String.t()
   def generate_text(params, model_config, data, prompt, key, opts \\ []) do
     max_new_tokens = Keyword.get(opts, :max_new_tokens, 500)
     temperature = Keyword.get(opts, :temperature, 0.8)
@@ -52,11 +59,12 @@ defmodule ExNanoGPT.Sampler do
     prompt_ids = Data.encode(data, prompt)
     idx = Nx.tensor([prompt_ids], type: :s32)
 
-    generated_idx = generate(idx, params, model_config, key,
-      max_new_tokens: max_new_tokens,
-      temperature: temperature,
-      top_k: top_k
-    )
+    generated_idx =
+      generate(idx, params, model_config, key,
+        max_new_tokens: max_new_tokens,
+        temperature: temperature,
+        top_k: top_k
+      )
 
     ids =
       generated_idx
@@ -89,7 +97,8 @@ defmodule ExNanoGPT.Sampler do
   ## Returns
   Extended token sequence, shape `{batch, t + max_new_tokens}`.
   """
-  @spec generate(Nx.Tensor.t(), Model.params(), Model.config(), Nx.Tensor.t(), keyword()) :: Nx.Tensor.t()
+  @spec generate(Nx.Tensor.t(), Model.params(), Model.config(), Nx.Tensor.t(), keyword()) ::
+          Nx.Tensor.t()
   def generate(idx, params, model_config, key, opts \\ []) do
     max_new_tokens = Keyword.get(opts, :max_new_tokens, 500)
     temperature = Keyword.get(opts, :temperature, 1.0)
@@ -99,6 +108,7 @@ defmodule ExNanoGPT.Sampler do
     Enum.reduce(0..(max_new_tokens - 1), {idx, key}, fn _i, {idx, key} ->
       # Crop context to block_size if sequence is too long
       seq_len = Nx.axis_size(idx, 1)
+
       idx_cond =
         if seq_len > block_size do
           Nx.slice_along_axis(idx, seq_len - block_size, block_size, axis: 1)

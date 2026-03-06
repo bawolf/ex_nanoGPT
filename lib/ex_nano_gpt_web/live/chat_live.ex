@@ -22,8 +22,9 @@ defmodule ExNanoGPTWeb.ChatLive do
   @impl true
   def handle_event("send", %{"message" => message}, socket) when message != "" do
     messages = socket.assigns.messages ++ [%{role: "user", content: message}]
-    socket = assign(socket, messages: messages, input: "", generating: true,
-                    status: "Generating...")
+
+    socket =
+      assign(socket, messages: messages, input: "", generating: true, status: "Generating...")
 
     socket =
       if socket.assigns.model_loaded do
@@ -31,7 +32,8 @@ defmodule ExNanoGPTWeb.ChatLive do
         socket
       else
         assign(socket,
-          messages: messages ++ [%{role: "assistant", content: "(No model loaded -- load weights first)"}],
+          messages:
+            messages ++ [%{role: "assistant", content: "(No model loaded -- load weights first)"}],
           generating: false,
           status: "Ready"
         )
@@ -71,19 +73,22 @@ defmodule ExNanoGPTWeb.ChatLive do
     try do
       {params, config} = ExNanoGPT.V2.WeightLoader.load(path)
       tok_path = Path.join(path, "tokenizer.etf")
-      tokenizer = if File.exists?(tok_path) do
-        Tokenizer.load(tok_path)
-      else
-        Tokenizer.train("hello world", vocab_size: config.vocab_size)
-      end
 
-      {:noreply, assign(socket,
-        model_params: params,
-        model_config: config,
-        tokenizer: tokenizer,
-        model_loaded: true,
-        status: "Model loaded! #{Model.count_params(params)} parameters."
-      )}
+      tokenizer =
+        if File.exists?(tok_path) do
+          Tokenizer.load(tok_path)
+        else
+          Tokenizer.train("hello world", vocab_size: config.vocab_size)
+        end
+
+      {:noreply,
+       assign(socket,
+         model_params: params,
+         model_config: config,
+         tokenizer: tokenizer,
+         model_loaded: true,
+         status: "Model loaded! #{Model.count_params(params)} parameters."
+       )}
     rescue
       e ->
         {:noreply, assign(socket, status: "Failed to load: #{Exception.message(e)}")}
@@ -92,23 +97,35 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   @impl true
   def handle_info({:generate, _user_msg}, socket) do
-    %{model_params: params, model_config: config, tokenizer: tok,
-      messages: messages, temperature: temp, top_k: top_k} = socket.assigns
+    %{
+      model_params: params,
+      model_config: config,
+      tokenizer: tok,
+      messages: messages,
+      temperature: temp,
+      top_k: top_k
+    } = socket.assigns
 
     # Build token sequence from conversation
-    turns = Enum.map(messages, fn %{role: role, content: content} ->
-      %{role: role, content: content}
-    end)
+    turns =
+      Enum.map(messages, fn %{role: role, content: content} ->
+        %{role: role, content: content}
+      end)
 
     {prompt_ids, _mask} = ExNanoGPT.V2.Conversation.render(turns, tok)
     ast_start = Tokenizer.encode_special(tok, "<|assistant_start|>")
     prompt_ids = prompt_ids ++ [ast_start]
 
     head_dim = div(config.n_embd, config.n_head)
-    cache = KVCache.new(
-      batch_size: 1, n_layers: config.n_layer, n_kv_head: config.n_kv_head,
-      head_dim: head_dim, max_seq: config.sequence_len
-    )
+
+    cache =
+      KVCache.new(
+        batch_size: 1,
+        n_layers: config.n_layer,
+        n_kv_head: config.n_kv_head,
+        head_dim: head_dim,
+        max_seq: config.sequence_len
+      )
 
     # Process prompt through cache
     prompt_tensor = Nx.tensor([prompt_ids], type: :s64)
@@ -117,7 +134,9 @@ defmodule ExNanoGPTWeb.ChatLive do
     # Generate tokens
     ast_end = Tokenizer.encode_special(tok, "<|assistant_end|>")
     key = Nx.Random.key(System.system_time(:microsecond))
-    generated = generate_tokens(params, config, tok, cache, temp, top_k, ast_end, @max_tokens, key)
+
+    generated =
+      generate_tokens(params, config, tok, cache, temp, top_k, ast_end, @max_tokens, key)
 
     response = Tokenizer.decode(tok, generated)
     messages = socket.assigns.messages ++ [%{role: "assistant", content: response}]
@@ -128,12 +147,16 @@ defmodule ExNanoGPTWeb.ChatLive do
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   defp generate_tokens(_params, _config, _tok, _cache, _temp, _top_k, _end_tok, 0, _key), do: []
+
   defp generate_tokens(params, config, tok, cache, temp, top_k, end_tok, remaining, key) do
     # Generate one token at a time using the cache
-    {logits, cache} = Model.forward_cached(
-      Nx.tensor([[List.last(cache_last_token(cache, tok))]], type: :s64),
-      params, config, cache
-    )
+    {logits, cache} =
+      Model.forward_cached(
+        Nx.tensor([[List.last(cache_last_token(cache, tok))]], type: :s64),
+        params,
+        config,
+        cache
+      )
 
     # Sample from logits
     logits = Nx.reshape(logits, {Nx.axis_size(logits, 2)})
@@ -143,18 +166,22 @@ defmodule ExNanoGPTWeb.ChatLive do
     if token == end_tok do
       []
     else
-      [token | generate_tokens(params, config, tok, cache, temp, top_k, end_tok, remaining - 1, key)]
+      [
+        token
+        | generate_tokens(params, config, tok, cache, temp, top_k, end_tok, remaining - 1, key)
+      ]
     end
   end
 
   defp cache_last_token(_cache, _tok), do: [0]
 
   defp sample_token(logits, temperature, top_k, key) do
-    logits = if temperature > 0 do
-      Nx.divide(logits, max(temperature, 1.0e-8))
-    else
-      logits
-    end
+    logits =
+      if temperature > 0 do
+        Nx.divide(logits, max(temperature, 1.0e-8))
+      else
+        logits
+      end
 
     # Top-K filtering
     {n} = Nx.shape(logits)

@@ -50,7 +50,10 @@ defmodule ExNanoGPT.V2.ModelTest do
       window_size = 4
 
       block_params = %{
-        c_q: c_q, c_k: c_k, c_v: c_v, c_proj: c_proj,
+        c_q: c_q,
+        c_k: c_k,
+        c_v: c_v,
+        c_proj: c_proj,
         ve_gate: Nx.broadcast(Nx.tensor(0.0, type: :f32), {32, n_kv_head}),
         c_fc: Nx.broadcast(Nx.tensor(0.0, type: :f32), {64, 256}),
         c_proj_mlp: Nx.broadcast(Nx.tensor(0.0, type: :f32), {256, 64})
@@ -60,8 +63,13 @@ defmodule ExNanoGPT.V2.ModelTest do
 
       # No value embedding: pass zero tensor for v_extra
       v_extra = Nx.broadcast(Nx.tensor(0.0, type: :f32), {2, seq_len, n_kv_head, head_dim})
-      actual = Model.attention_forward(x, block_params, v_extra, cos, sin,
-        n_head: n_head, n_kv_head: n_kv_head, window_size: window_size)
+
+      actual =
+        Model.attention_forward(x, block_params, v_extra, cos, sin,
+          n_head: n_head,
+          n_kv_head: n_kv_head,
+          window_size: window_size
+        )
 
       GoldenHelpers.assert_close(actual, expected, atol: 1.0e-4)
     end
@@ -91,8 +99,13 @@ defmodule ExNanoGPT.V2.ModelTest do
       expected_logits = load("fwd_logits")
 
       config = %Model{
-        sequence_len: 16, vocab_size: 256, n_layer: 2,
-        n_head: 4, n_kv_head: 2, n_embd: 64, window_pattern: "SL"
+        sequence_len: 16,
+        vocab_size: 256,
+        n_layer: 2,
+        n_head: 4,
+        n_kv_head: 2,
+        n_embd: 64,
+        window_pattern: "SL"
       }
 
       blocks =
@@ -163,8 +176,13 @@ defmodule ExNanoGPT.V2.ModelTest do
   describe "compute_window_sizes/1" do
     test "computes correct window pattern" do
       config = %Model{
-        sequence_len: 16, vocab_size: 256, n_layer: 4,
-        n_head: 4, n_kv_head: 2, n_embd: 64, window_pattern: "SL"
+        sequence_len: 16,
+        vocab_size: 256,
+        n_layer: 4,
+        n_head: 4,
+        n_kv_head: 2,
+        n_embd: 64,
+        window_pattern: "SL"
       }
 
       assert Model.compute_window_sizes(config) == [8, 16, 8, 16]
@@ -172,8 +190,13 @@ defmodule ExNanoGPT.V2.ModelTest do
 
     test "final layer always gets full context" do
       config = %Model{
-        sequence_len: 16, vocab_size: 256, n_layer: 3,
-        n_head: 4, n_kv_head: 2, n_embd: 64, window_pattern: "S"
+        sequence_len: 16,
+        vocab_size: 256,
+        n_layer: 3,
+        n_head: 4,
+        n_kv_head: 2,
+        n_embd: 64,
+        window_pattern: "S"
       }
 
       assert Model.compute_window_sizes(config) == [8, 8, 16]

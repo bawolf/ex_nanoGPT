@@ -23,21 +23,36 @@ defmodule ExNanoGPT.V2.Model do
   @ve_gate_channels 32
 
   defstruct [
-    :sequence_len, :vocab_size, :n_layer, :n_head,
-    :n_kv_head, :n_embd, :window_pattern
+    :sequence_len,
+    :vocab_size,
+    :n_layer,
+    :n_head,
+    :n_kv_head,
+    :n_embd,
+    :window_pattern
   ]
 
   def tiny_config do
     %__MODULE__{
-      sequence_len: 256, vocab_size: 256, n_layer: 2,
-      n_head: 4, n_kv_head: 2, n_embd: 64, window_pattern: "SL"
+      sequence_len: 256,
+      vocab_size: 256,
+      n_layer: 2,
+      n_head: 4,
+      n_kv_head: 2,
+      n_embd: 64,
+      window_pattern: "SL"
     }
   end
 
   def base_config do
     %__MODULE__{
-      sequence_len: 2048, vocab_size: 32768, n_layer: 12,
-      n_head: 6, n_kv_head: 6, n_embd: 768, window_pattern: "SSSL"
+      sequence_len: 2048,
+      vocab_size: 32768,
+      n_layer: 12,
+      n_head: 6,
+      n_kv_head: 6,
+      n_embd: 768,
+      window_pattern: "SSSL"
     }
   end
 
@@ -94,13 +109,17 @@ defmodule ExNanoGPT.V2.Model do
         {c_k, k} = Nx.Random.uniform(k, -s, s, shape: {d, kv_dim})
         {c_v, k} = Nx.Random.uniform(k, -s, s, shape: {d, kv_dim})
         {c_fc, k} = Nx.Random.uniform(k, -s, s, shape: {d, 4 * d})
+
         block = %{
-          c_q: c_q, c_k: c_k, c_v: c_v,
+          c_q: c_q,
+          c_k: c_k,
+          c_v: c_v,
           c_proj: Nx.broadcast(Nx.tensor(0.0, type: :f32), {nh * head_dim, d}),
           ve_gate: Nx.broadcast(Nx.tensor(0.0, type: :f32), {@ve_gate_channels, nkv}),
           c_fc: c_fc,
           c_proj_mlp: Nx.broadcast(Nx.tensor(0.0, type: :f32), {4 * d, d})
         }
+
         {block, k}
       end)
 
@@ -197,8 +216,16 @@ defmodule ExNanoGPT.V2.Model do
   deftransform get_attn_dims(x, n_head, n_kv_head) do
     {batch, seq_len, n_embd} = Nx.shape(x)
     head_dim = div(n_embd, n_head)
-    %{batch: batch, seq_len: seq_len, n_embd: n_embd, head_dim: head_dim,
-      n_head: n_head, n_kv_head: n_kv_head, repeat: div(n_head, n_kv_head)}
+
+    %{
+      batch: batch,
+      seq_len: seq_len,
+      n_embd: n_embd,
+      head_dim: head_dim,
+      n_head: n_head,
+      n_kv_head: n_kv_head,
+      repeat: div(n_head, n_kv_head)
+    }
   end
 
   deftransform reshape_heads(x, batch, seq_len, n_heads, head_dim) do
@@ -223,10 +250,22 @@ defmodule ExNanoGPT.V2.Model do
   deftransform expand_kv_heads(k, v, %{n_head: nh, n_kv_head: nkv} = _dims) when nh == nkv do
     {k, v}
   end
+
   deftransform expand_kv_heads(k, v, dims) do
     %{batch: b, seq_len: t, n_kv_head: nkv, head_dim: hd, repeat: rep} = dims
-    k = k |> Nx.reshape({b, t, nkv, 1, hd}) |> Nx.broadcast({b, t, nkv, rep, hd}) |> Nx.reshape({b, t, nkv * rep, hd})
-    v = v |> Nx.reshape({b, t, nkv, 1, hd}) |> Nx.broadcast({b, t, nkv, rep, hd}) |> Nx.reshape({b, t, nkv * rep, hd})
+
+    k =
+      k
+      |> Nx.reshape({b, t, nkv, 1, hd})
+      |> Nx.broadcast({b, t, nkv, rep, hd})
+      |> Nx.reshape({b, t, nkv * rep, hd})
+
+    v =
+      v
+      |> Nx.reshape({b, t, nkv, 1, hd})
+      |> Nx.broadcast({b, t, nkv, rep, hd})
+      |> Nx.reshape({b, t, nkv * rep, hd})
+
     {k, v}
   end
 
@@ -237,7 +276,10 @@ defmodule ExNanoGPT.V2.Model do
     causal = Nx.greater_equal(rows, cols)
     window = Nx.greater(cols, Nx.subtract(rows, window_size))
     mask = Nx.logical_and(causal, window)
-    mask = Nx.broadcast(Nx.reshape(mask, {1, 1, seq_len, seq_len}), {batch, n_head, seq_len, seq_len})
+
+    mask =
+      Nx.broadcast(Nx.reshape(mask, {1, 1, seq_len, seq_len}), {batch, n_head, seq_len, seq_len})
+
     neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), {batch, n_head, seq_len, seq_len})
     Nx.select(mask, scores, neg_inf)
   end
@@ -274,6 +316,7 @@ defmodule ExNanoGPT.V2.Model do
       case ve do
         :none ->
           Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch, seq_len, n_kv_head, head_dim})
+
         ve_tensor ->
           compute_v_extra(x_normed, idx, ve_tensor, block_params.ve_gate, n_kv_head, head_dim)
       end
@@ -311,7 +354,10 @@ defmodule ExNanoGPT.V2.Model do
         ws = Enum.at(window_sizes, i)
 
         block_forward(x, block_params, ve, idx, cos, sin,
-          n_head: nh, n_kv_head: nkv, window_size: ws)
+          n_head: nh,
+          n_kv_head: nkv,
+          window_size: ws
+        )
       end)
 
     x = rms_norm(x)
@@ -362,10 +408,21 @@ defmodule ExNanoGPT.V2.Model do
         ve = elem(params.value_embeds, i)
         ws = Enum.at(window_sizes, i)
 
-        {x, cache} = block_forward_cached(
-          x, block_params, ve, idx, cos, sin, cache, i,
-          n_head: nh, n_kv_head: nkv, window_size: ws
-        )
+        {x, cache} =
+          block_forward_cached(
+            x,
+            block_params,
+            ve,
+            idx,
+            cos,
+            sin,
+            cache,
+            i,
+            n_head: nh,
+            n_kv_head: nkv,
+            window_size: ws
+          )
+
         {x, cache}
       end)
 
@@ -388,13 +445,23 @@ defmodule ExNanoGPT.V2.Model do
       case ve do
         :none ->
           Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch, seq_len, n_kv_head, head_dim})
+
         ve_tensor ->
           compute_v_extra(x_normed, idx, ve_tensor, block_params.ve_gate, n_kv_head, head_dim)
       end
 
-    {attn_out, cache} = attention_forward_cached(
-      x_normed, block_params, v_extra, cos, sin, cache, layer_idx, opts
-    )
+    {attn_out, cache} =
+      attention_forward_cached(
+        x_normed,
+        block_params,
+        v_extra,
+        cos,
+        sin,
+        cache,
+        layer_idx,
+        opts
+      )
+
     x = Nx.add(x, attn_out)
     mlp_out = mlp_forward(rms_norm(x), block_params)
     {Nx.add(x, mlp_out), cache}
@@ -409,8 +476,12 @@ defmodule ExNanoGPT.V2.Model do
 
     # Project new tokens
     q = Nx.dot(x, [-1], block_params.c_q, [0]) |> Nx.reshape({batch, new_t, n_head, head_dim})
-    k_new = Nx.dot(x, [-1], block_params.c_k, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
-    v_new = Nx.dot(x, [-1], block_params.c_v, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
+
+    k_new =
+      Nx.dot(x, [-1], block_params.c_k, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
+
+    v_new =
+      Nx.dot(x, [-1], block_params.c_v, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
 
     v_new = Nx.add(v_new, v_extra)
 
@@ -432,24 +503,69 @@ defmodule ExNanoGPT.V2.Model do
 
     # GQA expand K/V
     repeat = div(n_head, n_kv_head)
+
     if repeat > 1 do
-      k_full = k_full |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
-               |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
-               |> Nx.reshape({batch, total_len, n_head, head_dim})
-      v_full = v_full |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
-               |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
-               |> Nx.reshape({batch, total_len, n_head, head_dim})
-      do_cached_attention(q, k_full, v_full, block_params.c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache)
+      k_full =
+        k_full
+        |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
+        |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
+        |> Nx.reshape({batch, total_len, n_head, head_dim})
+
+      v_full =
+        v_full
+        |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
+        |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
+        |> Nx.reshape({batch, total_len, n_head, head_dim})
+
+      do_cached_attention(
+        q,
+        k_full,
+        v_full,
+        block_params.c_proj,
+        batch,
+        new_t,
+        n_head,
+        head_dim,
+        total_len,
+        window_size,
+        cache
+      )
     else
-      do_cached_attention(q, k_full, v_full, block_params.c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache)
+      do_cached_attention(
+        q,
+        k_full,
+        v_full,
+        block_params.c_proj,
+        batch,
+        new_t,
+        n_head,
+        head_dim,
+        total_len,
+        window_size,
+        cache
+      )
     end
   end
 
-  defp do_cached_attention(q, k, v, c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache) do
+  defp do_cached_attention(
+         q,
+         k,
+         v,
+         c_proj,
+         batch,
+         new_t,
+         n_head,
+         head_dim,
+         total_len,
+         window_size,
+         cache
+       ) do
     # q: (B, new_t, H, D), k/v: (B, total_len, H, D)
     # Transpose to (B, H, *, D)
-    q = Nx.transpose(q, axes: [0, 2, 1, 3])  # (B, H, new_t, D)
-    k = Nx.transpose(k, axes: [0, 2, 1, 3])  # (B, H, total_len, D)
+    # (B, H, new_t, D)
+    q = Nx.transpose(q, axes: [0, 2, 1, 3])
+    # (B, H, total_len, D)
+    k = Nx.transpose(k, axes: [0, 2, 1, 3])
     v = Nx.transpose(v, axes: [0, 2, 1, 3])
 
     scale = 1.0 / :math.sqrt(head_dim)
@@ -469,8 +585,10 @@ defmodule ExNanoGPT.V2.Model do
     scores = Nx.select(mask, scores, neg_inf)
 
     attn = stable_softmax(scores)
-    y = Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])  # (B, H, new_t, D)
-    y = Nx.transpose(y, axes: [0, 2, 1, 3])  # (B, new_t, H, D)
+    # (B, H, new_t, D)
+    y = Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])
+    # (B, new_t, H, D)
+    y = Nx.transpose(y, axes: [0, 2, 1, 3])
     y = Nx.reshape(y, {batch, new_t, n_head * head_dim})
     output = Nx.dot(y, [-1], c_proj, [0])
     {output, cache}
@@ -519,12 +637,15 @@ defmodule ExNanoGPT.V2.Model do
   defp count_tensor_params(%Nx.Tensor{} = t) do
     t |> Nx.shape() |> Tuple.to_list() |> Enum.product()
   end
+
   defp count_tensor_params(map) when is_map(map) do
     map |> Map.values() |> Enum.map(&count_tensor_params/1) |> Enum.sum()
   end
+
   defp count_tensor_params(tuple) when is_tuple(tuple) do
     tuple |> Tuple.to_list() |> Enum.map(&count_tensor_params/1) |> Enum.sum()
   end
+
   defp count_tensor_params(nil), do: 0
   defp count_tensor_params(_), do: 0
 end

@@ -47,7 +47,11 @@ defmodule ExNanoGPT.Trainer do
   Run the full training loop.
   """
   @spec train(Model.config(), train_config(), Optimizer.config()) :: Model.params()
-  def train(model_config, train_config \\ @default_train_config, optim_config \\ Optimizer.default_config()) do
+  def train(
+        model_config,
+        train_config \\ @default_train_config,
+        optim_config \\ Optimizer.default_config()
+      ) do
     File.mkdir_p!(train_config.out_dir)
 
     IO.puts("Loading data...")
@@ -64,27 +68,46 @@ defmodule ExNanoGPT.Trainer do
 
     IO.puts("Training for #{train_config.max_iters} iterations...")
     IO.puts("  gradient accumulation steps: #{train_config.gradient_accumulation_steps}")
-    IO.puts("  effective batch size: #{train_config.batch_size * train_config.gradient_accumulation_steps}")
+
+    IO.puts(
+      "  effective batch size: #{train_config.batch_size * train_config.gradient_accumulation_steps}"
+    )
 
     best_val_loss = :infinity
 
     # nanoGPT: while True ... if iter_num > max_iters: break
     # iter_num goes 0..max_iters inclusive = max_iters+1 steps
     {final_params, _final_opt_state, _best_val_loss} =
-      Enum.reduce(0..train_config.max_iters, {params, opt_state, best_val_loss}, fn iter, {params, opt_state, best_val_loss} ->
+      Enum.reduce(0..train_config.max_iters, {params, opt_state, best_val_loss}, fn iter,
+                                                                                    {params,
+                                                                                     opt_state,
+                                                                                     best_val_loss} ->
         # Evaluate and checkpoint
         {best_val_loss} =
           if rem(iter, train_config.eval_interval) == 0 do
             train_loss = estimate_loss(params, model_config, train_data, train_config)
             val_loss = estimate_loss(params, model_config, val_data, train_config)
-            IO.puts("step #{iter}: train loss #{Float.round(train_loss, 4)}, val loss #{Float.round(val_loss, 4)}")
+
+            IO.puts(
+              "step #{iter}: train loss #{Float.round(train_loss, 4)}, val loss #{Float.round(val_loss, 4)}"
+            )
 
             if val_loss < best_val_loss or train_config.always_save_checkpoint do
               new_best = min(val_loss, best_val_loss)
+
               if iter > 0 do
-                save_checkpoint(params, opt_state, model_config, iter, best_val_loss, train_config.out_dir)
+                save_checkpoint(
+                  params,
+                  opt_state,
+                  model_config,
+                  iter,
+                  best_val_loss,
+                  train_config.out_dir
+                )
+
                 IO.puts("saving checkpoint to #{train_config.out_dir}")
               end
+
               {new_best}
             else
               {best_val_loss}
@@ -118,7 +141,13 @@ defmodule ExNanoGPT.Trainer do
   before backward, matching nanoGPT). Returns the averaged gradients
   and the last micro-step's (scaled) loss for logging.
   """
-  @spec accumulate_gradients(Model.params(), Nx.Tensor.t(), Model.config(), train_config(), non_neg_integer()) ::
+  @spec accumulate_gradients(
+          Model.params(),
+          Nx.Tensor.t(),
+          Model.config(),
+          train_config(),
+          non_neg_integer()
+        ) ::
           {map(), Nx.Tensor.t()}
   def accumulate_gradients(params, data, model_config, train_config, iter) do
     accum_steps = train_config.gradient_accumulation_steps
@@ -127,10 +156,12 @@ defmodule ExNanoGPT.Trainer do
       Enum.reduce(0..(accum_steps - 1), {nil, nil}, fn micro_step, {acc_grads, _last_loss} ->
         seed = iter * accum_steps + micro_step
         batch_key = Nx.Random.key(seed)
-        {x, y} = Batch.get_batch(data, batch_key,
-          batch_size: train_config.batch_size,
-          block_size: train_config.block_size
-        )
+
+        {x, y} =
+          Batch.get_batch(data, batch_key,
+            batch_size: train_config.batch_size,
+            block_size: train_config.block_size
+          )
 
         dropout_key = Nx.Random.key(seed + 1_000_000)
         {loss, grads} = compute_loss_and_grads(params, x, y, model_config, dropout_key)
@@ -165,7 +196,13 @@ defmodule ExNanoGPT.Trainer do
   together by `value_and_grad` (avoids EXLA/Expr backend conflicts from
   closure captures). Gradients for non-params tensors are discarded.
   """
-  @spec compute_loss_and_grads(Model.params(), Nx.Tensor.t(), Nx.Tensor.t(), Model.config(), Nx.Tensor.t()) ::
+  @spec compute_loss_and_grads(
+          Model.params(),
+          Nx.Tensor.t(),
+          Nx.Tensor.t(),
+          Model.config(),
+          Nx.Tensor.t()
+        ) ::
           {Nx.Tensor.t(), map()}
   def compute_loss_and_grads(params, x, y, model_config, key) do
     n_head = model_config.n_head
@@ -190,13 +227,19 @@ defmodule ExNanoGPT.Trainer do
     losses =
       for i <- 0..(train_config.eval_iters - 1) do
         batch_key = Nx.Random.key(i + 50_000)
-        {x, y} = Batch.get_batch(data, batch_key,
-          batch_size: train_config.batch_size,
-          block_size: train_config.block_size
-        )
 
-        logits = Model.forward_train(x, params, Nx.Random.key(0),
-          n_head: model_config.n_head, dropout_rate: 0.0)
+        {x, y} =
+          Batch.get_batch(data, batch_key,
+            batch_size: train_config.batch_size,
+            block_size: train_config.block_size
+          )
+
+        logits =
+          Model.forward_train(x, params, Nx.Random.key(0),
+            n_head: model_config.n_head,
+            dropout_rate: 0.0
+          )
+
         loss = Model.cross_entropy_loss(logits, y)
         Nx.to_number(loss)
       end
@@ -207,7 +250,14 @@ defmodule ExNanoGPT.Trainer do
   @doc """
   Save a checkpoint to disk as Erlang Term Format.
   """
-  @spec save_checkpoint(Model.params(), term(), Model.config(), non_neg_integer(), float(), String.t()) :: :ok
+  @spec save_checkpoint(
+          Model.params(),
+          term(),
+          Model.config(),
+          non_neg_integer(),
+          float(),
+          String.t()
+        ) :: :ok
   def save_checkpoint(params, opt_state, model_config, iter, best_val_loss, out_dir) do
     checkpoint = %{
       params: params,

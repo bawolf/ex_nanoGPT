@@ -87,7 +87,8 @@ defmodule ExNanoGPT.Optimizer do
   """
   @spec get_lr(non_neg_integer(), config()) :: float()
   def get_lr(iter, config) do
-    %{learning_rate: lr, warmup_iters: warmup, lr_decay_iters: decay_iters, min_lr: min_lr} = config
+    %{learning_rate: lr, warmup_iters: warmup, lr_decay_iters: decay_iters, min_lr: min_lr} =
+      config
 
     cond do
       iter < warmup ->
@@ -195,7 +196,8 @@ defmodule ExNanoGPT.Optimizer do
     {new_param, %{m: new_m, v: new_v}}
   end
 
-  defp adamw_update(params, grads, state, lr, t, config) when is_map(params) and not is_struct(params) do
+  defp adamw_update(params, grads, state, lr, t, config)
+       when is_map(params) and not is_struct(params) do
     {new_params_list, new_state_list} =
       params
       |> Map.keys()
@@ -233,7 +235,10 @@ defmodule ExNanoGPT.Optimizer do
   end
 
   defp sum_of_squares(tuple) when is_tuple(tuple) do
-    tuple |> Tuple.to_list() |> Enum.map(&sum_of_squares/1) |> Enum.reduce(Nx.tensor(0.0), &Nx.add/2)
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&sum_of_squares/1)
+    |> Enum.reduce(Nx.tensor(0.0), &Nx.add/2)
   end
 
   defp scale_grads(%Nx.Tensor{} = t, scale) do

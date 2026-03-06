@@ -61,10 +61,12 @@ defmodule ExNanoGPT.V2.Tokenizer do
 
     # Special tokens get IDs after the last merge token
     special_start = next_id
+
     special_map =
       @special_tokens
       |> Enum.with_index(special_start)
       |> Map.new(fn {name, id} -> {name, id} end)
+
     special_map_inv = Map.new(special_map, fn {k, v} -> {v, k} end)
 
     %__MODULE__{
@@ -79,6 +81,7 @@ defmodule ExNanoGPT.V2.Tokenizer do
 
   defp count_pairs([_]), do: %{}
   defp count_pairs([]), do: %{}
+
   defp count_pairs(ids) do
     ids
     |> Enum.chunk_every(2, 1, :discard)
@@ -93,15 +96,18 @@ defmodule ExNanoGPT.V2.Tokenizer do
 
   defp do_merge([], _p1, _p2, _new_id, acc), do: Enum.reverse(acc)
   defp do_merge([a], _p1, _p2, _new_id, acc), do: Enum.reverse([a | acc])
+
   defp do_merge([a, b | rest], p1, p2, new_id, acc) when a == p1 and b == p2 do
     do_merge(rest, p1, p2, new_id, [new_id | acc])
   end
+
   defp do_merge([a | rest], p1, p2, new_id, acc) do
     do_merge(rest, p1, p2, new_id, [a | acc])
   end
 
   defp build_vocab(merges, _next_id) do
     base = for i <- 0..255, into: %{}, do: {[i], i}
+
     merges
     |> Enum.reduce(base, fn {{a, b}, id}, vocab ->
       bytes_a = find_bytes(vocab, a)
@@ -142,6 +148,7 @@ defmodule ExNanoGPT.V2.Tokenizer do
   end
 
   defp apply_merges(ids, []), do: ids
+
   defp apply_merges(ids, [{pair, new_id} | rest]) do
     {p1, p2} = pair
     ids = merge_pair(ids, {p1, p2}, new_id)
@@ -159,10 +166,13 @@ defmodule ExNanoGPT.V2.Tokenizer do
       cond do
         Map.has_key?(tok.special_map_inv, id) ->
           tok.special_map_inv[id] |> :binary.bin_to_list()
+
         Map.has_key?(tok.vocab_inv, id) ->
           tok.vocab_inv[id]
+
         id < 256 ->
           [id]
+
         true ->
           []
       end
@@ -181,6 +191,7 @@ defmodule ExNanoGPT.V2.Tokenizer do
       special_tokens: @special_tokens,
       vocab_size: tok.vocab_size
     }
+
     File.write!(path, :erlang.term_to_binary(data))
   end
 
@@ -189,21 +200,24 @@ defmodule ExNanoGPT.V2.Tokenizer do
     data = path |> File.read!() |> :erlang.binary_to_term()
     merges = data.merges
 
-    next_id = if merges == [] do
-      256
-    else
-      {_pair, last_id} = List.last(merges)
-      last_id + 1
-    end
+    next_id =
+      if merges == [] do
+        256
+      else
+        {_pair, last_id} = List.last(merges)
+        last_id + 1
+      end
 
     vocab = build_vocab(merges, next_id)
     vocab_inv = Map.new(vocab, fn {k, v} -> {v, k} end)
 
     special_start = next_id
+
     special_map =
       data.special_tokens
       |> Enum.with_index(special_start)
       |> Map.new(fn {name, id} -> {name, id} end)
+
     special_map_inv = Map.new(special_map, fn {k, v} -> {v, k} end)
 
     %__MODULE__{

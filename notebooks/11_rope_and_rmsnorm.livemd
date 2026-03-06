@@ -282,6 +282,27 @@ IO.puts("Slow channels barely change — they encode long-range structure.")
 
 For each position, multiply the position index by each inverse frequency to get rotation angles.
 
+### Nx Mini-Lesson: Nx.new_axis (Adding Dimensions for Broadcasting)
+
+To multiply every position by every frequency, we need broadcasting. But `positions` has shape `{32}` and `inv_freq` has shape `{4}` -- they can't broadcast directly (32 ≠ 4). We need to add dimensions so they become `{32, 1}` and `{1, 4}`:
+
+```elixir
+# Nx.new_axis inserts a size-1 dimension at position n
+row = Nx.tensor([1.0, 2.0, 3.0])
+IO.inspect(Nx.shape(row), label: "original: {3}")
+
+col = Nx.new_axis(row, 1)
+IO.inspect(Nx.shape(col), label: "new_axis(row, 1): {3, 1}")
+
+expanded = Nx.new_axis(row, 0)
+IO.inspect(Nx.shape(expanded), label: "new_axis(row, 0): {1, 3}")
+
+# Now {3, 1} * {1, 3} broadcasts to {3, 3} — an outer product!
+IO.inspect(Nx.multiply(col, expanded), label: "outer product via broadcasting")
+```
+
+In Elixir, you'd write `for pos <- positions, freq <- freqs, do: pos * freq`. In Nx, you reshape and let broadcasting do the nested loop on the GPU.
+
 ```elixir
 seq_len = 32
 positions = Nx.iota({seq_len}, type: :f32)
@@ -321,14 +342,14 @@ Vl.new(width: 300, height: 250, title: "RoPE Cosine Values: Fast Channels (left)
 
 ### Step 3: The Rotation
 
-RoPE splits each head vector into first-half and second-half dimensions, then applies a 2D rotation to each pair:
+RoPE splits each head vector into first-half (x₁) and second-half (x₂) dimensions, then applies a rotation to each pair:
 
 ```
-y₁ = x₁ · cos(θ) - x₂ · sin(θ)
-y₂ = x₁ · sin(θ) + x₂ · cos(θ)
+y₁ =  x₁ · cos(θ) + x₂ · sin(θ)
+y₂ = -x₁ · sin(θ) + x₂ · cos(θ)
 ```
 
-Wait — that's just matrix multiplication by a rotation matrix! Each embedding pair gets rotated by an angle that depends on position and channel.
+This is a rotation matrix applied to each (x₁, x₂) pair. The key property: when you dot-product two rotated vectors, the result depends only on the *difference* in rotation angles — giving us relative position encoding for free.
 
 ### Visualize: Watch a Point Rotate
 
@@ -342,8 +363,8 @@ theta_base = Nx.to_number(inv_freq[0])
 rotation_data =
   for pos <- 0..15 do
     theta = pos * theta_base
-    y1 = x1 * :math.cos(theta) - x2 * :math.sin(theta)
-    y2 = x1 * :math.sin(theta) + x2 * :math.cos(theta)
+    y1 = x1 * :math.cos(theta) + x2 * :math.sin(theta)
+    y2 = -x1 * :math.sin(theta) + x2 * :math.cos(theta)
     %{"x" => Float.round(y1, 4), "y" => Float.round(y2, 4), "position" => pos}
   end
 
@@ -390,6 +411,25 @@ Vl.new(width: 350, height: 350, title: "Position #{pos}: angle = #{Float.round(p
 
 ### Exercise: Implement apply_rope
 
+### Nx Mini-Lesson: slice_along_axis and concatenate
+
+`Nx.slice_along_axis` extracts a range from a specific dimension -- like `Enum.slice` but for any axis of a tensor:
+
+```elixir
+t = Nx.iota({3, 8})
+IO.inspect(t, label: "original {3, 8}")
+
+first_half = Nx.slice_along_axis(t, 0, 4, axis: 1)
+second_half = Nx.slice_along_axis(t, 4, 4, axis: 1)
+IO.inspect(first_half, label: "first 4 cols")
+IO.inspect(second_half, label: "last 4 cols")
+
+# Nx.concatenate is the inverse — joins tensors along an axis (like ++ for lists)
+IO.inspect(Nx.concatenate([first_half, second_half], axis: 1), label: "rejoined (should match original)")
+```
+
+RoPE splits each head vector into first-half and second-half channels, applies different rotations to each, then concatenates them back.
+
 ```elixir
 apply_rope = fn x, cos, sin ->
   # x shape: {batch, seq_len, n_heads, head_dim}
@@ -398,8 +438,8 @@ apply_rope = fn x, cos, sin ->
   #
   # TODO:
   # 1. Split x into first half and second half along the last axis
-  # 2. y1 = x1 * cos - x2 * sin      (note: SUBTRACT for standard rotation)
-  # 3. y2 = x1 * sin + x2 * cos
+  # 2. y1 =  x1 * cos + x2 * sin
+  # 3. y2 = -x1 * sin + x2 * cos
   # 4. Concatenate y1 and y2 along the last axis
   #
   # Hint: Nx.slice_along_axis(x, start, length, axis: 3) to split

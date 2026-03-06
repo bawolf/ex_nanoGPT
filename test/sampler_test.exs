@@ -19,11 +19,13 @@ defmodule ExNanoGPT.SamplerTest do
 
     # Start with a sequence of length 3, generate 5 more tokens
     idx = Nx.tensor([[1, 5, 10]], type: :s32)
-    result = Sampler.generate(idx, params, @model_config, key,
-      max_new_tokens: 5,
-      temperature: 1.0,
-      top_k: nil
-    )
+
+    result =
+      Sampler.generate(idx, params, @model_config, key,
+        max_new_tokens: 5,
+        temperature: 1.0,
+        top_k: nil
+      )
 
     assert Nx.shape(result) == {1, 8}
     assert Nx.type(result) == {:s, 32}
@@ -38,11 +40,13 @@ defmodule ExNanoGPT.SamplerTest do
     params = Model.init_params(@model_config, key)
 
     idx = Nx.tensor([[1, 2, 3]], type: :s32)
-    result = Sampler.generate(idx, params, @model_config, key,
-      max_new_tokens: 10,
-      temperature: 1.0,
-      top_k: 5
-    )
+
+    result =
+      Sampler.generate(idx, params, @model_config, key,
+        max_new_tokens: 10,
+        temperature: 1.0,
+        top_k: 5
+      )
 
     assert Nx.shape(result) == {1, 13}
   end
@@ -53,10 +57,19 @@ defmodule ExNanoGPT.SamplerTest do
 
     idx = Nx.tensor([[1, 2]], type: :s32)
 
-    result1 = Sampler.generate(idx, params, @model_config, Nx.Random.key(100),
-      max_new_tokens: 5, temperature: 0.01, top_k: nil)
-    result2 = Sampler.generate(idx, params, @model_config, Nx.Random.key(200),
-      max_new_tokens: 5, temperature: 0.01, top_k: nil)
+    result1 =
+      Sampler.generate(idx, params, @model_config, Nx.Random.key(100),
+        max_new_tokens: 5,
+        temperature: 0.01,
+        top_k: nil
+      )
+
+    result2 =
+      Sampler.generate(idx, params, @model_config, Nx.Random.key(200),
+        max_new_tokens: 5,
+        temperature: 0.01,
+        top_k: nil
+      )
 
     # With very low temperature, both runs should produce the same (greedy) output
     assert Nx.equal(result1, result2) |> Nx.all() |> Nx.to_number() == 1
@@ -83,11 +96,13 @@ defmodule ExNanoGPT.SamplerTest do
 
     # Start with sequence longer than block_size
     idx = Nx.tensor([[1, 2, 3, 4, 5, 6]], type: :s32)
-    result = Sampler.generate(idx, params, config, key,
-      max_new_tokens: 3,
-      temperature: 1.0,
-      top_k: nil
-    )
+
+    result =
+      Sampler.generate(idx, params, config, key,
+        max_new_tokens: 3,
+        temperature: 1.0,
+        top_k: nil
+      )
 
     # Should have original 6 + 3 new = 9 tokens
     assert Nx.shape(result) == {1, 9}
@@ -99,10 +114,19 @@ defmodule ExNanoGPT.SamplerTest do
 
     idx = Nx.tensor([[1, 2, 3]], type: :s32)
 
-    result1 = Sampler.generate(idx, params, @model_config, Nx.Random.key(555),
-      max_new_tokens: 10, temperature: 0.8, top_k: 10)
-    result2 = Sampler.generate(idx, params, @model_config, Nx.Random.key(555),
-      max_new_tokens: 10, temperature: 0.8, top_k: 10)
+    result1 =
+      Sampler.generate(idx, params, @model_config, Nx.Random.key(555),
+        max_new_tokens: 10,
+        temperature: 0.8,
+        top_k: 10
+      )
+
+    result2 =
+      Sampler.generate(idx, params, @model_config, Nx.Random.key(555),
+        max_new_tokens: 10,
+        temperature: 0.8,
+        top_k: 10
+      )
 
     assert Nx.equal(result1, result2) |> Nx.all() |> Nx.to_number() == 1
   end

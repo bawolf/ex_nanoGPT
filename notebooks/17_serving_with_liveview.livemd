@@ -85,15 +85,9 @@ top_k = 40
 
 gen_key = Nx.Random.key(123)
 
-{generated_tokens, _cache, _key} =
-  Enum.reduce_while(1..max_new_tokens, {[], cache, gen_key}, fn _i, {tokens, c, k} ->
-    current_logits = if tokens == [], do: logits, else: elem(
-      Model.forward_cached(
-        Nx.tensor([[List.last(tokens)]], type: :s64), params, config, c
-      ), 0
-    )
-
-    flat = Nx.reshape(current_logits, {config.vocab_size})
+{generated_tokens, _cache, _key, _logits} =
+  Enum.reduce_while(1..max_new_tokens, {[], cache, gen_key, logits}, fn _i, {tokens, c, k, cur_logits} ->
+    flat = Nx.reshape(cur_logits, {config.vocab_size})
     scaled = Nx.divide(flat, temperature)
 
     {n} = Nx.shape(scaled)
@@ -115,11 +109,11 @@ gen_key = Nx.Random.key(123)
     {k_new, _} = Nx.Random.split(k) |> then(fn keys -> {keys[0], keys[1]} end)
 
     if token_id == ast_end do
-      {:halt, {tokens, c, k_new}}
+      {:halt, {tokens, c, k_new, cur_logits}}
     else
       token_tensor = Nx.tensor([[token_id]], type: :s64)
-      {_new_logits, c} = Model.forward_cached(token_tensor, params, config, c)
-      {:cont, {tokens ++ [token_id], c, k_new}}
+      {next_logits, c} = Model.forward_cached(token_tensor, params, config, c)
+      {:cont, {tokens ++ [token_id], c, k_new, next_logits}}
     end
   end)
 

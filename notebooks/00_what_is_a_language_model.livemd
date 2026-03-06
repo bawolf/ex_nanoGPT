@@ -122,7 +122,10 @@ itos = nil  # TODO: %{0 => ?a, 1 => ?b, ...}
 
 # Test it
 IO.inspect(Map.get(stoi, ?h), label: "h encodes to")
-IO.inspect(Map.get(itos, 0), label: "0 decodes to")
+Map.get(itos, 0)
+|> List.wrap()
+|> to_string()
+|> IO.inspect(label: "0 decodes to")
 ```
 
 <details>
@@ -150,7 +153,7 @@ end
 
 # Test
 encoded = encode.("hello")
-IO.inspect(encoded, label: "encoded 'hello'")
+IO.inspect(encoded, label: "encoded 'hello'", charlists: :as_lists)
 decoded = decode.(encoded)
 IO.inspect(decoded, label: "decoded back")
 ```
@@ -172,10 +175,46 @@ end
 
 ## From Text to Tensors
 
-Neural networks work with tensors (multi-dimensional arrays of numbers), not lists. Let's convert our encoded text into an Nx tensor.
+Neural networks work with **tensors**, not Elixir lists. Before we convert our text, let's understand what a tensor is.
+
+### Nx Mini-Lesson: Tensors vs Lists
+
+In Elixir, you work with lists: `[1, 2, 3]`. In Nx, the equivalent is a **tensor** -- a typed, fixed-shape array that can live on a GPU.
+
+```elixir
+# An Elixir list -- flexible, mixed types, lives in process memory
+list = [1, 2, 3, 4, 5]
+IO.inspect(list, label: "Elixir list")
+IO.inspect(length(list), label: "length")
+
+# An Nx tensor -- typed, fixed shape, can live on GPU
+tensor = Nx.tensor([1, 2, 3, 4, 5])
+IO.inspect(tensor, label: "Nx tensor")
+IO.inspect(Nx.shape(tensor), label: "shape (like length, but returns a tuple)")
+IO.inspect(Nx.type(tensor), label: "type (every element has the same type)")
+```
+
+Three key differences from lists:
+
+1. **Type is uniform.** Every element has the same numeric type: `:s32` (signed 32-bit integer), `:f32` (32-bit float), etc. You choose it with `type:`.
+2. **Shape replaces length.** `Nx.shape/1` returns a tuple like `{5}` for 1D, `{3, 4}` for 2D (3 rows, 4 columns).
+3. **Values are tensors, not numbers.** `tensor[0]` returns a 0-dimensional *tensor*, not an Elixir integer. Use `Nx.to_number/1` or `Nx.to_flat_list/1` to escape back to Elixir.
+
+```elixir
+t = Nx.tensor([10, 20, 30])
+
+IO.inspect(t[0], label: "t[0] — still a tensor!")
+IO.inspect(Nx.to_number(t[0]), label: "Nx.to_number — an Elixir integer")
+IO.inspect(Nx.to_flat_list(t), label: "Nx.to_flat_list — an Elixir list")
+```
+
+Why tensors instead of lists? GPUs process millions of numbers in parallel, but only if they're all the same type in a contiguous block of memory. Elixir lists are linked nodes scattered in memory -- GPUs can't touch them.
+
+Now let's convert our encoded text into a tensor:
 
 ```elixir
 # Encode the full text and convert to a tensor
+# type: :s32 means "signed 32-bit integer" — our token IDs are integers
 data = encode.(text) |> Nx.tensor(type: :s32)
 IO.inspect(Nx.shape(data), label: "data shape")
 IO.inspect(data[0..9], label: "first 10 tokens")
@@ -214,14 +253,14 @@ block_size = 8  # context length: how many characters the model sees at once
 x = train_data[0..block_size-1]
 y = train_data[1..block_size]
 
-IO.puts("Input:  #{inspect(Nx.to_flat_list(x))}")
-IO.puts("Target: #{inspect(Nx.to_flat_list(y))}")
+IO.puts("Input:  #{inspect(Nx.to_flat_list(x))} = `#{decode.(Nx.to_flat_list(x))}`")
+IO.puts("Target:  #{inspect(Nx.to_flat_list(y))} = `#{decode.(Nx.to_flat_list(y))}`")
 IO.puts("")
 
 for i <- 0..(block_size - 1) do
   context = Nx.to_flat_list(x[0..i])
   target = Nx.to_number(y[i])
-  IO.puts("when context is #{inspect(context)} → target is #{target} ('#{decode.([target])}')")
+  IO.puts("when context is #{inspect(context)} or `#{decode.(context)}` → target is #{target} ('#{decode.([target])}')")
 end
 ```
 
@@ -231,32 +270,63 @@ We don't train on one sequence at a time -- we train on **batches** of sequences
 
 ### Exercise: Build a Batch
 
-Write a function that, given the data tensor and a PRNG key, generates a random batch of input/target pairs.
+Write a function that, given the data tensor and a PRNG key, generates a random batch of input/target pairs. We'll build this up one piece at a time.
+
+**Step 1: Pick random start positions**
+
+> **Nx Bridge**: In Elixir, you'd pick random numbers with `Enum.map(1..n, fn _ -> :rand.uniform(max) end)`.
+> In Nx, we write `{starts, _key} = Nx.Random.randint(key, 0, max, shape: {n})`.
+> This returns a **tensor** of `n` random integers AND a new PRNG key. Nx uses functional PRNG -- you pass a key in and get a new one out, so results are always reproducible. (Why? GPU code can't use hidden process state like `:rand` does -- explicit keys make randomness deterministic and parallelizable.)
 
 ```elixir
 batch_size = 4
 block_size = 8
 
-get_batch = fn data, key ->
-  data_len = Nx.axis_size(data, 0)
-  max_start = data_len - block_size
-  # TODO:
-  # 1. Generate `batch_size` random start indices in [0, max_start)
-  # 2. For each start index, slice out block_size tokens for x
-  # 3. For each start index, slice out block_size tokens starting at start+1 for y
-  # 4. Stack into {batch_size, block_size} tensors
-  # Return {x, y}
-  {nil, nil}
-end
+data_len = Nx.axis_size(train_data, 0)
+max_start = data_len - block_size
 
 key = Nx.Random.key(42)
-{x, y} = get_batch.(train_data, key)
-IO.inspect(Nx.shape(x), label: "x shape")
-IO.inspect(Nx.shape(y), label: "y shape")
+{starts, _new_key} = Nx.Random.randint(key, 0, max_start, shape: {batch_size})
+IO.inspect(starts, label: "4 random start positions")
 ```
 
-<details>
-<summary>Solution</summary>
+**Step 2: Slice one sequence from the data**
+
+> **Nx Bridge**: `Nx.slice(tensor, [start], [length])` extracts a contiguous chunk -- like `Enum.slice(list, start, length)`. One wrinkle: `starts[i]` returns a 0-dimensional *tensor* (not a plain integer), but that's fine -- `Nx.slice` accepts tensors as start positions.
+
+```elixir
+# Grab one sequence starting at starts[0]
+x_one = Nx.slice(train_data, [starts[0]], [block_size])
+y_one = Nx.slice(train_data, [Nx.add(starts[0], 1)], [block_size])
+
+IO.inspect(Nx.to_flat_list(x_one), label: "x (input)")
+IO.inspect(Nx.to_flat_list(y_one), label: "y (target, shifted by 1)")
+```
+
+**Step 3: Do it for all batch_size sequences**
+
+```elixir
+# Same thing, but for each of the 4 start positions
+x_rows = for i <- 0..(batch_size - 1), do: Nx.slice(train_data, [starts[i]], [block_size])
+y_rows = for i <- 0..(batch_size - 1), do: Nx.slice(train_data, [Nx.add(starts[i], 1)], [block_size])
+
+IO.inspect(length(x_rows), label: "number of rows")
+IO.inspect(Nx.shape(hd(x_rows)), label: "shape of each row")
+```
+
+**Step 4: Stack rows into a single batch tensor**
+
+> **Nx Bridge**: `Nx.stack(list_of_tensors)` combines a list of same-shaped tensors into one tensor with a new leading dimension. Four `{8}` tensors become one `{4, 8}` tensor -- like building a 2D grid from rows.
+
+```elixir
+x = Nx.stack(x_rows)
+y = Nx.stack(y_rows)
+
+IO.inspect(Nx.shape(x), label: "x batch shape")
+IO.inspect(Nx.shape(y), label: "y batch shape")
+```
+
+**Putting it together**: Now wrap steps 1-4 into a reusable function.
 
 ```elixir
 get_batch = fn data, key ->
@@ -269,9 +339,12 @@ get_batch = fn data, key ->
 
   {Nx.stack(x_rows), Nx.stack(y_rows)}
 end
-```
 
-</details>
+key = Nx.Random.key(42)
+{x, y} = get_batch.(train_data, key)
+IO.inspect(Nx.shape(x), label: "x shape")
+IO.inspect(Nx.shape(y), label: "y shape")
+```
 
 ## Break It: What If Batches Aren't Random?
 

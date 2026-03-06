@@ -115,6 +115,7 @@ defmodule ExNanoGPT.V2.Conversation do
     |> Stream.reject(&(&1 == ""))
     |> Enum.map(fn line ->
       data = Jason.decode!(line)
+
       data["conversations"]
       |> Enum.map(fn turn ->
         %{role: turn["role"], content: turn["content"]}

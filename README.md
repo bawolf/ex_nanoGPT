@@ -12,7 +12,9 @@ Every matrix multiply, every attention head, every gradient update is explicit N
 
 ## Learn by Building
 
-This repo includes **18 interactive Livebook notebooks** where you rebuild each component yourself, with exercises, visualizations, "Break It" experiments, and verification against the reference implementation.
+This repo includes **17 interactive Livebook notebooks** where you rebuild each component yourself, with exercises, visualizations, "Break It" experiments, and verification against the reference implementation.
+
+**New to Nx?** No problem -- every notebook teaches Nx concepts inline as they come up, translating Nx patterns into familiar Elixir idioms. See the [Elixir → Nx cheat sheet](#elixir--nx-cheat-sheet) below for a quick reference.
 
 **Part 1: nanoGPT (v1) -- Character-level GPT**
 
@@ -101,7 +103,7 @@ lib/ex_nano_gpt_web/   # Phoenix LiveView chat UI
   layouts.ex           # HTML root layout
   live/chat_live.ex    # Chat interface with streaming generation
 
-notebooks/             # 18 interactive Livebook lessons (11 v1 + 7 v2)
+notebooks/             # 17 interactive Livebook lessons (10 v1 + 7 v2)
 scripts/
   train.exs            # v1 training script
   cloud_train.exs      # v2 cloud training with cost estimates
@@ -239,6 +241,24 @@ Even with EMLX GPU, ~55s/step means ~3 days for the full 5000 iterations. This i
 **Workarounds:**
 - **Rent a GPU** -- A T4 on Vast.ai (~$0.10/hr) trains the full model in minutes with EXLA + CUDA.
 - **Run the smoke test** -- `mix run scripts/train.exs --smoke` trains a tiny model in 5 seconds, enough to verify everything works.
+
+## Elixir → Nx Cheat Sheet
+
+| Elixir | Nx | Notes |
+|--------|----|-------|
+| `[1, 2, 3]` | `Nx.tensor([1, 2, 3])` | Fixed type, GPU-ready |
+| `length(list)` | `Nx.shape(tensor)` | Returns a tuple like `{5}` |
+| `Enum.at(list, i)` | `tensor[i]` | Returns a tensor, not a value |
+| `Enum.slice(list, a..b)` | `tensor[a..b]` | Range indexing |
+| `hd(list)` | `Nx.to_number(t[0])` | Convert to Elixir value |
+| `Enum.map(list, &f/1)` | `Nx.multiply(tensor, 2)` | Vectorized, no map needed |
+| `Enum.sum(list)` | `Nx.sum(tensor)` | Or `Nx.sum(t, axes: [0])` |
+| `Enum.zip_reduce(a, b, ...)` | `Nx.dot(a, b)` | Matrix multiply |
+| `:rand.uniform()` | `Nx.Random.uniform(key, ...)` | Functional, returns `{tensor, key}` |
+| `Enum.map(ids, &table[&1])` | `Nx.take(table, ids, axis: 0)` | Parallel gather |
+| `if cond, do: a, else: b` | `Nx.select(cond, a, b)` | Element-wise conditional |
+| `List.replace_at(l, i, v)` | `Nx.put_slice(t, starts, v)` | Immutable update |
+| `def f(x), do: ...` | `defn f(x), do: ...` | JIT-compiled for GPU |
 
 ## Acknowledgements
 

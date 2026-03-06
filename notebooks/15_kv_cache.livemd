@@ -32,6 +32,24 @@ params = Model.init_params(config, key)
 
 prompt = [1, 50, 100, 200, 42]
 
+### Nx Mini-Lesson: Multi-Axis Access Syntax
+
+Nx lets you index into multiple dimensions at once with `tensor[[axis0, axis1, ...]]`:
+
+```elixir
+t = Nx.iota({2, 4, 3})
+IO.inspect(Nx.shape(t), label: "shape: {2 batches, 4 positions, 3 features}")
+
+# Single element from each axis
+IO.inspect(t[[0, 2, 1]], label: "batch 0, position 2, feature 1")
+
+# -1 means last, .. means all
+IO.inspect(t[[0, -1, ..]], label: "batch 0, last position, ALL features")
+IO.inspect(t[[1, 0, ..]], label: "batch 1, first position, ALL features")
+```
+
+We use `logits[[0, -1, ..]]` to grab the logits for the last token in batch 0 -- that's the prediction for the next token.
+
 step_times =
   Enum.reduce(1..15, {prompt, []}, fn step, {seq, times} ->
     {time_us, logits} = :timer.tc(fn ->
@@ -97,6 +115,28 @@ At 100 tokens, the non-cached approach does roughly **50x** more work. The gap o
 
 The cache is a simple data structure: pre-allocated tensors for K and V at each layer, plus a position counter.
 
+### Nx Mini-Lesson: Nx.put_slice (Writing Into a Tensor)
+
+The KV cache is a pre-allocated block of zeros. As we generate tokens, we write each new K/V into the next slot. `Nx.put_slice` does this -- it writes a smaller tensor into a region of a larger one:
+
+```elixir
+# Pre-allocate a 3x5 block of zeros
+cache = Nx.broadcast(0.0, {3, 5})
+IO.inspect(cache, label: "empty cache")
+
+# Write a 3x2 patch starting at column 2
+patch = Nx.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+updated = Nx.put_slice(cache, [0, 2], patch)
+IO.inspect(updated, label: "after writing at position [0, 2]")
+
+# Write another patch at column 0
+patch2 = Nx.tensor([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+updated2 = Nx.put_slice(updated, [0, 0], patch2)
+IO.inspect(updated2, label: "after writing at position [0, 0]")
+```
+
+Nx is immutable -- `put_slice` returns a NEW tensor (the original is unchanged). Think of it like `List.replace_at` but for multi-dimensional regions.
+
 ```elixir
 defmodule SimpleKVCache do
   defstruct [:k_cache, :v_cache, :pos, :max_seq, :n_layers]
@@ -115,6 +155,11 @@ defmodule SimpleKVCache do
     # TODO:
     # 1. k = elem(cache.k_cache, layer_idx)
     # 2. k = Nx.put_slice(k, [0, cache.pos, 0, 0], new_k)
+    #    ↑ Nx Bridge: Nx.put_slice(tensor, start_indices, slice) writes `slice`
+    #      into `tensor` at the given start position. It returns a NEW tensor
+    #      (Nx is immutable). Think of it like List.replace_at but for
+    #      multi-dimensional regions. The start indices [0, pos, 0, 0] mean
+    #      "batch 0, starting at sequence position `pos`, first head, first dim."
     # 3. Same for v
     # 4. Advance pos ONLY after the last layer
     cache

@@ -59,8 +59,14 @@ defmodule ExNanoGPT.Model do
   """
   @spec init_params(config(), Nx.Tensor.t()) :: params()
   def init_params(config, key) do
-    %{vocab_size: vocab_size, block_size: block_size, n_layer: n_layer,
-      n_head: n_head, n_embd: n_embd, bias: bias?} = config
+    %{
+      vocab_size: vocab_size,
+      block_size: block_size,
+      n_layer: n_layer,
+      n_head: n_head,
+      n_embd: n_embd,
+      bias: bias?
+    } = config
 
     keys = Nx.Random.split(key, parts: n_layer + 1)
 

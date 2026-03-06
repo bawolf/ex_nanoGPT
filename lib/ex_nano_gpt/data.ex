@@ -78,7 +78,10 @@ defmodule ExNanoGPT.Data do
       File.read!(path)
     else
       IO.puts("Downloading Shakespeare dataset...")
-      {:ok, {{_, 200, _}, _, body}} = :httpc.request(:get, {~c"#{@shakespeare_url}", []}, [], body_format: :binary)
+
+      {:ok, {{_, 200, _}, _, body}} =
+        :httpc.request(:get, {~c"#{@shakespeare_url}", []}, [], body_format: :binary)
+
       text = IO.iodata_to_binary(body)
       File.write!(path, text)
       text

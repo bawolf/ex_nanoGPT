@@ -8,20 +8,21 @@ defmodule ExNanoGPTWeb.Endpoint do
     same_site: "Lax"
   ]
 
-  socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: @session_options]]
+  socket("/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]])
 
-  plug Plug.Static,
+  plug(Plug.Static,
     at: "/",
     from: :ex_nano_gpt,
     gzip: false,
     only: ~w(assets)
+  )
 
-  plug Plug.Parsers,
+  plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
     json_decoder: Jason
+  )
 
-  plug Plug.Session, @session_options
-  plug ExNanoGPTWeb.Router
+  plug(Plug.Session, @session_options)
+  plug(ExNanoGPTWeb.Router)
 end

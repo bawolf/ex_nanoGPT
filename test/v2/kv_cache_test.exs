@@ -5,8 +5,13 @@ defmodule ExNanoGPT.V2.KVCacheTest do
   alias ExNanoGPT.Test.GoldenHelpers
 
   @config %Model{
-    sequence_len: 32, vocab_size: 64, n_layer: 2,
-    n_head: 4, n_kv_head: 2, n_embd: 32, window_pattern: "SL"
+    sequence_len: 32,
+    vocab_size: 64,
+    n_layer: 2,
+    n_head: 4,
+    n_kv_head: 2,
+    n_embd: 32,
+    window_pattern: "SL"
   }
 
   setup do
@@ -16,9 +21,14 @@ defmodule ExNanoGPT.V2.KVCacheTest do
 
   describe "KVCache" do
     test "new/1 creates cache with correct shapes" do
-      cache = KVCache.new(
-        batch_size: 1, n_layers: 2, n_kv_head: 2, head_dim: 8, max_seq: 32
-      )
+      cache =
+        KVCache.new(
+          batch_size: 1,
+          n_layers: 2,
+          n_kv_head: 2,
+          head_dim: 8,
+          max_seq: 32
+        )
 
       assert cache.pos == 0
       assert cache.n_layers == 2
@@ -31,9 +41,14 @@ defmodule ExNanoGPT.V2.KVCacheTest do
     end
 
     test "update/4 writes into correct position" do
-      cache = KVCache.new(
-        batch_size: 1, n_layers: 1, n_kv_head: 2, head_dim: 4, max_seq: 8
-      )
+      cache =
+        KVCache.new(
+          batch_size: 1,
+          n_layers: 1,
+          n_kv_head: 2,
+          head_dim: 4,
+          max_seq: 8
+        )
 
       new_k = Nx.broadcast(Nx.tensor(1.0), {1, 2, 2, 4})
       new_v = Nx.broadcast(Nx.tensor(2.0), {1, 2, 2, 4})
@@ -56,10 +71,15 @@ defmodule ExNanoGPT.V2.KVCacheTest do
 
       # Cached forward: process all tokens at once
       head_dim = div(@config.n_embd, @config.n_head)
-      cache = KVCache.new(
-        batch_size: 1, n_layers: @config.n_layer, n_kv_head: @config.n_kv_head,
-        head_dim: head_dim, max_seq: @config.sequence_len
-      )
+
+      cache =
+        KVCache.new(
+          batch_size: 1,
+          n_layers: @config.n_layer,
+          n_kv_head: @config.n_kv_head,
+          head_dim: head_dim,
+          max_seq: @config.sequence_len
+        )
 
       {cached_logits, _cache} = Model.forward_cached(seq, params, @config, cache)
       last_logits_cached = cached_logits[[0, 0, ..]]
@@ -75,16 +95,24 @@ defmodule ExNanoGPT.V2.KVCacheTest do
       last_logits_full = full_logits[[0, 3, ..]]
 
       head_dim = div(@config.n_embd, @config.n_head)
-      cache = KVCache.new(
-        batch_size: 1, n_layers: @config.n_layer, n_kv_head: @config.n_kv_head,
-        head_dim: head_dim, max_seq: @config.sequence_len
-      )
+
+      cache =
+        KVCache.new(
+          batch_size: 1,
+          n_layers: @config.n_layer,
+          n_kv_head: @config.n_kv_head,
+          head_dim: head_dim,
+          max_seq: @config.sequence_len
+        )
 
       # Process tokens one at a time
       {_logits, cache} = Model.forward_cached(Nx.tensor([[5]]), params, @config, cache)
       {_logits, cache} = Model.forward_cached(Nx.tensor([[12]]), params, @config, cache)
       {_logits, cache} = Model.forward_cached(Nx.tensor([[3]]), params, @config, cache)
-      {last_logits_cached, _cache} = Model.forward_cached(Nx.tensor([[8]]), params, @config, cache)
+
+      {last_logits_cached, _cache} =
+        Model.forward_cached(Nx.tensor([[8]]), params, @config, cache)
+
       last_logits_cached = last_logits_cached[[0, 0, ..]]
 
       GoldenHelpers.assert_close(last_logits_cached, last_logits_full, atol: 1.0e-3, rtol: 1.0e-3)

@@ -95,10 +95,12 @@ defmodule ExNanoGPT.V2.ConversationTest do
   describe "load_jsonl/1" do
     test "parses conversation JSONL" do
       path = Path.join(System.tmp_dir!(), "test_convos.jsonl")
+
       content = """
       {"conversations": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
       {"conversations": [{"role": "user", "content": "bye"}, {"role": "assistant", "content": "see ya"}]}
       """
+
       File.write!(path, content)
 
       convos = Conversation.load_jsonl(path)

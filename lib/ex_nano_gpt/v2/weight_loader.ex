@@ -54,8 +54,13 @@ defmodule ExNanoGPT.V2.WeightLoader do
           c_k: load_linear(dir, "transformer.h.#{i}.attn.c_k.weight", dtype),
           c_v: load_linear(dir, "transformer.h.#{i}.attn.c_v.weight", dtype),
           c_proj: load_linear(dir, "transformer.h.#{i}.attn.c_proj.weight", dtype),
-          ve_gate: load_linear_optional(dir, "transformer.h.#{i}.attn.ve_gate.weight", dtype,
-                     {Model.ve_gate_channels(), n_kv_head}),
+          ve_gate:
+            load_linear_optional(
+              dir,
+              "transformer.h.#{i}.attn.ve_gate.weight",
+              dtype,
+              {Model.ve_gate_channels(), n_kv_head}
+            ),
           c_fc: load_linear(dir, "transformer.h.#{i}.mlp.c_fc.weight", dtype),
           c_proj_mlp: load_linear(dir, "transformer.h.#{i}.mlp.c_proj.weight", dtype)
         }
@@ -65,6 +70,7 @@ defmodule ExNanoGPT.V2.WeightLoader do
     value_embeds =
       for i <- 0..(config.n_layer - 1) do
         key = "transformer.value_embeds.#{i}.weight"
+
         if has_param?(metadata, key) do
           load_npy(dir, key, dtype)
         else
@@ -92,6 +98,7 @@ defmodule ExNanoGPT.V2.WeightLoader do
 
   defp build_config(metadata) do
     cfg = metadata["config"] || %{}
+
     %Model{
       sequence_len: Map.get(cfg, "sequence_len", 2048),
       vocab_size: Map.get(cfg, "vocab_size", 32768),
@@ -120,6 +127,7 @@ defmodule ExNanoGPT.V2.WeightLoader do
   defp load_linear_optional(dir, key, dtype, default_shape) do
     filename = String.replace(key, "/", "_") <> ".npy"
     path = Path.join(dir, filename)
+
     if File.exists?(path) do
       load_npy(dir, key, dtype) |> Nx.transpose()
     else

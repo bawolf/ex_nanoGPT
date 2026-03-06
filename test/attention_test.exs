@@ -46,12 +46,15 @@ defmodule ExNanoGPT.AttentionTest do
     mask = Attention.causal_mask(4)
 
     expected =
-      Nx.tensor([
-        [1, 0, 0, 0],
-        [1, 1, 0, 0],
-        [1, 1, 1, 0],
-        [1, 1, 1, 1]
-      ], type: :u8)
+      Nx.tensor(
+        [
+          [1, 0, 0, 0],
+          [1, 1, 0, 0],
+          [1, 1, 1, 0],
+          [1, 1, 1, 1]
+        ],
+        type: :u8
+      )
 
     assert Nx.equal(mask, expected) |> Nx.all() |> Nx.to_number() == 1
   end

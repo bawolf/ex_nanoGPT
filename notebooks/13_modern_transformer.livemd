@@ -32,9 +32,9 @@ alias VegaLite, as: Vl
 
 ## Three Activation Functions Walk Into a Model
 
-Our v1 transformer uses GELU — a smooth approximation of ReLU developed in 2016. It's a solid choice. But in February 2024, Zhengyan Zhang et al. published a paper asking a simple question: what if we just squared the output of ReLU?
+Our v1 transformer uses GELU — a smooth approximation of ReLU developed in 2016. It's a solid choice. But in 2021, So et al. at Google Brain used **neural architecture search** to find better transformer primitives. Their system, called **Primer** (NeurIPS 2021), tried thousands of combinations and converged on a remarkably simple change: just square the output of ReLU.
 
-The answer was surprising. **ReLU-squared produces dramatically sparser activations** — most neurons output exactly zero. This isn't a bug. Sparse networks are faster (skip zero multiplications), more interpretable (fewer active features = easier to understand), and often more parameter-efficient.
+The result was surprising. **ReLU-squared produces dramatically sparser activations** — most neurons output exactly zero. This isn't a bug. Sparse networks are faster (skip zero multiplications), more interpretable (fewer active features = easier to understand), and often more parameter-efficient. Karpathy adopted it in nanochat for exactly these reasons.
 
 Let's see for ourselves.
 
