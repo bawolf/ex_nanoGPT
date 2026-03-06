@@ -1,0 +1,478 @@
+# 17: Serving with LiveView — From Notebook to Browser
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## Talk to Your Model
+
+You built a transformer from scratch. You built a tokenizer. You built a KV cache. You taught it the format of a conversation. Let's put it all together and actually talk to it.
+
+No frameworks. No web server. Just a generation loop right here in this notebook.
+
+```elixir
+alias ExNanoGPT.V2.{Model, KVCache, Tokenizer, Conversation}
+
+corpus = """
+The quick brown fox jumps over the lazy dog. Hello world! How are you today?
+I am doing great, thanks for asking. Elixir is a functional programming language.
+The BEAM virtual machine provides lightweight processes and fault tolerance.
+Phoenix is a web framework built with Elixir for productive and reliable applications.
+LiveView enables rich real-time user experiences with server-rendered HTML.
+"""
+
+tok = Tokenizer.train(corpus, vocab_size: 300)
+
+config = %Model{
+  sequence_len: 128, vocab_size: tok.vocab_size,
+  n_layer: 2, n_head: 4, n_kv_head: 2,
+  n_embd: 64, window_pattern: "SL"
+}
+
+key = Nx.Random.key(42)
+params = Model.init_params(config, key)
+
+IO.puts("Model: #{Model.count_params(params)} parameters")
+IO.puts("Vocab: #{tok.vocab_size} tokens")
+```
+
+### Build the Generation Pipeline
+
+Step by step: encode the conversation, process through the cache, generate one token at a time.
+
+```elixir
+conversation = [%{role: "user", content: "Hello!"}]
+
+{prompt_ids, _mask} = Conversation.render(conversation, tok)
+ast_start = Tokenizer.encode_special(tok, "<|assistant_start|>")
+prompt_ids = prompt_ids ++ [ast_start]
+
+head_dim = div(config.n_embd, config.n_head)
+cache = KVCache.new(
+  batch_size: 1, n_layers: config.n_layer,
+  n_kv_head: config.n_kv_head, head_dim: head_dim,
+  max_seq: config.sequence_len
+)
+
+prompt_tensor = Nx.tensor([prompt_ids], type: :s64)
+{logits, cache} = Model.forward_cached(prompt_tensor, params, config, cache)
+
+IO.puts("Prompt: #{length(prompt_ids)} tokens")
+IO.puts("Cache position: #{KVCache.get_pos(cache)}")
+IO.puts("Ready to generate!")
+```
+
+```elixir
+ast_end = Tokenizer.encode_special(tok, "<|assistant_end|>")
+max_new_tokens = 30
+temperature = 0.8
+top_k = 40
+
+gen_key = Nx.Random.key(123)
+
+{generated_tokens, _cache, _key, _logits} =
+  Enum.reduce_while(1..max_new_tokens, {[], cache, gen_key, logits}, fn _i, {tokens, c, k, cur_logits} ->
+    flat = Nx.reshape(cur_logits, {config.vocab_size})
+    scaled = Nx.divide(flat, temperature)
+
+    {n} = Nx.shape(scaled)
+    k_val = min(top_k, n)
+    sorted_indices = Nx.argsort(scaled, direction: :desc)
+    kth_val = scaled[Nx.to_number(sorted_indices[k_val - 1])]
+    mask = Nx.greater_equal(scaled, kth_val)
+    filtered = Nx.select(mask, scaled, Nx.Constants.neg_infinity(:f32))
+
+    max_val = Nx.reduce_max(filtered)
+    probs = Nx.exp(Nx.subtract(filtered, max_val))
+    probs = Nx.divide(probs, Nx.sum(probs))
+
+    log_probs = Nx.log(Nx.max(probs, 1.0e-10))
+    {uniform, _} = Nx.Random.uniform(k, shape: Nx.shape(probs))
+    gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))
+    token_id = Nx.to_number(Nx.argmax(Nx.add(log_probs, gumbel)))
+
+    {k_new, _} = Nx.Random.split(k) |> then(fn keys -> {keys[0], keys[1]} end)
+
+    if token_id == ast_end do
+      {:halt, {tokens, c, k_new, cur_logits}}
+    else
+      token_tensor = Nx.tensor([[token_id]], type: :s64)
+      {next_logits, c} = Model.forward_cached(token_tensor, params, config, c)
+      {:cont, {tokens ++ [token_id], c, k_new, next_logits}}
+    end
+  end)
+
+response = Tokenizer.decode(tok, generated_tokens)
+IO.puts("User:      \"Hello!\"")
+IO.puts("Assistant: \"#{response}\"")
+IO.puts("\n(Random weights — the output is gibberish. A trained model would respond coherently.)")
+```
+
+It works! But there's a problem. This notebook blocks during generation. You can't see tokens as they appear — you wait until generation is complete, then see the full response.
+
+What if we could **stream** tokens to you one at a time, as they're generated?
+
+## Understanding Sampling: Temperature and Top-K
+
+Before we move to real-time streaming, let's understand the controls that shape generation.
+
+### Temperature
+
+Temperature divides the logits before softmax. It controls randomness:
+- **T near 0**: nearly deterministic (always picks the most likely token)
+- **T = 1**: uses the model's raw probabilities
+- **T >> 1**: approaches uniform random
+
+```elixir
+raw_logits = Nx.tensor([3.0, 2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0])
+token_labels = ["the", "a", "is", "was", "it", "of", "an", "to"]
+
+temp_data =
+  for temp <- [0.1, 0.5, 1.0, 2.0] do
+    scaled = Nx.divide(raw_logits, temp)
+    max_val = Nx.reduce_max(scaled)
+    exps = Nx.exp(Nx.subtract(scaled, max_val))
+    probs = Nx.divide(exps, Nx.sum(exps))
+
+    Enum.zip(token_labels, Nx.to_flat_list(probs))
+    |> Enum.map(fn {tok_name, p} ->
+      %{"token" => tok_name, "probability" => Float.round(p, 4), "temperature" => "T=#{temp}"}
+    end)
+  end
+  |> List.flatten()
+
+Vl.new(width: 140, height: 200, title: "Temperature Effect")
+|> Vl.data_from_values(temp_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, sort: token_labels, axis: [label_angle: -45])
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+|> Vl.encode_field(:column, "temperature", type: :nominal)
+```
+
+### Interactive: Temperature Explorer
+
+```elixir
+temp_slider = Kino.Input.range("Temperature (x10)", min: 1, max: 30, step: 1, default: 10)
+```
+
+```elixir
+temp_val = Kino.Input.read(temp_slider) / 10.0
+
+raw = Nx.tensor([3.0, 2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0])
+labels = ["the", "a", "is", "was", "it", "of", "an", "to"]
+
+scaled = Nx.divide(raw, temp_val)
+max_val = Nx.reduce_max(scaled)
+exps = Nx.exp(Nx.subtract(scaled, max_val))
+probs = Nx.divide(exps, Nx.sum(exps))
+probs_list = Nx.to_flat_list(probs)
+
+entropy = -Enum.map(probs_list, fn p ->
+  if p > 1.0e-10, do: p * :math.log2(p), else: 0.0
+end) |> Enum.sum()
+
+data = Enum.zip(labels, probs_list)
+  |> Enum.map(fn {tok, p} -> %{"token" => tok, "probability" => Float.round(p, 4)} end)
+
+top_token = Enum.max_by(data, fn d -> d["probability"] end)
+
+chart =
+  Vl.new(width: 400, height: 250, title: "T=#{Float.round(temp_val, 1)} | Entropy=#{Float.round(entropy, 2)} bits")
+  |> Vl.data_from_values(data)
+  |> Vl.mark(:bar)
+  |> Vl.encode_field(:x, "token", type: :nominal, sort: labels)
+  |> Vl.encode_field(:y, "probability", type: :quantitative, scale: %{domain: [0, 1]})
+  |> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+
+description = cond do
+  temp_val <= 0.3 -> "Nearly greedy — almost always picks the top token."
+  temp_val <= 0.8 -> "Conservative — strong preference for likely tokens."
+  temp_val <= 1.2 -> "Balanced — uses the model's natural distribution."
+  temp_val <= 2.0 -> "Creative — gives unlikely tokens a real chance."
+  true -> "Very random — approaching uniform distribution."
+end
+
+Kino.Layout.grid([
+  chart,
+  Kino.Markdown.new("**Most likely:** \"#{top_token["token"]}\" at #{Float.round(top_token["probability"] * 100, 1)}%. #{description}")
+], columns: 1)
+```
+
+### Top-K
+
+Top-K keeps only the K most likely tokens and zeros out the rest. Even at high temperature, the model can never sample an extremely unlikely token.
+
+```elixir
+topk_data =
+  for k <- [2, 4, 8] do
+    probs = Nx.divide(raw, 1.0) |> then(fn s ->
+      max_val = Nx.reduce_max(s)
+      exps = Nx.exp(Nx.subtract(s, max_val))
+      Nx.divide(exps, Nx.sum(exps))
+    end)
+
+    sorted_indices = Nx.argsort(raw, direction: :desc)
+    kth_val = raw[Nx.to_number(sorted_indices[k - 1])]
+    mask = Nx.greater_equal(raw, kth_val)
+    filtered = Nx.select(mask, raw, Nx.Constants.neg_infinity(:f32))
+    max_val = Nx.reduce_max(filtered)
+    filt_exps = Nx.exp(Nx.subtract(filtered, max_val))
+    filt_probs = Nx.divide(filt_exps, Nx.sum(filt_exps))
+
+    Enum.zip(labels, Nx.to_flat_list(filt_probs))
+    |> Enum.map(fn {tok_name, p} ->
+      %{"token" => tok_name, "probability" => Float.round(p, 4), "top_k" => "K=#{k}"}
+    end)
+  end
+  |> List.flatten()
+
+Vl.new(width: 140, height: 200, title: "Top-K Filtering")
+|> Vl.data_from_values(topk_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, sort: labels, axis: [label_angle: -45])
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+|> Vl.encode_field(:column, "top_k", type: :nominal)
+```
+
+## Phoenix LiveView: The Streaming Solution
+
+The notebook blocks during generation. We need something that can send tokens to the browser *as they're generated*. Enter Phoenix LiveView.
+
+### The Origin Story
+
+In 2013, Chris McCord was building real-time features with Ruby on Rails. He loved how Rails made CRUD simple, but adding WebSocket-based live updates meant writing JavaScript, building REST APIs, managing client state — the simplicity vanished.
+
+He spent years working on the problem. First `sync.rb` for Rails, then Phoenix Channels for Elixir. Finally, in 2018, he announced **LiveView** at ElixirConf: real-time web UIs with zero client-side JavaScript.
+
+The idea: the server renders HTML, sends it to the browser, and when state changes, sends only the *diff*. The browser patches the DOM. No REST API, no JSON serialization, no React, no client-side state management. Just Elixir processes sending HTML diffs over WebSocket.
+
+For streaming LLM tokens, this is perfect. Each generated token triggers a re-render, and LiveView pushes the one-word diff to the browser.
+
+### Architecture
+
+```
+Browser                          Server (Elixir process)
+  |                                  |
+  |  ---- HTTP GET / ------------>   |  mount/3: initialize state
+  |  <--- Full HTML page ---------   |  render/1: generate HTML
+  |                                  |
+  |  ==== WebSocket connected ====   |
+  |                                  |
+  |  ---- phx-submit "send" ----->   |  handle_event/3: user sends message
+  |  <--- HTML diff patch --------   |  render/1: show user bubble
+  |                                  |
+  |                                  |  handle_info: generate tokens
+  |  <--- HTML diff patch --------   |  render/1: stream each token
+  |  <--- HTML diff patch --------   |
+  |  <--- HTML diff patch --------   |  (token by token)
+  |                                  |
+```
+
+Each browser tab gets its own **BEAM process**. The process holds conversation state, model parameters, and KV cache in memory. When the user sends a message, the process generates tokens and pushes diff patches to the browser.
+
+This is where Elixir shines. BEAM processes are:
+- **Lightweight**: you can spawn millions. Each chat session is cheap.
+- **Isolated**: one crash doesn't take down the server.
+- **Concurrent**: no thread pools, no locks, no shared state.
+
+This is exactly what you want for serving an LLM to multiple users simultaneously.
+
+### The Generation Loop in ChatLive
+
+Our `ExNanoGPTWeb.ChatLive` module follows this flow:
+
+1. **`mount/3`**: initialize empty conversation, no model loaded yet
+2. **`handle_event("load_model")`**: load weights and tokenizer into process state
+3. **`handle_event("send")`**: user submits a message, appended to conversation
+4. **`handle_info({:generate})`**: render conversation to tokens, init KV cache, enter generation loop
+5. **Generation loop**: for each token — forward_cached, sample, decode, push to browser
+6. **Stop**: when `<|assistant_end|>` is generated or max tokens reached
+
+### Token Generation Timeline
+
+The first "token" is actually the entire prompt being processed (prefill). After that, each token is a single forward pass through the cache — much faster.
+
+```elixir
+simulated_tokens = ["The", " BEAM", " VM", " provides", " light", "weight", " processes", "."]
+simulated_times = [45, 12, 11, 13, 12, 11, 14, 10]
+
+timeline_data =
+  simulated_tokens
+  |> Enum.zip(simulated_times)
+  |> Enum.with_index()
+  |> Enum.scan({0, nil}, fn {{tok, ms}, idx}, {cumulative, _} ->
+    start = cumulative
+    {cumulative + ms, %{
+      "token" => tok, "start_ms" => start, "end_ms" => cumulative + ms,
+      "duration_ms" => ms, "step" => idx,
+      "type" => if(idx == 0, do: "prefill", else: "decode")
+    }}
+  end)
+  |> Enum.map(&elem(&1, 1))
+
+Vl.new(width: 500, height: 180, title: "Token Generation Timeline (simulated)")
+|> Vl.data_from_values(timeline_data)
+|> Vl.mark(:bar, tooltip: true)
+|> Vl.encode_field(:y, "token", type: :nominal, sort: nil, title: "Token")
+|> Vl.encode_field(:x, "start_ms", type: :quantitative, title: "Time (ms)")
+|> Vl.encode_field(:x2, "end_ms")
+|> Vl.encode_field(:color, "type",
+  type: :nominal,
+  scale: %{domain: ["prefill", "decode"], range: ["#6366f1", "#22c55e"]}
+)
+```
+
+Prefill is slow (processes all prompt tokens, fills KV cache). Decode is fast (one token per step). This is why KV caching matters — without it, every bar would be as tall as the first.
+
+## Running the Chat Server
+
+The project includes a complete Phoenix LiveView chat interface.
+
+### Start It
+
+```bash
+iex -S mix phx.server
+```
+
+Then open [http://localhost:4000](http://localhost:4000).
+
+The UI lets you:
+- Send messages and see streaming responses
+- Adjust temperature and top-k
+- Load pre-trained model checkpoints
+
+### What's Happening Under the Hood
+
+```
++---------------------------------------------+
+|  Browser (http://localhost:4000)             |
+|  +---------------------------------------+  |
+|  | Chat UI (Tailwind CSS)                |  |
+|  |  - Message history                    |  |
+|  |  - Input field                        |  |
+|  |  - Temperature / Top-K sliders        |  |
+|  +---------------+-----------------------+  |
+|                   | WebSocket                |
++-------------------+-------------------------+
+                    |
++-------------------+-------------------------+
+|  Phoenix Server   |                         |
+|  +---------------+---------------------+    |
+|  | ChatLive Process (one per user)     |    |
+|  |  assigns:                           |    |
+|  |    messages: [%{role, content}]     |    |
+|  |    model_params: %{wte, blocks}     |    |
+|  |    tokenizer: %Tokenizer{}          |    |
+|  |    kv_cache: %KVCache{}             |    |
+|  +---------------+---------------------+    |
+|                   |                         |
+|  +---------------+---------------------+    |
+|  | Generation Pipeline                 |    |
+|  |  1. Conversation.render(turns, tok) |    |
+|  |  2. KVCache.new(...)                |    |
+|  |  3. Model.forward_cached(prompt)    |    |
+|  |  4. Loop: sample -> forward_cached  |    |
+|  |  5. Tokenizer.decode(tok, ids)      |    |
+|  +-------------------------------------+    |
+|                                             |
+|  +-------------------------------------+    |
+|  | Nx + EMLX (Apple Metal GPU)         |    |
+|  | Matrix ops, attention, softmax      |    |
+|  +-------------------------------------+    |
++---------------------------------------------+
+```
+
+Each tab = one BEAM process. Complete isolation. No shared mutable state. The same architecture that powers WhatsApp (2 million connections per server) now powers your chatbot.
+
+## KV Cache Without vs With
+
+```elixir
+test_conversation = [%{role: "user", content: "Hi!"}]
+{prompt_ids_test, _} = Conversation.render(test_conversation, tok)
+prompt_ids_test = prompt_ids_test ++ [Tokenizer.encode_special(tok, "<|assistant_start|>")]
+n_generate = 10
+
+{cache_time_us, _} = :timer.tc(fn ->
+  prompt_t = Nx.tensor([prompt_ids_test], type: :s64)
+  hd = div(config.n_embd, config.n_head)
+  c = KVCache.new(batch_size: 1, n_layers: config.n_layer, n_kv_head: config.n_kv_head,
+                  head_dim: hd, max_seq: config.sequence_len)
+  {logits, c} = Model.forward_cached(prompt_t, params, config, c)
+
+  Enum.reduce(1..n_generate, {logits, c}, fn _i, {_l, c} ->
+    Model.forward_cached(Nx.tensor([[0]], type: :s64), params, config, c)
+  end)
+end)
+
+{no_cache_time_us, _} = :timer.tc(fn ->
+  Enum.reduce(1..n_generate, prompt_ids_test, fn _i, ids ->
+    _logits = Model.forward(Nx.tensor([ids], type: :s64), params, config)
+    ids ++ [0]
+  end)
+end)
+
+IO.puts("=== #{n_generate} tokens ===")
+IO.puts("With cache:    #{div(cache_time_us, 1000)} ms")
+IO.puts("Without cache: #{div(no_cache_time_us, 1000)} ms")
+IO.puts("Speedup:       #{Float.round(no_cache_time_us / max(cache_time_us, 1), 1)}x")
+```
+
+## The Full Stack
+
+You just built every piece of a chatbot from scratch:
+
+| Notebook | What you built |
+|----------|---------------|
+| **00-10** | GPT-2 style transformer (v1) |
+| **11** | RMSNorm and RoPE — modern normalization and position encoding |
+| **12** | GQA, QK norm, sliding window — modern attention |
+| **13** | Full v2 assembly — ReLU-squared, softcapping, value embeddings |
+| **14** | BPE tokenizer — from bytes to subword tokens |
+| **15** | KV cache — fast autoregressive generation |
+| **16** | SFT — teaching a model to have conversations |
+| **17** | LiveView serving — streaming tokens to a browser |
+
+**Math to metal to browser.** Not a wrapper around an API. The actual model runs on your machine, in a language you know, with code you wrote.
+
+Chris McCord built LiveView because he wanted real-time web without JavaScript. You're using it to stream tokens from a transformer you built from scratch. That's the full stack.
+
+## What's Next
+
+### Cloud Training
+The tiny models in these notebooks prove concepts. A real chat model needs millions of conversation examples, 100M+ parameters, and hours of GPU time. See `scripts/cloud_train.exs` for cost estimates and instructions.
+
+### Loading Pre-Trained Weights
+```elixir
+# {params, config} = ExNanoGPT.V2.WeightLoader.load("path/to/checkpoint")
+# tokenizer = ExNanoGPT.V2.Tokenizer.load("path/to/tokenizer.etf")
+```
+
+### Beyond
+- **Batching**: process multiple users in one GPU call
+- **Quantization**: use f16/bf16 to halve memory
+- **Tool use**: the conversation format already supports `<|python_start|>` tokens
+- **RLHF**: the next step after SFT — learning from human preferences
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **LiveView** | Server-rendered real-time UI over WebSocket. Chris McCord, ElixirConf 2018. |
+| **Prefill** | Processing the entire prompt at once to populate the KV cache |
+| **Decode** | Generating one token at a time using the cache |
+| **Temperature** | Scales logits before softmax; lower = deterministic, higher = creative |
+| **Top-K** | Keeps only K most likely tokens; prevents sampling unlikely tokens |
+| **Streaming** | Sending tokens as they're generated, not waiting for the full response |
+| **BEAM processes** | Each chat session is isolated — lightweight, fault-tolerant, concurrent |

@@ -1,14 +1,43 @@
 # ExNanoGPT
 
-An Elixir/Nx port of [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) -- the simplest, most readable implementation of a GPT language model, rewritten in Elixir using [Nx](https://github.com/elixir-nx/nx).
+[![CI](https://github.com/bawolf/ex_nanoGPT/actions/workflows/ci.yml/badge.svg)](https://github.com/bawolf/ex_nanoGPT/actions/workflows/ci.yml)
 
-Every matrix multiply, every attention head, every gradient update is explicit Nx code. No magic libraries -- the AdamW optimizer, training loop, and sampler are all built from scratch.
+A GPT in **176 lines of Elixir**. A modern chat model in **292 lines**.
 
-**Trains on Apple Silicon GPU** via [EMLX](https://github.com/elixir-nx/emlx) (Metal), or on NVIDIA GPU via [EXLA](https://github.com/elixir-nx/nx/tree/main/exla) (CUDA).
+```elixir
+# The entire v1 GPT forward pass (lib/ex_nano_gpt/v1_compact.ex)
+def forward(idx, params, config) do
+  %{n_head: n_head, n_layer: n_layer} = config
+  seq_len = Nx.axis_size(idx, 1)
 
-## Learn by Building
+  x = Nx.add(Nx.take(params.wte, idx, axis: 0),
+             Nx.take(params.wpe, Nx.iota({seq_len}), axis: 0))
 
-This repo includes **11 interactive Livebook notebooks** where you rebuild each component yourself, with exercises, solutions, and verification against the reference implementation.
+  x = Enum.reduce(0..(n_layer - 1), x, fn i, x ->
+    block(x, elem(params.blocks, i), n_head: n_head)
+  end)
+
+  x = layer_norm(x, params.ln_f_w, params.ln_f_b)
+  Nx.dot(x, [-1], params.wte, [-1])
+end
+```
+
+That's a real, working GPT-2. Token embeddings, position embeddings, N transformer blocks, final layer norm, weight-tied output projection. Every matrix multiply is explicit [Nx](https://github.com/elixir-nx/nx) code -- no magic libraries.
+
+This is an Elixir port of Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat). Two model versions, both as single-file implementations:
+
+- **[v1_compact.ex](lib/ex_nano_gpt/v1_compact.ex)** (176 lines): GPT-2 architecture -- LayerNorm, GELU, learned position embeddings
+- **[v2_compact.ex](lib/ex_nano_gpt/v2_compact.ex)** (292 lines): nanochat architecture -- RoPE, RMSNorm, GQA, ReLU², sliding window attention, KV cache, softcapping
+
+Trains on Apple Silicon GPU via [EMLX](https://github.com/elixir-nx/emlx) (Metal), or on NVIDIA GPU via [EXLA](https://github.com/elixir-nx/nx/tree/main/exla) (CUDA).
+
+## Understand Every Line
+
+Want to know what those 176 lines actually do? **17 Livebook notebooks** build each model piece by piece -- with exercises, visualizations, "Break It" experiments, and verification against the compact implementations.
+
+**New to Nx?** Every notebook teaches Nx inline, translating patterns into familiar Elixir idioms. See the [cheat sheet](#elixir--nx-cheat-sheet) below.
+
+**Part 1: nanoGPT (v1) -- Character-level GPT**
 
 | # | Notebook | What you build |
 |---|----------|---------------|
@@ -23,6 +52,18 @@ This repo includes **11 interactive Livebook notebooks** where you rebuild each 
 | 08 | [AdamW Optimizer](notebooks/08_adamw_optimizer.livemd) | Moments, bias correction, LR schedule |
 | 09 | [Training Loop](notebooks/09_training_loop.livemd) | value_and_grad, gradient accumulation |
 | 10 | [Sampling & Generation](notebooks/10_sampling.livemd) | Temperature, top-k, autoregressive loop |
+
+**Part 2: nanochat (v2) -- Modern Chat Model**
+
+| # | Notebook | What you build |
+|---|----------|---------------|
+| 11 | [RoPE & RMSNorm](notebooks/11_rope_and_rmsnorm.livemd) | Rotary embeddings, RMS normalization |
+| 12 | [Modern Attention](notebooks/12_modern_attention.livemd) | GQA, QK norm, sliding window |
+| 13 | [Modern Transformer](notebooks/13_modern_transformer.livemd) | ReLU², softcapping, residual scaling |
+| 14 | [BPE Tokenization](notebooks/14_bpe_tokenization.livemd) | Byte-pair encoding from scratch |
+| 15 | [KV Cache](notebooks/15_kv_cache.livemd) | Cached inference, O(n) generation |
+| 16 | [Conversation & SFT](notebooks/16_conversation_and_sft.livemd) | Chat format, loss masking, fine-tuning |
+| 17 | [Serving with LiveView](notebooks/17_serving_with_liveview.livemd) | Phoenix chat UI, streaming generation |
 
 ### Getting Started with Livebook
 
@@ -57,23 +98,28 @@ This repo includes **11 interactive Livebook notebooks** where you rebuild each 
 
 ```
 lib/ex_nano_gpt/
-  data.ex              # Shakespeare download, char tokenizer, binary encoding
+  v1_compact.ex        # ★ Complete GPT-2 in one file (176 lines)
+  v2_compact.ex        # ★ Complete nanochat in one file (292 lines)
+
+  # The same code, broken out module-by-module for teaching:
+  data.ex              # Shakespeare download, char tokenizer
   batch.ex             # Random batch generation
-  embedding.ex         # Token + position embeddings, dropout
+  embedding.ex         # Token + position embeddings
   layer_norm.ex        # Layer normalization
   attention.ex         # Multi-head causal self-attention
   mlp.ex               # Feed-forward network (GELU)
-  block.ex             # Transformer block (attention + MLP + residuals)
-  model.ex             # Full GPT model (assembly, weight tying, loss)
-  optimizer.ex         # AdamW with cosine LR schedule, gradient clipping
-  trainer.ex           # Training loop, gradient accumulation, checkpointing
-  sampler.ex           # Text generation (temperature, top-k, Gumbel-max)
+  block.ex             # Transformer block
+  model.ex             # Full GPT model assembly
+  optimizer.ex         # AdamW optimizer
+  trainer.ex           # Training loop
+  sampler.ex           # Text generation (temperature, top-k)
 
-notebooks/             # 11 interactive Livebook lessons
-scripts/
-  train.exs            # Training script (--smoke for quick test)
-  bench_step.exs       # Benchmark a single training step
-test/                  # Unit tests + golden tests vs Python nanoGPT
+  v2/                  # nanochat modules (same as v2_compact, exploded)
+    model.ex kv_cache.ex tokenizer.ex weight_loader.ex conversation.ex
+
+lib/ex_nano_gpt_web/   # Phoenix LiveView chat UI
+notebooks/             # 17 Livebook lessons (10 v1 + 7 v2)
+test/                  # Unit + golden tests vs Python
 ```
 
 ## Quick Start
@@ -82,7 +128,7 @@ test/                  # Unit tests + golden tests vs Python nanoGPT
 # Install dependencies
 mix deps.get
 
-# Run tests (55 tests including golden tests against Python nanoGPT)
+# Run tests (unit + golden tests against Python nanoGPT + nanochat)
 mix test
 
 # Smoke test: train a tiny model for 10 steps
@@ -92,74 +138,79 @@ mix run scripts/train.exs --smoke
 mix run scripts/train.exs
 ```
 
-## Backend Configuration
+## Backends
 
-The default backend is **EMLX (Metal GPU)** -- no setup required on Apple Silicon Macs. Switch backends with the `NX_BACKEND` environment variable:
-
-| Backend | Env var | Device | Use case |
-|---------|---------|--------|----------|
-| EMLX GPU | `NX_BACKEND=emlx` (default) | Apple Metal GPU | Mac training & inference |
-| EMLX CPU | `NX_BACKEND=emlx_cpu` | CPU | Debugging, non-Mac |
-| EXLA | `NX_BACKEND=exla` | CPU (Mac) / CUDA GPU (Linux) | Linux GPU training |
+Default is **EMLX** (Apple Metal GPU) -- no setup required on Apple Silicon. Set `NX_BACKEND=exla` for CUDA on Linux. Set `NX_BACKEND=emlx_cpu` for CPU-only. Training is ~55s/step on M2 Air (EMLX GPU), much faster on CUDA. For full training, rent a T4 on Vast.ai (~$0.10/hr) with EXLA + CUDA.
 
 ```bash
-# Default: EMLX on Apple GPU
-mix test
-
-# Switch to EXLA (CPU on Mac, CUDA on Linux)
-NX_BACKEND=exla mix test
-
 # EXLA with CUDA on Linux
 XLA_TARGET=cuda12 NX_BACKEND=exla mix deps.compile
 NX_BACKEND=exla mix run scripts/train.exs
 ```
 
-### Performance (M2 Air, Shakespeare char, 10.65M params)
+## v2: Chat UI & Pre-trained Weights
 
-| Backend | Device | Per-step | 5000 iters | Tests (55) |
-|---------|--------|----------|------------|------------|
-| EMLX | Metal GPU | **~55s** | ~3.2 days | 4.9s |
-| EXLA | CPU | ~113s | ~6.5 days | 21.4s |
+Start the Phoenix LiveView chat interface:
 
-EMLX is ~2x faster on Mac. On Linux with CUDA, EXLA will be much faster (seconds per step).
+```bash
+iex -S mix phx.server  # http://localhost:4000
+```
+
+**Option A: Download Karpathy's pre-trained weights** (recommended)
+
+```bash
+./scripts/download_weights.sh            # downloads nanochat-d32 → weights/
+./scripts/download_weights.sh nanochat-d34  # or the larger 2.2B model
+```
+
+Then enter `weights/` as the path in the chat UI and click "Load Model".
+
+**Option B: Train from scratch** (cloud GPU)
+
+```bash
+mix run scripts/cloud_train.exs  # see script for cost estimates (~$0.55 for 100M quick test)
+```
+
+**v1 Shakespeare** doesn't use the chat UI -- it generates text directly:
+
+```bash
+mix run scripts/train.exs        # trains & generates Shakespeare
+mix run scripts/train.exs --smoke  # quick 10-step smoke test
+```
+
+**Load weights programmatically:**
+
+```elixir
+{params, config} = ExNanoGPT.V2.WeightLoader.load("weights/")
+logits = ExNanoGPT.V2.Model.forward(token_ids, params, config)
+```
 
 ## Known Limitations
 
-### EMLX Metal sort kernel
+- **EMLX sort bug**: `Nx.sort` crashes on Metal GPU. Workaround in `sampler.ex` uses rank-based top-k. Revert instructions in source. Track: [elixir-nx/emlx](https://github.com/elixir-nx/emlx)
+- **No f64 on Metal**: This project uses f32 everywhere, but custom f64 code will fail on EMLX GPU.
+- **EMLX is early**: Not yet on Hex (installed from GitHub). Some Nx ops missing but none used here. Watch: [elixir-nx/nx#1504](https://github.com/elixir-nx/nx/pull/1504)
+- **Training speed**: ~55s/step on Mac vs seconds in PyTorch. Best for learning; rent a GPU for full training.
 
-MLX's Metal GPU backend has a bug where `Nx.sort` crashes with `Unable to load kernel carg_block_sort_bool` -- it dispatches a boolean sort kernel for float tensors, causing a hard crash (SIGABRT, exit code 134).
+## Elixir → Nx Cheat Sheet
 
-**Affected code**: `ExNanoGPT.Sampler.apply_top_k/2` in `lib/ex_nano_gpt/sampler.ex`. The natural implementation uses `Nx.sort` (matching nanoGPT's `torch.topk`), but we use a rank-based O(vocab^2) workaround instead.
-
-**Only affects EMLX GPU** -- `NX_BACKEND=exla` works fine with `Nx.sort`.
-
-**To revert**: When the upstream MLX sort kernel is fixed, replace `apply_top_k` with the 4-line `Nx.sort` version documented in the source comment.
-
-**Workaround for your own code**: Transfer to CPU for the sort: `tensor |> Nx.backend_transfer({EMLX.Backend, device: :cpu}) |> Nx.sort() |> Nx.backend_transfer({EMLX.Backend, device: :gpu})`.
-
-Track: [elixir-nx/emlx](https://github.com/elixir-nx/emlx)
-
-### No f64 on Metal
-
-Metal does not support 64-bit floats. This project uses f32 everywhere so this is a non-issue, but if you add code that creates f64 tensors it will fail on EMLX GPU.
-
-### EMLX is still early
-
-[EMLX](https://github.com/elixir-nx/emlx) is not yet on Hex (installed from GitHub). Some Nx operations are missing (interior padding, reduce, window_reduce). None of these are used by this project, but they may affect extensions.
-
-**What to watch:**
-- [elixir-nx/emlx](https://github.com/elixir-nx/emlx) -- active development by the Nx core team
-- [elixir-nx/nx#1504](https://github.com/elixir-nx/nx/pull/1504) -- Metal PjRt plugin support for Nx
-
-### Training is still slow
-
-Even with EMLX GPU, ~55s/step means ~3 days for the full 5000 iterations. This is an Elixir/Nx overhead issue -- the same model trains in seconds per step in PyTorch on the same hardware. The gap will narrow as EMLX's compiler matures, but for now this project is best used for **learning** (the notebooks work instantly) rather than production training.
-
-**Workarounds:**
-- **Rent a GPU** -- A T4 on Vast.ai (~$0.10/hr) trains the full model in minutes with EXLA + CUDA.
-- **Run the smoke test** -- `mix run scripts/train.exs --smoke` trains a tiny model in 5 seconds, enough to verify everything works.
+| Elixir | Nx | Notes |
+|--------|----|-------|
+| `[1, 2, 3]` | `Nx.tensor([1, 2, 3])` | Fixed type, GPU-ready |
+| `length(list)` | `Nx.shape(tensor)` | Returns a tuple like `{5}` |
+| `Enum.at(list, i)` | `tensor[i]` | Returns a tensor, not a value |
+| `Enum.slice(list, a..b)` | `tensor[a..b]` | Range indexing |
+| `hd(list)` | `Nx.to_number(t[0])` | Convert to Elixir value |
+| `Enum.map(list, &f/1)` | `Nx.multiply(tensor, 2)` | Vectorized, no map needed |
+| `Enum.sum(list)` | `Nx.sum(tensor)` | Or `Nx.sum(t, axes: [0])` |
+| `Enum.zip_reduce(a, b, ...)` | `Nx.dot(a, b)` | Matrix multiply |
+| `:rand.uniform()` | `Nx.Random.uniform(key, ...)` | Functional, returns `{tensor, key}` |
+| `Enum.map(ids, &table[&1])` | `Nx.take(table, ids, axis: 0)` | Parallel gather |
+| `if cond, do: a, else: b` | `Nx.select(cond, a, b)` | Element-wise conditional |
+| `List.replace_at(l, i, v)` | `Nx.put_slice(t, starts, v)` | Immutable update |
+| `def f(x), do: ...` | `defn f(x), do: ...` | JIT-compiled for GPU |
 
 ## Acknowledgements
 
-- [Andrej Karpathy](https://github.com/karpathy) for nanoGPT
+- [Andrej Karpathy](https://github.com/karpathy) for [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat)
 - [Elixir Nx team](https://github.com/elixir-nx) for Nx, EXLA, and EMLX

@@ -35,6 +35,7 @@ defmodule ExNanoGPT.BlockTest do
     }
   end
 
+  @tag :golden
   test "transformer block forward matches PyTorch" do
     input = load_golden("block_input")
     params = load_block_params()

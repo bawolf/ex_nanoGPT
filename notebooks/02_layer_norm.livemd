@@ -1,35 +1,19 @@
 # 02: Layer Normalization
 
 ```elixir
-Mix.install([
-  {:nx, "~> 0.10"},
-  {:exla, "~> 0.10"},
-  {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"},
-  {:vega_lite, "~> 0.1"},
-  {:kino_vega_lite, "~> 0.1"}
-])
+Code.require_file("setup.exs", __DIR__)
 
-# Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
-backend = System.get_env("NX_BACKEND", "emlx")
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
 
-case backend do
-  "exla" ->
-    Nx.global_default_backend(EXLA.Backend)
-    Nx.Defn.global_default_options(compiler: EXLA)
-    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
-
-  "emlx_cpu" ->
-    Nx.global_default_backend({EMLX.Backend, device: :cpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (CPU)")
-
-  _ ->
-    Nx.global_default_backend({EMLX.Backend, device: :gpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (Apple Metal GPU)")
-end
-
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
@@ -56,6 +40,43 @@ Where:
 The key: normalization happens across the **last axis** (the embedding dimension), independently for each token position.
 
 ## See It In Action
+
+But first, we need an Nx concept: **axes**.
+
+### Nx Mini-Lesson: Axes and keep_axes
+
+Every Nx reduction function (`Nx.sum`, `Nx.mean`, `Nx.variance`, etc.) takes an `axes:` option that says *which dimension to collapse*. Axes are numbered from 0, and `-1` means "the last one."
+
+```elixir
+t = Nx.tensor([[1.0, 2.0, 3.0],
+               [4.0, 5.0, 6.0]])
+IO.inspect(Nx.shape(t), label: "shape: {2 rows, 3 cols}")
+
+# Sum along axis 0 (collapse rows → one value per column)
+IO.inspect(Nx.sum(t, axes: [0]), label: "sum axis 0: {3}")
+
+# Sum along axis -1 (collapse columns → one value per row)
+IO.inspect(Nx.sum(t, axes: [-1]), label: "sum axis -1: {2}")
+```
+
+**`keep_axes: true`** keeps the collapsed dimension as size 1 instead of removing it. This matters for broadcasting:
+
+```elixir
+# Without keep_axes: shape goes from {2, 3} → {2} (dimension removed)
+mean_no_keep = Nx.mean(t, axes: [-1])
+IO.inspect(Nx.shape(mean_no_keep), label: "without keep_axes")
+
+# With keep_axes: shape goes from {2, 3} → {2, 1} (dimension kept as size 1)
+mean_keep = Nx.mean(t, axes: [-1], keep_axes: true)
+IO.inspect(Nx.shape(mean_keep), label: "with keep_axes")
+
+# {2, 1} can broadcast against {2, 3} for subtraction — {2} cannot
+IO.inspect(Nx.subtract(t, mean_keep), label: "t - mean (works!)")
+
+# Try: Nx.subtract(t, mean_no_keep) — this would fail or give wrong results
+```
+
+For layer norm, we need to subtract the mean and divide by the standard deviation *per row*. `keep_axes: true` makes the shapes line up.
 
 ```elixir
 # Before normalization: values are all over the place

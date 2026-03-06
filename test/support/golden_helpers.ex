@@ -3,7 +3,7 @@ defmodule ExNanoGPT.Test.GoldenHelpers do
   Helpers for golden tests: load reference .npy files and compare tensors.
   """
 
-  alias ExNanoGPT.Test.Npy
+  alias ExNanoGPT.Npy
 
   @golden_dir Path.join([File.cwd!(), "test", "golden"])
 

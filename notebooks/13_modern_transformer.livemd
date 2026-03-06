@@ -1,0 +1,453 @@
+# 13: Assembling the Modern Transformer — From Sparsity to Softcapping
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## Three Activation Functions Walk Into a Model
+
+Our v1 transformer uses GELU — a smooth approximation of ReLU developed in 2016. It's a solid choice. But in 2021, So et al. at Google Brain used **neural architecture search** to find better transformer primitives. Their system, called **Primer** (NeurIPS 2021), tried thousands of combinations and converged on a remarkably simple change: just square the output of ReLU.
+
+The result was surprising. **ReLU-squared produces dramatically sparser activations** — most neurons output exactly zero. This isn't a bug. Sparse networks are faster (skip zero multiplications), more interpretable (fewer active features = easier to understand), and often more parameter-efficient. Karpathy adopted it in nanochat for exactly these reasons.
+
+Let's see for ourselves.
+
+```elixir
+x_range = Nx.linspace(-3.0, 3.0, n: 200)
+
+relu_vals = Nx.max(x_range, 0.0)
+relu_sq_vals = Nx.multiply(relu_vals, relu_vals)
+gelu_vals = Nx.multiply(x_range, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(x_range, Nx.sqrt(Nx.tensor(2.0)))))))
+
+x_list = Nx.to_flat_list(x_range)
+
+chart_data =
+  Enum.zip([x_list, Nx.to_flat_list(relu_vals), Nx.to_flat_list(relu_sq_vals), Nx.to_flat_list(gelu_vals)])
+  |> Enum.flat_map(fn {x, relu, relu2, gelu} ->
+    [
+      %{"x" => Float.round(x, 3), "y" => Float.round(relu, 4), "activation" => "ReLU"},
+      %{"x" => Float.round(x, 3), "y" => Float.round(relu2, 4), "activation" => "ReLU-squared (v2)"},
+      %{"x" => Float.round(x, 3), "y" => Float.round(gelu, 4), "activation" => "GELU (v1)"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "Activation Functions: GELU (v1) vs ReLU-squared (v2)")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Input")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "Output")
+|> Vl.encode_field(:color, "activation", type: :nominal)
+```
+
+Look at the curves. GELU has a smooth transition — small negative inputs produce small negative outputs. ReLU-squared is harsh: anything negative is exactly 0, and positive values get amplified quadratically.
+
+### Counting the Zeros
+
+Feed 1000 random values through each activation and count how many are "active" (above a small threshold):
+
+```elixir
+key = Nx.Random.key(42)
+{activations, _} = Nx.Random.normal(key, 0.0, 1.0, shape: {1000})
+
+relu_out = Nx.max(activations, 0.0)
+relu2_out = Nx.multiply(relu_out, relu_out)
+gelu_out = Nx.multiply(activations, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(activations, Nx.sqrt(Nx.tensor(2.0)))))))
+
+threshold = 0.1
+
+gelu_active = Nx.sum(Nx.greater(Nx.abs(gelu_out), threshold)) |> Nx.to_number()
+relu_active = Nx.sum(Nx.greater(Nx.abs(relu_out), threshold)) |> Nx.to_number()
+relu2_active = Nx.sum(Nx.greater(Nx.abs(relu2_out), threshold)) |> Nx.to_number()
+
+sparsity_data = [
+  %{"activation" => "GELU (v1)", "active_neurons" => gelu_active, "pct" => Float.round(gelu_active / 10, 1)},
+  %{"activation" => "ReLU", "active_neurons" => relu_active, "pct" => Float.round(relu_active / 10, 1)},
+  %{"activation" => "ReLU-squared (v2)", "active_neurons" => relu2_active, "pct" => Float.round(relu2_active / 10, 1)}
+]
+
+Vl.new(width: 400, height: 250, title: "Active Neurons (|output| > #{threshold}) out of 1000")
+|> Vl.data_from_values(sparsity_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "activation", type: :nominal, sort: ["GELU (v1)", "ReLU", "ReLU-squared (v2)"])
+|> Vl.encode_field(:y, "active_neurons", type: :quantitative, title: "Active Neurons")
+|> Vl.encode_field(:color, "activation", type: :nominal, legend: nil)
+```
+
+ReLU-squared has the fewest active neurons. Fewer features fire, but the ones that do fire *strongly*. This is the sparsity advantage.
+
+## Math Notation
+
+| Symbol | Meaning | Nx code |
+|--------|---------|---------|
+| `ReLU²(x)` | `max(0, x)²` | `Nx.multiply(Nx.max(x, 0), Nx.max(x, 0))` |
+| `λ_r` | Residual lambda | `resid_lambdas[i]` |
+| `λ_0` | x0 lambda (skip from initial embedding) | `x0_lambdas[i]` |
+| `softcap(x)` | `c · tanh(x/c)` | `softcap * Nx.tanh(x / softcap)` |
+| `W_E` | Input token embedding | `wte` |
+| `W_H` | Output lm_head (untied from W_E) | `lm_head` |
+
+## Logit Softcapping: Preventing Overconfidence
+
+In 2024, Google's Gemma 2 team introduced **logit softcapping**. The problem: during early training, logits can blow up to extreme values. A logit of 50 for one token and -50 for the rest means the model is 100% confident in its prediction — which is almost certainly wrong for an untrained model.
+
+Hard clipping (just cap at ±20) would work, but it kills gradients at the boundary. The Gemma team used `tanh` instead: smooth, differentiable, and naturally bounded between -1 and 1.
+
+`softcap(x) = c · tanh(x / c)`
+
+For small inputs (well within the cap), this is approximately the identity function. Only extreme values get compressed.
+
+```elixir
+softcap = 20.0
+logit_range = Nx.linspace(-50.0, 50.0, n: 300)
+
+identity_vals = Nx.to_flat_list(logit_range)
+capped_vals = Nx.to_flat_list(Nx.multiply(softcap, Nx.tanh(Nx.divide(logit_range, softcap))))
+
+cap_data =
+  Enum.zip(identity_vals, capped_vals)
+  |> Enum.flat_map(fn {raw, capped} ->
+    [
+      %{"logit" => Float.round(raw, 2), "output" => Float.round(raw, 2), "function" => "Identity (no cap)"},
+      %{"logit" => Float.round(raw, 2), "output" => Float.round(capped, 4), "function" => "Softcap (c=20)"}
+    ]
+  end)
+
+Vl.new(width: 500, height: 300, title: "Logit Softcapping: smooth, differentiable, bounded")
+|> Vl.data_from_values(cap_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "logit", type: :quantitative, title: "Raw logit")
+|> Vl.encode_field(:y, "output", type: :quantitative, title: "Output")
+|> Vl.encode_field(:color, "function", type: :nominal)
+```
+
+Notice: within [-10, 10], the softcapped line is almost identical to identity. Only beyond ±15 does the compression become visible. The model barely notices the cap during normal operation — it only kicks in to prevent disaster.
+
+```elixir
+IO.puts("Near-identity property:\n")
+
+for val <- [-5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0] do
+  capped = softcap * :math.tanh(val / softcap)
+  diff = abs(val - capped)
+  IO.puts("  logit=#{String.pad_leading(Float.to_string(val), 6)} -> capped=#{String.pad_leading(Float.to_string(Float.round(capped, 3)), 8)}  diff=#{Float.round(diff, 4)}")
+end
+```
+
+### Verify Against the v2 Model
+
+```elixir
+test_logits = Nx.tensor([[-30.0, -5.0, 0.0, 5.0, 30.0]])
+
+reference = ExNanoGPT.V2.Model.softcap_logits(test_logits)
+ours = Nx.multiply(20.0, Nx.tanh(Nx.divide(test_logits, 20.0)))
+
+diff = Nx.subtract(ours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts(if diff < 1.0e-5, do: "MATCH! Max diff: #{diff}", else: "MISMATCH. Max diff: #{diff}")
+```
+
+## Value Embeddings: The 44% Surprise
+
+Here's something remarkable about Karpathy's nanochat architecture. In October 2024, Loshchilov et al. at NVIDIA published **nGPT**, a transformer where all vectors live on a hypersphere. Part of this idea — giving each layer an additional "value embedding" looked up by token identity — made its way into nanochat.
+
+In nanochat's record-setting model, **value embeddings account for 604 million out of 1.38 billion parameters** — nearly 44% of the entire model.
+
+The idea: on alternating layers, look up a learned vector for each token (like the input embedding, but separate) and add it to V. This gives the attention mechanism a direct signal about *what* each token is, independent of the surrounding context.
+
+```elixir
+config = ExNanoGPT.V2.Model.tiny_config()
+
+IO.puts("Which layers get value embeddings?\n")
+for i <- 0..(config.n_layer - 1) do
+  has_ve = ExNanoGPT.V2.Model.has_ve?(i, config.n_layer)
+  IO.puts("  Layer #{i}: #{if has_ve, do: "YES (value embeddings)", else: "no"}")
+end
+
+ve_params = config.vocab_size * config.n_kv_head * div(config.n_embd, config.n_head)
+layers_with_ve = Enum.count(0..(config.n_layer - 1), &ExNanoGPT.V2.Model.has_ve?(&1, config.n_layer))
+total_ve = ve_params * layers_with_ve
+IO.puts("\nValue embedding params per layer: #{ve_params}")
+IO.puts("Layers with VE: #{layers_with_ve}")
+IO.puts("Total VE params: #{total_ve}")
+IO.puts("Gate channels: #{ExNanoGPT.V2.Model.ve_gate_channels()}")
+```
+
+## Per-Layer Residual Scaling
+
+In v1, the residual connection is simple: `x = x + block(x)`. In v2, each layer first applies per-layer scaling:
+
+`x = λ_r · x + λ_0 · x₀`
+
+where x₀ is the initial embedding (saved after the first RMSNorm). This gives the model fine-grained control over how much of the original signal survives at each depth. The x₀ skip acts as a "gradient highway" — gradients flow directly from the loss back to the embeddings, making deep networks trainable.
+
+```elixir
+n_layers = 6
+resid_lambdas = Nx.broadcast(Nx.tensor(1.0, type: :f32), {n_layers})
+x0_lambdas = Nx.broadcast(Nx.tensor(0.1, type: :f32), {n_layers})
+
+IO.puts("At each layer:")
+IO.puts("  x = #{Nx.to_number(resid_lambdas[0])} * x + #{Nx.to_number(x0_lambdas[0])} * x0")
+IO.puts("\nThe running state x gets full weight (1.0).")
+IO.puts("The original embedding x0 gets a small influence (0.1).")
+IO.puts("These lambdas are learnable — the model discovers the right balance during training.")
+```
+
+## The Full Forward Pass
+
+Here's the complete architecture. Every piece — RMSNorm, RoPE, GQA, QK norm, sliding window, ReLU-squared, value embeddings, residual scaling, softcapping — assembled into one forward pass.
+
+```
+Input token IDs: {batch, seq_len}
+        |
+        v
+   Token Embedding (wte)        <- {vocab_size, n_embd}
+        |
+        v
+   RMSNorm (embed)
+        |
+        +--- save as x0 (for skip connections)
+        |
+        v
+  +------------- Layer i ---------------+
+  |  x = lambda_r * x + lambda_0 * x0  |  <- per-layer scaling
+  |  x_norm = RMSNorm(x)               |
+  |  Q = x_norm * W_Q      (n_head)    |
+  |  K = x_norm * W_K      (n_kv_head) |
+  |  V = x_norm * W_V + VE (n_kv_head) |  <- value embeddings on alt layers
+  |  Q, K = RoPE(Q, K)                 |
+  |  Q, K = RMSNorm(Q), RMSNorm(K)     |  <- QK normalization
+  |  K, V = expand_heads(K, V)          |  <- GQA head expansion
+  |  attn = softmax(Q*K^T/sqrt(d)+mask)*V|  <- sliding window mask
+  |  x = x + attn * W_proj             |
+  |  x = x + ReLU²(RMSNorm(x)*W_fc)*W_p|
+  +-------------------------------------+
+        |                    x n_layer
+        v
+   RMSNorm (final)
+        |
+        v
+   Linear (lm_head)             <- {vocab_size, n_embd}, untied from wte
+        |
+        v
+   Softcap: 20*tanh(logits/20)
+        |
+        v
+   Output logits: {batch, seq_len, vocab_size}
+```
+
+### Initialize and Run
+
+```elixir
+config = ExNanoGPT.V2.Model.tiny_config()
+key = Nx.Random.key(1337)
+params = ExNanoGPT.V2.Model.init_params(config, key)
+
+IO.puts("v2 Model Config:")
+IO.puts("  vocab_size:   #{config.vocab_size}")
+IO.puts("  n_layer:      #{config.n_layer}")
+IO.puts("  n_head:       #{config.n_head}")
+IO.puts("  n_kv_head:    #{config.n_kv_head}")
+IO.puts("  n_embd:       #{config.n_embd}")
+IO.puts("  window_pattern: #{config.window_pattern}")
+```
+
+```elixir
+batch = 2
+seq_len = 16
+idx = Nx.tensor(
+  Enum.map(1..batch, fn _ ->
+    Enum.map(1..seq_len, fn _ -> :rand.uniform(config.vocab_size) - 1 end)
+  end),
+  type: :s32
+)
+
+logits = ExNanoGPT.V2.Model.forward(idx, params, config)
+
+IO.inspect(Nx.shape(logits), label: "output logits shape (should be {2, 16, 256})")
+IO.puts("\nLogit range: [#{Float.round(Nx.to_number(Nx.reduce_min(logits)), 4)}, #{Float.round(Nx.to_number(Nx.reduce_max(logits)), 4)}]")
+IO.puts("Softcap bound: [-20.0, 20.0]")
+IO.puts("All logits within softcap? #{Nx.to_number(Nx.reduce_max(Nx.abs(logits))) < 20.001}")
+```
+
+### Parameter Count
+
+```elixir
+v2_count = ExNanoGPT.V2.Model.count_params(params)
+
+v1_config = %{
+  vocab_size: 65, block_size: 256, n_layer: 6,
+  n_head: 6, n_embd: 384, dropout: 0.0, bias: true
+}
+v1_params = ExNanoGPT.Model.init_params(v1_config, Nx.Random.key(0))
+v1_count = ExNanoGPT.Model.count_params(v1_params, non_embedding: false)
+
+format_params = fn n ->
+  cond do
+    n >= 1_000_000 -> "#{Float.round(n / 1_000_000, 2)}M"
+    n >= 1_000 -> "#{Float.round(n / 1_000, 1)}K"
+    true -> "#{n}"
+  end
+end
+
+IO.puts("Parameter counts:")
+IO.puts("  v1 (nanoGPT):  #{format_params.(v1_count)} (vocab=#{v1_config.vocab_size}, d=#{v1_config.n_embd}, layers=#{v1_config.n_layer})")
+IO.puts("  v2 (nanochat):  #{format_params.(v2_count)} (vocab=#{config.vocab_size}, d=#{config.n_embd}, layers=#{config.n_layer})")
+IO.puts("\nYou just built the same architecture Karpathy used to train a")
+IO.puts("GPT-2-quality chatbot for under $100 in cloud compute.")
+```
+
+## Break It
+
+### Remove softcapping
+
+Without softcapping, logits can grow unbounded. With random weights this is mild, but during training it causes instability.
+
+```elixir
+x_test = Nx.take(params.wte, idx, axis: 0)
+x_test = ExNanoGPT.V2.Model.rms_norm(x_test)
+
+raw_logits = Nx.dot(x_test, [-1], params.lm_head, [1])
+capped_logits = ExNanoGPT.V2.Model.softcap_logits(raw_logits)
+
+IO.puts("Raw logit range:    [#{Float.round(Nx.to_number(Nx.reduce_min(raw_logits)), 2)}, #{Float.round(Nx.to_number(Nx.reduce_max(raw_logits)), 2)}]")
+IO.puts("Capped logit range: [#{Float.round(Nx.to_number(Nx.reduce_min(capped_logits)), 4)}, #{Float.round(Nx.to_number(Nx.reduce_max(capped_logits)), 4)}]")
+IO.puts("\nSoftcapping guarantees logits stay in [-20, 20], preventing overconfident predictions.")
+```
+
+### Set resid_lambdas to 0
+
+If `lambda_r = 0`, the running hidden state is discarded at each layer. Only the x0 skip survives.
+
+```elixir
+broken_params = %{params | resid_lambdas: Nx.broadcast(Nx.tensor(0.0, type: :f32), {config.n_layer})}
+logits_broken = ExNanoGPT.V2.Model.forward(idx, broken_params, config)
+
+IO.puts("Normal logit std:     #{Float.round(Nx.to_number(Nx.standard_deviation(logits)), 4)}")
+IO.puts("resid_lambda=0 std:   #{Float.round(Nx.to_number(Nx.standard_deviation(logits_broken)), 4)}")
+IO.puts("\nWith resid_lambda=0, each block's computation is thrown away.")
+IO.puts("x = 0*x + 0.1*x0 — the transformer blocks have no cumulative effect.")
+```
+
+### Challenge: Value Embeddings vs More MLP
+
+Value embeddings account for ~44% of nanochat's parameters. What if you gave those parameters to the MLP instead? Would the model be better or worse?
+
+Think about it: value embeddings provide a *context-free* signal about token identity. The MLP provides a *context-dependent* transformation. Are both necessary? Why might the context-free signal be valuable even when you have context?
+
+## Architecture Comparison: v1 vs v2
+
+| Feature | v1 (nanoGPT / GPT-2) | v2 (nanochat / LLaMA-style) |
+|---------|----------------------|----------------------------|
+| **Normalization** | LayerNorm (learnable γ, β) | RMSNorm (no learnable params) |
+| **Position encoding** | Learned absolute embeddings | RoPE (rotary, relative) |
+| **Attention** | Multi-head (n_head = n_kv_head) | GQA (n_kv_head ≤ n_head) |
+| **QKV projection** | Single combined c_attn | Separate W_Q, W_K, W_V |
+| **QK normalization** | None | RMSNorm on Q and K |
+| **Attention mask** | Full causal | Sliding window (alternating) |
+| **MLP activation** | GELU | ReLU-squared |
+| **Bias** | Yes (in all linear layers) | No (nowhere) |
+| **Weight tying** | lm_head = wte^T | Untied (separate lm_head) |
+| **Residual** | x + block(x) | λ_r·x + λ_0·x₀ + block(x) |
+| **Value embeddings** | None | Alternating layers |
+| **Logit bounding** | None | Softcap: c·tanh(logits/c) |
+
+Every change was motivated by a specific problem. Simpler normalization (RMSNorm). Better position handling (RoPE). Less memory (GQA). Stable training (QK norm, softcapping). Sparser features (ReLU-squared). Gradient highways (λ scaling).
+
+## The Full Symbol Table
+
+Every symbol you've learned across all 14 notebooks:
+
+| Notebook | Symbols |
+|----------|---------|
+| 00 | Σ (sum), xᵢ (indexing) |
+| 01 | W ∈ ℝ^{m×n} (matrix shape), W[i] (row lookup) |
+| 02 | μ (mean), σ² (variance), ε (epsilon), γ/β (scale/shift) |
+| 03 | Q, K, V (projections), d_k (head dim), softmax, ^T (transpose) |
+| 04 | GELU, Φ (Gaussian CDF), erf (error function) |
+| 05 | x_{l+1} = x_l + F(x_l) (residual connection) |
+| 06 | W_E^T (transposed weight tying) |
+| 07 | L (loss), log, P(y\|x) (conditional probability) |
+| 08 | α (learning rate), β₁/β₂ (decay rates), ∇ (gradient), θ (parameters) |
+| 09 | ∇_θ L (gradient of loss w.r.t. params) |
+| 10 | T (temperature), P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T) |
+| 11 | RMS(x), θᵢ (RoPE frequency), R(θ) (rotation matrix) |
+| 12 | n_h, n_kv (head counts), w (window size), W_Q/W_K/W_V |
+| 13 | ReLU²(x), λ_r/λ_0 (residual scaling), softcap(x), W_E/W_H (untied) |
+
+Every symbol maps directly to Nx code you wrote. You can now read modern ML papers and understand the architecture behind LLaMA, Gemma, and Mistral.
+
+## The Whole Thing
+
+Everything from notebooks 11-13 — RoPE, RMSNorm, GQA, QK norm, sliding window, ReLU-squared, value embeddings, residual scaling, softcapping — fits in **one file, 292 lines**. Open `lib/ex_nano_gpt/v2_compact.ex` and read it top to bottom.
+
+```elixir
+Code.require_file("../lib/ex_nano_gpt/v2_compact.ex")
+
+# Run the compact model
+compact_logits = ExNanoGPT.V2Compact.forward(idx, params, config)
+
+diff =
+  Nx.subtract(compact_logits, logits)
+  |> Nx.abs()
+  |> Nx.reduce_max()
+  |> Nx.to_number()
+
+IO.puts("Max diff between reference and v2_compact.ex: #{diff}")
+IO.puts(if diff < 1.0e-4, do: "✓ Identical. You just built this 292-line model piece by piece.", else: "✗ Mismatch — #{diff}")
+```
+
+<details>
+<summary>The entire forward pass from v2_compact.ex</summary>
+
+```elixir
+# lib/ex_nano_gpt/v2_compact.ex — forward/3
+def forward(idx, params, %__MODULE__{} = config) do
+  %{n_layer: n, n_head: nh, n_kv_head: nkv, n_embd: d} = config
+  head_dim = div(d, nh)
+  seq_len = Nx.axis_size(idx, 1)
+  ws = window_sizes(config)
+  {cos, sin} = precompute_rope(seq_len, head_dim)
+
+  x = Nx.take(params.wte, idx, axis: 0) |> rms_norm()
+  x0 = x
+
+  x =
+    Enum.reduce(0..(n - 1), x, fn i, x ->
+      rl = Nx.reshape(params.resid_lambdas[i], {1, 1, 1})
+      xl = Nx.reshape(params.x0_lambdas[i], {1, 1, 1})
+      x = Nx.add(Nx.multiply(rl, x), Nx.multiply(xl, x0))
+
+      block(x, elem(params.blocks, i), elem(params.value_embeds, i), idx, cos, sin,
+        n_head: nh, n_kv_head: nkv, window_size: Enum.at(ws, i))
+    end)
+
+  logits = Nx.dot(rms_norm(x), [-1], params.lm_head, [1])
+  Nx.multiply(@softcap, Nx.tanh(Nx.divide(logits, @softcap)))
+end
+```
+
+RoPE frequencies, RMSNorm, per-layer residual scaling with x0 skip, value embeddings, sliding window attention, softcapping. Every line maps to something you built and verified in notebooks 11-13.
+
+</details>
+
+## What's Next
+
+The model is built. But it only works with character-level tokens — one byte per character. Next: **BPE tokenization**, the algorithm that went from a 1994 data compression paper to the foundation of every modern LLM's vocabulary.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **ReLU-squared** | `max(0, x)²` — sparser than GELU, better feature selection. Zhang et al., Feb 2024. |
+| **Softcapping** | `c · tanh(logits/c)` — smooth logit bounding. Gemma 2 team, Google 2024. |
+| **Value embeddings** | Token-identity signals added to V on alternating layers. From nGPT / nanochat. |
+| **Residual scaling** | `λ_r · x + λ_0 · x₀` — per-layer gradient highways |
+| **Untied embeddings** | Separate input (wte) and output (lm_head) weight matrices |

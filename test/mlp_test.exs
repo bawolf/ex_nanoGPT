@@ -6,6 +6,7 @@ defmodule ExNanoGPT.MLPTest do
 
   @n_embd 32
 
+  @tag :golden
   test "MLP forward matches PyTorch" do
     input = load_golden("mlp_input")
     # extract.py saves weights in our convention {in, out} already

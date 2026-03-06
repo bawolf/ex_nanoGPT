@@ -13,6 +13,7 @@ ex_nano_gpt-*.tar
 
 # Checkpoints and training output
 /out-*/
+/weights/
 *.ckpt
 *.etf
 
@@ -30,3 +31,4 @@ __pycache__/
 # IDE
 .elixir_ls/
 .vscode/
+test/support/golden_v2/

@@ -1,0 +1,448 @@
+# 15: KV Cache — Why Generation Is Slow (and How to Fix It)
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## Why Is This Slow?
+
+Let's generate some tokens with our v2 model and time each step.
+
+```elixir
+alias ExNanoGPT.V2.Model
+
+config = Model.tiny_config()
+key = Nx.Random.key(42)
+params = Model.init_params(config, key)
+
+prompt = [1, 50, 100, 200, 42]
+
+### Nx Mini-Lesson: Multi-Axis Access Syntax
+
+Nx lets you index into multiple dimensions at once with `tensor[[axis0, axis1, ...]]`:
+
+```elixir
+t = Nx.iota({2, 4, 3})
+IO.inspect(Nx.shape(t), label: "shape: {2 batches, 4 positions, 3 features}")
+
+# Single element from each axis
+IO.inspect(t[[0, 2, 1]], label: "batch 0, position 2, feature 1")
+
+# -1 means last, .. means all
+IO.inspect(t[[0, -1, ..]], label: "batch 0, last position, ALL features")
+IO.inspect(t[[1, 0, ..]], label: "batch 1, first position, ALL features")
+```
+
+We use `logits[[0, -1, ..]]` to grab the logits for the last token in batch 0 -- that's the prediction for the next token.
+
+step_times =
+  Enum.reduce(1..15, {prompt, []}, fn step, {seq, times} ->
+    {time_us, logits} = :timer.tc(fn ->
+      Model.forward(Nx.tensor([seq], type: :s32), params, config)
+    end)
+
+    next_token = Nx.to_number(Nx.argmax(logits[[0, -1, ..]]))
+    time_ms = Float.round(time_us / 1000, 1)
+    {seq ++ [next_token], [{step, time_ms, length(seq)} | times]}
+  end)
+  |> elem(1)
+  |> Enum.reverse()
+
+time_data =
+  Enum.map(step_times, fn {step, ms, seq_len} ->
+    %{"step" => step, "time_ms" => ms, "seq_len" => seq_len}
+  end)
+
+Vl.new(width: 500, height: 300, title: "Time Per Generation Step (no cache)")
+|> Vl.data_from_values(time_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "step", type: :ordinal, title: "Generation Step")
+|> Vl.encode_field(:y, "time_ms", type: :quantitative, title: "Time (ms)")
+```
+
+Each step gets slower. Why? Because at step 15, we're recomputing Q, K, and V for **all 20 tokens** — the 5 prompt tokens plus the 15 we've generated. We already computed K and V for the first 19 tokens at the previous step. We're redoing all that work just to process one new token.
+
+Over n generation steps, the total work is proportional to **Sigma(t²) ≈ O(n³)**.
+
+The Transformer team at Google saw this coming. In the original "Attention Is All You Need" paper (Vaswani et al., June 2017), they included a mechanism for caching K and V during autoregressive decoding. **KV caching isn't a later optimization — it's a fundamental design decision from day one.**
+
+## The Fix: Remember What You've Already Computed
+
+**Without cache**: recompute K, V for the entire sequence at every step. O(n³) total.
+
+**With cache**: store K, V from previous steps. Only compute K, V for the single new token. O(n²) total.
+
+```elixir
+data =
+  for n <- [10, 20, 30, 50, 75, 100] do
+    without = Enum.sum(for t <- 1..n, do: t * t)
+    with_cache = Enum.sum(for t <- 1..n, do: t)
+
+    [
+      %{"tokens" => n, "operations" => without, "method" => "Without Cache O(n^3)"},
+      %{"tokens" => n, "operations" => with_cache, "method" => "With Cache O(n^2)"}
+    ]
+  end
+  |> List.flatten()
+
+Vl.new(width: 500, height: 300, title: "Total Computation: Cached vs Non-Cached")
+|> Vl.data_from_values(data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "tokens", type: :ordinal, title: "Tokens Generated")
+|> Vl.encode_field(:y, "operations", type: :quantitative, title: "Total Operations")
+|> Vl.encode_field(:color, "method", type: :nominal)
+|> Vl.encode_field(:xOffset, "method", type: :nominal)
+```
+
+At 100 tokens, the non-cached approach does roughly **50x** more work. The gap only widens.
+
+## Build a KV Cache
+
+The cache is a simple data structure: pre-allocated tensors for K and V at each layer, plus a position counter.
+
+### Nx Mini-Lesson: Nx.put_slice (Writing Into a Tensor)
+
+The KV cache is a pre-allocated block of zeros. As we generate tokens, we write each new K/V into the next slot. `Nx.put_slice` does this -- it writes a smaller tensor into a region of a larger one:
+
+```elixir
+# Pre-allocate a 3x5 block of zeros
+cache = Nx.broadcast(0.0, {3, 5})
+IO.inspect(cache, label: "empty cache")
+
+# Write a 3x2 patch starting at column 2
+patch = Nx.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+updated = Nx.put_slice(cache, [0, 2], patch)
+IO.inspect(updated, label: "after writing at position [0, 2]")
+
+# Write another patch at column 0
+patch2 = Nx.tensor([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+updated2 = Nx.put_slice(updated, [0, 0], patch2)
+IO.inspect(updated2, label: "after writing at position [0, 0]")
+```
+
+Nx is immutable -- `put_slice` returns a NEW tensor (the original is unchanged). Think of it like `List.replace_at` but for multi-dimensional regions.
+
+```elixir
+defmodule SimpleKVCache do
+  defstruct [:k_cache, :v_cache, :pos, :max_seq, :n_layers]
+
+  def new(opts) do
+    # TODO:
+    # 1. Read: batch_size, n_layers, n_kv_head, head_dim, max_seq from opts
+    # 2. shape = {batch_size, max_seq, n_kv_head, head_dim}
+    # 3. Create n_layers zero tensors for K and n_layers for V
+    # 4. Convert to tuples with List.to_tuple
+    # 5. Return %SimpleKVCache{k_cache: ..., v_cache: ..., pos: 0, ...}
+    %__MODULE__{pos: 0}
+  end
+
+  def update(cache, layer_idx, new_k, new_v) do
+    # TODO:
+    # 1. k = elem(cache.k_cache, layer_idx)
+    # 2. k = Nx.put_slice(k, [0, cache.pos, 0, 0], new_k)
+    #    ↑ Nx Bridge: Nx.put_slice(tensor, start_indices, slice) writes `slice`
+    #      into `tensor` at the given start position. It returns a NEW tensor
+    #      (Nx is immutable). Think of it like List.replace_at but for
+    #      multi-dimensional regions. The start indices [0, pos, 0, 0] mean
+    #      "batch 0, starting at sequence position `pos`, first head, first dim."
+    # 3. Same for v
+    # 4. Advance pos ONLY after the last layer
+    cache
+  end
+
+  def get_layer(cache, layer_idx) do
+    # TODO: {elem(cache.k_cache, layer_idx), elem(cache.v_cache, layer_idx)}
+    {nil, nil}
+  end
+
+  def get_pos(cache), do: cache.pos
+end
+
+IO.puts("Module defined. Fill in the TODOs or check the solution below.")
+```
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+defmodule SimpleKVCache do
+  defstruct [:k_cache, :v_cache, :pos, :max_seq, :n_layers]
+
+  def new(opts) do
+    batch = opts[:batch_size]
+    n_layers = opts[:n_layers]
+    n_kv_head = opts[:n_kv_head]
+    head_dim = opts[:head_dim]
+    max_seq = opts[:max_seq]
+
+    shape = {batch, max_seq, n_kv_head, head_dim}
+    k_cache = for _ <- 1..n_layers, do: Nx.broadcast(Nx.tensor(0.0, type: :f32), shape)
+    v_cache = for _ <- 1..n_layers, do: Nx.broadcast(Nx.tensor(0.0, type: :f32), shape)
+
+    %__MODULE__{
+      k_cache: List.to_tuple(k_cache),
+      v_cache: List.to_tuple(v_cache),
+      pos: 0, max_seq: max_seq, n_layers: n_layers
+    }
+  end
+
+  def update(cache, layer_idx, new_k, new_v) do
+    k = elem(cache.k_cache, layer_idx)
+    v = elem(cache.v_cache, layer_idx)
+    k = Nx.put_slice(k, [0, cache.pos, 0, 0], new_k)
+    v = Nx.put_slice(v, [0, cache.pos, 0, 0], new_v)
+    k_cache = put_elem(cache.k_cache, layer_idx, k)
+    v_cache = put_elem(cache.v_cache, layer_idx, v)
+    new_pos =
+      if layer_idx == cache.n_layers - 1,
+        do: cache.pos + Nx.axis_size(new_k, 1),
+        else: cache.pos
+    %{cache | k_cache: k_cache, v_cache: v_cache, pos: new_pos}
+  end
+
+  def get_layer(cache, layer_idx) do
+    {elem(cache.k_cache, layer_idx), elem(cache.v_cache, layer_idx)}
+  end
+
+  def get_pos(cache), do: cache.pos
+end
+```
+
+</details>
+
+### Test It
+
+```elixir
+cache = SimpleKVCache.new(
+  batch_size: 1, n_layers: 2, n_kv_head: 2, head_dim: 4, max_seq: 10
+)
+
+IO.puts("Initial pos: #{SimpleKVCache.get_pos(cache)}")
+
+new_k = Nx.iota({1, 1, 2, 4}, type: :f32)
+new_v = Nx.multiply(new_k, 2.0)
+
+cache = SimpleKVCache.update(cache, 0, new_k, new_v)
+IO.puts("After layer 0 update, pos: #{SimpleKVCache.get_pos(cache)}  (unchanged — not last layer)")
+
+cache = SimpleKVCache.update(cache, 1, new_k, new_v)
+IO.puts("After layer 1 update, pos: #{SimpleKVCache.get_pos(cache)}  (advanced — last layer)")
+
+{k, _v} = SimpleKVCache.get_layer(cache, 0)
+IO.puts("\nPosition 0 (filled):  #{inspect(Nx.to_flat_list(k[[0, 0, .., ..]]) |> Enum.map(&Float.round(&1, 1)))}")
+IO.puts("Position 1 (zeros):   #{inspect(Nx.to_flat_list(k[[0, 1, .., ..]]) |> Enum.map(&Float.round(&1, 1)))}")
+```
+
+### Verify Against the Library
+
+```elixir
+alias ExNanoGPT.V2.KVCache
+
+lib_cache = KVCache.new(batch_size: 1, n_layers: 2, n_kv_head: 2, head_dim: 4, max_seq: 10)
+lib_cache = KVCache.update(lib_cache, 0, new_k, new_v)
+lib_cache = KVCache.update(lib_cache, 1, new_k, new_v)
+
+{lib_k, _} = KVCache.get_layer(lib_cache, 0)
+{our_k, _} = SimpleKVCache.get_layer(cache, 0)
+
+diff = Nx.subtract(lib_k, our_k) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+IO.puts("Max difference: #{diff}")
+IO.puts(if diff < 1.0e-6, do: "MATCH!", else: "MISMATCH")
+```
+
+## The Moment of Truth: Cached vs Non-Cached
+
+The critical test: cached forward must produce **identical logits** to non-cached forward.
+
+```elixir
+alias ExNanoGPT.V2.{Model, KVCache}
+
+idx = Nx.tensor([prompt], type: :s32)
+head_dim = div(config.n_embd, config.n_head)
+
+logits_full = Model.forward(idx, params, config)
+logits_last_pos = logits_full[[0, -1, ..]]
+
+cache = KVCache.new(
+  batch_size: 1, n_layers: config.n_layer,
+  n_kv_head: config.n_kv_head, head_dim: head_dim,
+  max_seq: config.sequence_len
+)
+
+{logits_cached, cache} = Model.forward_cached(idx, params, config, cache)
+logits_cached_flat = logits_cached[[0, 0, ..]]
+
+diff = Nx.subtract(logits_last_pos, logits_cached_flat) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+
+IO.puts("Max logit difference: #{Float.round(diff, 8)}")
+IO.puts(if diff < 0.01, do: "MATCH! Cache is correct.", else: "MISMATCH.")
+IO.puts("Cache position after prefill: #{KVCache.get_pos(cache)}")
+```
+
+### Generate Tokens with the Cache
+
+```elixir
+num_gen = 20
+
+{tokens, fill_data, _cache} =
+  Enum.reduce(1..num_gen, {[], [%{"step" => 0, "filled" => length(prompt)}], cache}, fn step, {tokens, data, cache} ->
+    last_token =
+      if tokens == [],
+        do: Nx.to_number(Nx.argmax(logits_cached[[0, 0, ..]])),
+        else: List.last(tokens)
+
+    next_idx = Nx.tensor([[last_token]], type: :s32)
+    {logits, cache} = Model.forward_cached(next_idx, params, config, cache)
+    next_token = Nx.to_number(Nx.argmax(logits[[0, 0, ..]]))
+
+    new_data = %{"step" => step, "filled" => KVCache.get_pos(cache)}
+    {tokens ++ [next_token], [new_data | data], cache}
+  end)
+
+IO.puts("Generated #{length(tokens)} tokens")
+IO.puts("Final cache position: #{List.first(fill_data)["filled"]}")
+```
+
+### Visualize: Cache Filling Up
+
+```elixir
+Vl.new(width: 500, height: 300, title: "KV Cache Fill During Generation")
+|> Vl.data_from_values(Enum.reverse(fill_data))
+|> Vl.mark(:area, interpolate: "step-after", opacity: 0.6)
+|> Vl.encode_field(:x, "step", type: :quantitative, title: "Generation Step")
+|> Vl.encode_field(:y, "filled", type: :quantitative, title: "Cache Positions Filled")
+```
+
+The cache starts with the prompt (5 positions), then grows by exactly 1 per step.
+
+## The Payoff: Benchmark
+
+```elixir
+_ = Model.forward(Nx.tensor([prompt], type: :s32), params, config)
+warmup_cache = KVCache.new(batch_size: 1, n_layers: config.n_layer,
+  n_kv_head: config.n_kv_head, head_dim: head_dim, max_seq: config.sequence_len)
+_ = Model.forward_cached(Nx.tensor([prompt], type: :s32), params, config, warmup_cache)
+
+bench_data =
+  for n <- [5, 10, 20, 40] do
+    {time_no_cache, _} =
+      :timer.tc(fn ->
+        Enum.reduce(1..n, prompt, fn _, seq ->
+          logits = Model.forward(Nx.tensor([seq], type: :s32), params, config)
+          next = Nx.to_number(Nx.argmax(logits[[0, -1, ..]]))
+          seq ++ [next]
+        end)
+      end)
+
+    {time_cached, _} =
+      :timer.tc(fn ->
+        c = KVCache.new(batch_size: 1, n_layers: config.n_layer,
+          n_kv_head: config.n_kv_head, head_dim: head_dim, max_seq: config.sequence_len)
+        {logits, c} = Model.forward_cached(Nx.tensor([prompt], type: :s32), params, config, c)
+        first = Nx.to_number(Nx.argmax(logits[[0, 0, ..]]))
+
+        Enum.reduce(2..n, {first, c}, fn _, {last, c} ->
+          {logits, c} = Model.forward_cached(Nx.tensor([[last]], type: :s32), params, config, c)
+          {Nx.to_number(Nx.argmax(logits[[0, 0, ..]])), c}
+        end)
+      end)
+
+    no_ms = Float.round(time_no_cache / 1000, 1)
+    yes_ms = Float.round(time_cached / 1000, 1)
+    speedup = if yes_ms > 0, do: Float.round(no_ms / yes_ms, 1), else: 0.0
+    IO.puts("#{String.pad_leading("#{n}", 3)} tokens:  no_cache=#{no_ms}ms  cached=#{yes_ms}ms  speedup=#{speedup}x")
+
+    [
+      %{"tokens" => n, "time_ms" => no_ms, "method" => "Without Cache"},
+      %{"tokens" => n, "time_ms" => yes_ms, "method" => "With Cache"}
+    ]
+  end
+  |> List.flatten()
+```
+
+```elixir
+Vl.new(width: 500, height: 300, title: "Generation Time: The KV Cache Payoff")
+|> Vl.data_from_values(bench_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "tokens", type: :ordinal, title: "Tokens Generated")
+|> Vl.encode_field(:y, "time_ms", type: :quantitative, title: "Time (ms)")
+|> Vl.encode_field(:color, "method", type: :nominal)
+|> Vl.encode_field(:xOffset, "method", type: :nominal)
+```
+
+The speedup grows with sequence length — exactly as the O(n²) vs O(n³) analysis predicts.
+
+## Break It
+
+### Wrong RoPE Position Offset
+
+RoPE encodes absolute position. If we reset the cache position to 0 at each step, every new token thinks it's at position 0 — wrong rotation angles, scrambled attention.
+
+```elixir
+correct_cache = KVCache.new(batch_size: 1, n_layers: config.n_layer,
+  n_kv_head: config.n_kv_head, head_dim: head_dim, max_seq: config.sequence_len)
+{_, correct_cache} = Model.forward_cached(idx, params, config, correct_cache)
+
+{correct_tokens, _} =
+  Enum.reduce(1..10, {[], correct_cache}, fn _, {toks, cache} ->
+    last = if toks == [], do: Nx.to_number(Nx.argmax(logits_cached[[0, 0, ..]])), else: List.last(toks)
+    {logits, cache} = Model.forward_cached(Nx.tensor([[last]], type: :s32), params, config, cache)
+    {toks ++ [Nx.to_number(Nx.argmax(logits[[0, 0, ..]]))], cache}
+  end)
+
+broken_cache = KVCache.new(batch_size: 1, n_layers: config.n_layer,
+  n_kv_head: config.n_kv_head, head_dim: head_dim, max_seq: config.sequence_len)
+{_, broken_cache} = Model.forward_cached(idx, params, config, broken_cache)
+
+{broken_tokens, _} =
+  Enum.reduce(1..10, {[], broken_cache}, fn _, {toks, cache} ->
+    last = if toks == [], do: Nx.to_number(Nx.argmax(logits_cached[[0, 0, ..]])), else: List.last(toks)
+    bad_cache = %{cache | pos: 0}
+    {logits, cache} = Model.forward_cached(Nx.tensor([[last]], type: :s32), params, config, bad_cache)
+    {toks ++ [Nx.to_number(Nx.argmax(logits[[0, 0, ..]]))], cache}
+  end)
+
+IO.puts("Correct tokens: #{inspect(correct_tokens)}")
+IO.puts("Broken tokens:  #{inspect(broken_tokens)}")
+IO.puts("Match: #{correct_tokens == broken_tokens}")
+IO.puts("\nWith wrong positions, RoPE angles are wrong -> attention patterns are scrambled.")
+```
+
+### Challenge: What Happens When the Cache Is Full?
+
+Our cache has a fixed `max_seq`. What happens when you generate past it? Design a strategy.
+
+*Hint: In 2023, vLLM introduced PagedAttention — borrowing the idea of virtual memory pages from operating systems to manage KV cache dynamically. Before that, early systems just crashed or silently produced garbage. Modern approaches include rolling windows (discard oldest entries) and sparse attention patterns.*
+
+## Real-World Connection
+
+KV caching is why ChatGPT can stream tokens to you in real time. Without it, generating the 100th token in a response would require re-reading the entire conversation from scratch — 100x more work than necessary.
+
+In 2023, the KV cache became the central focus of LLM infrastructure optimization. vLLM's PagedAttention paper showed that naive cache management wastes 60-80% of GPU memory. By treating cache memory like an operating system treats virtual memory — small pages, on-demand allocation — they achieved 2-4x better throughput.
+
+Today, every major LLM deployment (ChatGPT, Claude, Gemini) uses sophisticated KV cache management. The simple idea we built here — "don't recompute what you've already computed" — scales up to the defining infrastructure challenge of the AI era.
+
+## What's Next
+
+We have a model, a tokenizer, and fast inference. But our model just predicts the next token — it doesn't know how to have a conversation. Next: **Supervised Fine-Tuning**, the technique that turned GPT-3 into ChatGPT.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **KV Cache** | Store K/V from previous tokens to avoid recomputation. In the original Transformer, 2017. |
+| **Prefill** | Processing the full prompt in one pass, filling the cache |
+| **Incremental decode** | Processing one new token per step, reading K/V from cache |
+| **O(n³) -> O(n²)** | Total generation cost drops from cubic to quadratic |
+| **RoPE alignment** | Position embeddings must match actual token positions in cache |
+| **PagedAttention** | Virtual-memory-style cache management. vLLM, 2023. |

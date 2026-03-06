@@ -55,19 +55,25 @@ defmodule ExNanoGPT.ModelTest do
     }
   end
 
+  @tag :golden
   test "GPT training forward matches PyTorch" do
     input = load_golden("gpt_input")
     params = load_gpt_params()
     expected_logits = load_golden("gpt_logits_training")
 
     key = Nx.Random.key(0)
-    actual_logits = Model.forward_train(input, params, key,
-      n_head: @config.n_head, dropout_rate: @config.dropout)
+
+    actual_logits =
+      Model.forward_train(input, params, key,
+        n_head: @config.n_head,
+        dropout_rate: @config.dropout
+      )
 
     assert Nx.shape(actual_logits) == {2, 8, 65}
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
   end
 
+  @tag :golden
   test "GPT inference forward matches PyTorch" do
     input = load_golden("gpt_input")
     params = load_gpt_params()
@@ -80,6 +86,7 @@ defmodule ExNanoGPT.ModelTest do
     assert_close(actual_logits, expected_logits, atol: 1.0e-4)
   end
 
+  @tag :golden
   test "cross-entropy loss matches PyTorch" do
     input = load_golden("gpt_input")
     targets = load_golden("gpt_targets")
@@ -87,8 +94,13 @@ defmodule ExNanoGPT.ModelTest do
     expected_loss = load_golden("gpt_loss")
 
     key = Nx.Random.key(0)
-    logits = Model.forward_train(input, params, key,
-      n_head: @config.n_head, dropout_rate: @config.dropout)
+
+    logits =
+      Model.forward_train(input, params, key,
+        n_head: @config.n_head,
+        dropout_rate: @config.dropout
+      )
+
     actual_loss = Model.cross_entropy_loss(logits, targets)
 
     expected_scalar = Nx.squeeze(expected_loss)

@@ -41,21 +41,25 @@ defmodule ExNanoGPT.TrainerTest do
     key = Nx.Random.key(42)
     params = Model.init_params(@model_config, key)
 
-    x = Nx.tensor([[1, 5, 10, 20, 30, 15, 8, 3],
-                    [60, 2, 45, 12, 7, 55, 33, 0]])
-    y = Nx.tensor([[5, 10, 20, 30, 15, 8, 3, 42],
-                    [2, 45, 12, 7, 55, 33, 0, 11]])
+    x = Nx.tensor([[1, 5, 10, 20, 30, 15, 8, 3], [60, 2, 45, 12, 7, 55, 33, 0]])
+    y = Nx.tensor([[5, 10, 20, 30, 15, 8, 3, 42], [2, 45, 12, 7, 55, 33, 0, 11]])
 
     dropout_key = Nx.Random.key(0)
-    optim_config = %{ExNanoGPT.Optimizer.default_config() |
-      learning_rate: 1.0e-3,
-      warmup_iters: 0,
-      weight_decay: 0.0,
-      grad_clip: 0.0
+
+    optim_config = %{
+      ExNanoGPT.Optimizer.default_config()
+      | learning_rate: 1.0e-3,
+        warmup_iters: 0,
+        weight_decay: 0.0,
+        grad_clip: 0.0
     }
 
-    logits_before = Model.forward_train(x, params, dropout_key,
-      n_head: @model_config.n_head, dropout_rate: @model_config.dropout)
+    logits_before =
+      Model.forward_train(x, params, dropout_key,
+        n_head: @model_config.n_head,
+        dropout_rate: @model_config.dropout
+      )
+
     loss_before = Nx.to_number(Model.cross_entropy_loss(logits_before, y))
 
     # Take a step
@@ -63,8 +67,12 @@ defmodule ExNanoGPT.TrainerTest do
     opt_state = ExNanoGPT.Optimizer.init(params)
     {new_params, _} = ExNanoGPT.Optimizer.step(params, grads, opt_state, optim_config)
 
-    logits_after = Model.forward_train(x, new_params, dropout_key,
-      n_head: @model_config.n_head, dropout_rate: @model_config.dropout)
+    logits_after =
+      Model.forward_train(x, new_params, dropout_key,
+        n_head: @model_config.n_head,
+        dropout_rate: @model_config.dropout
+      )
+
     loss_after = Nx.to_number(Model.cross_entropy_loss(logits_after, y))
 
     assert loss_after < loss_before

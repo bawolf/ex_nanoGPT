@@ -1,35 +1,19 @@
 # 05: The Transformer Block
 
 ```elixir
-Mix.install([
-  {:nx, "~> 0.10"},
-  {:exla, "~> 0.10"},
-  {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"},
-  {:vega_lite, "~> 0.1"},
-  {:kino_vega_lite, "~> 0.1"}
-])
+Code.require_file("setup.exs", __DIR__)
 
-# Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
-backend = System.get_env("NX_BACKEND", "emlx")
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
 
-case backend do
-  "exla" ->
-    Nx.global_default_backend(EXLA.Backend)
-    Nx.Defn.global_default_options(compiler: EXLA)
-    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
-
-  "emlx_cpu" ->
-    Nx.global_default_backend({EMLX.Backend, device: :cpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (CPU)")
-
-  _ ->
-    Nx.global_default_backend({EMLX.Backend, device: :gpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (Apple Metal GPU)")
-end
-
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
@@ -118,6 +102,31 @@ Combine all the pieces. The forward pass is:
 6. Apply LayerNorm (`ln_2`)
 7. Apply MLP
 8. Add the residual back
+
+### Nx Mini-Lesson: Nx.Random.split (Independent Random Streams)
+
+In Elixir, you just call `:rand.uniform()` three times -- the hidden process state advances automatically. In Nx, randomness is explicit: you **split** a key to get independent streams, then pass each to a different function.
+
+```elixir
+key = Nx.Random.key(42)
+
+# Split into 3 independent keys
+keys = Nx.Random.split(key, parts: 3)
+IO.inspect(Nx.shape(keys), label: "3 independent keys")
+
+# Each key produces different random numbers
+{a, _} = Nx.Random.normal(keys[0], shape: {3})
+{b, _} = Nx.Random.normal(keys[1], shape: {3})
+IO.inspect(Nx.to_flat_list(a) |> Enum.map(&Float.round(&1, 3)), label: "from key 0")
+IO.inspect(Nx.to_flat_list(b) |> Enum.map(&Float.round(&1, 3)), label: "from key 1")
+
+# Same parent key → same children → same random weights every time
+keys2 = Nx.Random.split(Nx.Random.key(42), parts: 3)
+{a2, _} = Nx.Random.normal(keys2[0], shape: {3})
+IO.inspect(Nx.to_flat_list(a2) |> Enum.map(&Float.round(&1, 3)), label: "from key 0 again (same!)")
+```
+
+This guarantees reproducibility: same parent key = same child keys = same random weights every time. We use this to initialize each layer with a different but deterministic random stream.
 
 ```elixir
 n_embd = 8
@@ -236,6 +245,56 @@ blocks_viz =
 {x_viz, _} = Nx.Random.normal(block_keys[n_blocks_viz], shape: {1, 4, n_embd_viz})
 rng_key = Nx.Random.key(0)
 block_opts = [n_head: n_head_viz, dropout_rate: 0.0, training: false]
+
+### Nx Mini-Lesson: defn and value_and_grad
+
+**`defn`** is Nx's version of `def` for numerical code. Functions defined with `defn` get JIT-compiled to run on the GPU:
+
+```elixir
+defmodule DefnDemo do
+  import Nx.Defn
+
+  defn normalize(x) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    x - mean
+  end
+
+  defn relu(x) do
+    Nx.max(x, 0.0)
+  end
+end
+
+x = Nx.tensor([[1.0, 5.0, 3.0], [-2.0, 0.0, 4.0]])
+IO.inspect(DefnDemo.normalize(x), label: "mean-subtracted")
+IO.inspect(DefnDemo.relu(x), label: "ReLU (negative → 0)")
+```
+
+Key rules for `defn`:
+- **Inside `defn`**, you can use `+`, `-`, `*`, `/` directly on tensors (operator overloading). Outside `defn`, you must use `Nx.add`, `Nx.multiply`, etc.
+- Only Nx operations and other `defn` functions can be called -- no `IO.puts`, no `Enum.map`, no pattern matching on tensor values.
+- Use `deftransform` for shape-dependent logic that must be resolved at compile time.
+
+**`Nx.Defn.value_and_grad`** is how neural networks learn. It takes a function that returns a scalar and gives you both the result AND the gradients of all inputs -- automatically:
+
+```elixir
+defmodule GradDemo do
+  import Nx.Defn
+
+  defn squared_sum(x) do
+    Nx.sum(Nx.multiply(x, x))
+  end
+end
+
+grad_fn = Nx.Defn.value_and_grad(&GradDemo.squared_sum/1)
+{value, gradient} = grad_fn.(Nx.tensor([3.0, 4.0]))
+
+IO.inspect(Nx.to_number(value), label: "f(x) = 3² + 4² = 25")
+IO.inspect(Nx.to_flat_list(gradient), label: "gradient = [2*3, 2*4] = [6.0, 8.0]")
+```
+
+The gradient tells us: "if I nudge each input a tiny bit, how much does the output change?" This is what the optimizer uses to update weights. You never manually compute derivatives -- Nx traces through your computation and computes them for you.
+
+Now let's use `value_and_grad` to measure gradient flow through transformer blocks:
 
 # WITH residuals (normal transformer block behavior)
 loss_with_residual = fn blocks ->

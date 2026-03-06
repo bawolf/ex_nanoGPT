@@ -1,0 +1,388 @@
+# 16: From Completion to Chat — The Technique That Created ChatGPT
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install([
+  {:ex_nano_gpt, path: "."},
+  {:vega_lite, "~> 0.1"},
+  {:kino_vega_lite, "~> 0.1"},
+  {:kino, "~> 0.14"}
+])
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## Ask It a Question
+
+Our v1 model was trained on Shakespeare. It learned English, grammar, style. Let's ask it something.
+
+```elixir
+alias ExNanoGPT.V2.{Model, Tokenizer, Conversation}
+
+corpus = """
+Hello! How are you doing today? I'm learning about language models and transformers.
+Elixir is a functional programming language built on the Erlang VM. It's great for
+building scalable and fault-tolerant applications. The BEAM virtual machine provides
+lightweight processes, distributed computing, and hot code upgrades. What is Elixir?
+A programming language that runs on BEAM. How does attention work? It computes a
+weighted sum over value vectors using query-key similarity scores.
+"""
+
+tok = Tokenizer.train(corpus, vocab_size: 300)
+
+config = %Model{
+  sequence_len: 128, vocab_size: tok.vocab_size,
+  n_layer: 2, n_head: 4, n_kv_head: 2,
+  n_embd: 64, window_pattern: "SL"
+}
+
+key = Nx.Random.key(42)
+params = Model.init_params(config, key)
+
+question = "What is Elixir?"
+question_ids = Tokenizer.encode(tok, question)
+
+logits = Model.forward(Nx.tensor([question_ids], type: :s32), params, config)
+
+generated = Enum.reduce(1..20, {question_ids, logits}, fn _, {ids, logits} ->
+  next = Nx.to_number(Nx.argmax(logits[[0, -1, ..]]))
+  new_ids = ids ++ [next]
+  new_logits = Model.forward(Nx.tensor([new_ids], type: :s32), params, config)
+  {new_ids, new_logits}
+end) |> elem(0)
+
+response = Tokenizer.decode(tok, generated)
+IO.puts("Prompt:   \"#{question}\"")
+IO.puts("Response: \"#{response}\"")
+IO.puts("\nThat's gibberish. The model knows language patterns, but it doesn't")
+IO.puts("know how to answer a question. It's never seen a conversation.")
+```
+
+The model is like someone who has read every book but never had a conversation. It can predict text, but it has no concept of "user asks, assistant responds."
+
+## The InstructGPT Moment (January 2022)
+
+On January 27, 2022, OpenAI published a paper that changed everything.
+
+They took GPT-3 — a 175-billion parameter model — and did something remarkably simple. They collected examples of humans answering questions, formatted them as conversations, and fine-tuned a smaller model on those examples.
+
+The result: **InstructGPT**. A 1.3B parameter model — 100x smaller than GPT-3 — that humans *preferred* over the full GPT-3. A model 100x smaller won because it knew the format of a conversation.
+
+The technique? **Supervised Fine-Tuning (SFT).**
+
+Eleven months later, on November 30, 2022, OpenAI applied SFT to GPT-3.5 and launched **ChatGPT**. It reached 100 million users in 2 months — faster than any product in history.
+
+The core insight was deceptively simple: take a text predictor and teach it the *pattern* of conversation.
+
+## The Conversation Format
+
+A conversation is a sequence of turns, marked by special tokens:
+
+```
+<|bos|><|user_start|>What is Elixir?<|user_end|><|assistant_start|>A language on BEAM.<|assistant_end|>
+```
+
+Let's build one and see it as tokens.
+
+```elixir
+turns = [
+  %{role: "user", content: "What is Elixir?"},
+  %{role: "assistant", content: "A functional language on the BEAM."},
+  %{role: "user", content: "What is BEAM?"},
+  %{role: "assistant", content: "The Erlang virtual machine."}
+]
+
+{token_ids, loss_mask} = Conversation.render(turns, tok)
+
+IO.puts("Token count: #{length(token_ids)}")
+IO.puts("Token IDs:  #{inspect(token_ids)}")
+IO.puts("Loss mask:  #{inspect(loss_mask)}")
+```
+
+### Decode and Annotate
+
+```elixir
+special_inv = Map.new(tok.special_map, fn {name, id} -> {id, name} end)
+
+for {id, mask, pos} <- Enum.zip([token_ids, loss_mask, 0..(length(token_ids) - 1)]) do
+  text = Tokenizer.decode(tok, [id])
+  role = cond do
+    Map.has_key?(special_inv, id) -> "special"
+    mask == 1 -> "ASSISTANT"
+    true -> "user"
+  end
+  label = if Map.has_key?(special_inv, id), do: special_inv[id], else: inspect(text)
+  loss_indicator = if mask == 1, do: " <- LEARN THIS", else: ""
+  IO.puts("  [#{pos}] #{String.pad_trailing(role, 10)} #{label}#{loss_indicator}")
+end
+```
+
+## The Key Insight: Loss Masking
+
+Now the critical question: **should the model learn to predict what the USER says?**
+
+Think about it. User messages are arbitrary — the model can never predict what a human will type. Training on user messages wastes capacity on an impossible task. The model should only learn to generate **assistant responses**.
+
+The loss mask encodes this:
+- **1** for assistant content tokens and `<|assistant_end|>` — learn these
+- **0** for everything else — ignore during training
+
+```elixir
+IO.puts("Loss mask breakdown:")
+IO.puts("  Total tokens:     #{length(loss_mask)}")
+IO.puts("  Learns (mask=1):  #{Enum.count(loss_mask, &(&1 == 1))}")
+IO.puts("  Ignores (mask=0): #{Enum.count(loss_mask, &(&1 == 0))}")
+IO.puts("")
+IO.puts("Only #{Float.round(Enum.count(loss_mask, &(&1 == 1)) / length(loss_mask) * 100, 1)}% of tokens contribute to the loss.")
+IO.puts("The model focuses all its learning on being a good assistant.")
+```
+
+### Visualize: Tokens Colored by Role
+
+```elixir
+viz_data =
+  Enum.zip(token_ids, loss_mask)
+  |> Enum.with_index()
+  |> Enum.map(fn {{id, mask}, pos} ->
+    role = cond do
+      Map.has_key?(special_inv, id) -> "special"
+      mask == 1 -> "assistant"
+      true -> "user"
+    end
+    text = if Map.has_key?(special_inv, id), do: special_inv[id], else: Tokenizer.decode(tok, [id])
+    short = if String.length(text) > 12, do: String.slice(text, 0, 12) <> "...", else: text
+    %{"position" => pos, "role" => role, "value" => 1, "token" => short}
+  end)
+
+Vl.new(width: 700, height: 80, title: "Conversation Tokens (colored by role)")
+|> Vl.data_from_values(viz_data)
+|> Vl.mark(:rect, tooltip: true)
+|> Vl.encode_field(:x, "position", type: :ordinal, title: "Position", axis: [label_angle: 0])
+|> Vl.encode_field(:color, "role",
+  type: :nominal,
+  scale: %{domain: ["special", "user", "assistant"], range: ["#6366f1", "#94a3b8", "#22c55e"]}
+)
+|> Vl.encode(:tooltip, [
+  %{field: "position", type: :quantitative},
+  %{field: "role", type: :nominal},
+  %{field: "token", type: :nominal}
+])
+```
+
+### Visualize: The Loss Mask
+
+Green bars = the model learns here. Gray = ignored.
+
+```elixir
+mask_data =
+  Enum.zip(token_ids, loss_mask)
+  |> Enum.with_index()
+  |> Enum.map(fn {{id, mask}, pos} ->
+    role = cond do
+      Map.has_key?(special_inv, id) -> "special"
+      mask == 1 -> "assistant"
+      true -> "user"
+    end
+    text = if Map.has_key?(special_inv, id), do: special_inv[id], else: Tokenizer.decode(tok, [id])
+    short = if String.length(text) > 12, do: String.slice(text, 0, 12) <> "...", else: text
+    %{"position" => pos, "mask" => mask, "role" => role, "token" => short}
+  end)
+
+Vl.new(width: 700, height: 120, title: "Loss Mask: green = trains, gray = ignored")
+|> Vl.data_from_values(mask_data)
+|> Vl.mark(:bar, tooltip: true)
+|> Vl.encode_field(:x, "position", type: :ordinal, title: "Token Position")
+|> Vl.encode_field(:y, "mask", type: :quantitative, title: "Loss Weight", scale: %{domain: [0, 1]})
+|> Vl.encode_field(:color, "role",
+  type: :nominal,
+  scale: %{domain: ["special", "user", "assistant"], range: ["#6366f1", "#94a3b8", "#22c55e"]}
+)
+|> Vl.encode(:tooltip, [
+  %{field: "position", type: :quantitative},
+  %{field: "token", type: :nominal},
+  %{field: "role", type: :nominal},
+  %{field: "mask", type: :quantitative}
+])
+```
+
+## The SFT Training Step
+
+Let's put it all together: take our untrained model, create a batch from conversations, and compute the masked loss. Then see what happens after one training step.
+
+```elixir
+conversations = [
+  [
+    %{role: "user", content: "Hello!"},
+    %{role: "assistant", content: "Hi there!"}
+  ],
+  [
+    %{role: "user", content: "What is Elixir?"},
+    %{role: "assistant", content: "A language on BEAM."}
+  ]
+]
+
+max_len = 64
+{input_ids, target_ids, loss_mask_batch} = Conversation.prepare_batch(conversations, tok, max_len)
+
+IO.puts("Batch shape:")
+IO.puts("  Input:  #{inspect(Nx.shape(input_ids))}")
+IO.puts("  Target: #{inspect(Nx.shape(target_ids))}")
+IO.puts("  Mask:   #{inspect(Nx.shape(loss_mask_batch))}")
+IO.puts("  Mask sum: #{Nx.to_number(Nx.sum(loss_mask_batch))} positions with loss")
+```
+
+```elixir
+logits = Model.forward(input_ids, params, config)
+masked_loss = Model.cross_entropy_loss(logits, target_ids, loss_mask_batch)
+unmasked_loss = Model.cross_entropy_loss(logits, target_ids)
+
+expected = :math.log(tok.vocab_size) |> Float.round(4)
+
+IO.puts("Masked loss (assistant only):  #{Nx.to_number(masked_loss) |> Float.round(4)}")
+IO.puts("Unmasked loss (all tokens):    #{Nx.to_number(unmasked_loss) |> Float.round(4)}")
+IO.puts("Expected for random model:     ~#{expected} (ln(#{tok.vocab_size}))")
+IO.puts("\nBoth are near the random baseline — the model hasn't learned yet.")
+```
+
+### Per-Position Loss: Only Green Bars Count
+
+```elixir
+{batch, seq_len, vocab_size} = Nx.shape(logits)
+flat_logits = Nx.reshape(logits, {batch * seq_len, vocab_size})
+flat_targets = Nx.reshape(target_ids, {batch * seq_len})
+
+log_probs = Nx.subtract(flat_logits, Nx.log(Nx.sum(Nx.exp(flat_logits), axes: [-1], keep_axes: true)))
+one_hot = Nx.equal(
+  Nx.iota({batch * seq_len, vocab_size}, axis: 1),
+  Nx.reshape(flat_targets, {batch * seq_len, 1})
+)
+per_token_nll = Nx.negate(Nx.sum(Nx.multiply(log_probs, one_hot), axes: [-1]))
+
+flat_mask = Nx.reshape(loss_mask_batch, {batch * seq_len})
+masked_nll = Nx.multiply(per_token_nll, flat_mask)
+
+first_seq = Nx.to_flat_list(masked_nll) |> Enum.take(max_len)
+mask_vals = Nx.to_flat_list(flat_mask) |> Enum.take(max_len)
+
+per_pos_data =
+  Enum.zip(first_seq, mask_vals)
+  |> Enum.with_index()
+  |> Enum.map(fn {{nll, mask}, pos} ->
+    %{"position" => pos, "nll" => Float.round(nll, 4),
+      "masked" => if(mask > 0.5, do: "assistant (loss)", else: "ignored")}
+  end)
+
+Vl.new(width: 600, height: 200, title: "Per-Token NLL — only green bars drive learning")
+|> Vl.data_from_values(per_pos_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "position", type: :ordinal, title: "Token Position")
+|> Vl.encode_field(:y, "nll", type: :quantitative, title: "Negative Log-Likelihood")
+|> Vl.encode_field(:color, "masked",
+  type: :nominal,
+  scale: %{domain: ["ignored", "assistant (loss)"], range: ["#d1d5db", "#22c55e"]}
+)
+```
+
+Gray bars are multiplied by zero in the loss — they don't affect gradients. Only green bars (assistant tokens) drive learning.
+
+## Break It
+
+### No Loss Mask: Training on Everything
+
+What if we don't mask at all? The model wastes capacity learning to predict user messages (impossible), special tokens (trivial), and padding (noise).
+
+```elixir
+no_mask_loss = Model.cross_entropy_loss(logits, target_ids)
+masked_loss_val = Model.cross_entropy_loss(logits, target_ids, loss_mask_batch)
+
+IO.puts("Loss (no mask):   #{Nx.to_number(no_mask_loss) |> Float.round(4)}")
+IO.puts("Loss (with mask): #{Nx.to_number(masked_loss_val) |> Float.round(4)}")
+IO.puts("")
+IO.puts("For a random model the numbers look similar. But after training:")
+IO.puts("  - Without mask: the model wastes half its gradient updates on user messages")
+IO.puts("  - With mask: every update improves assistant response quality")
+IO.puts("A masked model converges faster on what matters: generating good responses.")
+```
+
+### Inverted Mask: Learning the Wrong Thing
+
+What if we accidentally mask assistant tokens and unmask user tokens?
+
+```elixir
+inverted_mask = Nx.subtract(1.0, loss_mask_batch)
+
+inverted_loss = Model.cross_entropy_loss(logits, target_ids, inverted_mask)
+correct_loss = Model.cross_entropy_loss(logits, target_ids, loss_mask_batch)
+
+IO.puts("Correct mask loss:  #{Nx.to_number(correct_loss) |> Float.round(4)}")
+IO.puts("Inverted mask loss: #{Nx.to_number(inverted_loss) |> Float.round(4)}")
+IO.puts("")
+IO.puts("Correct mask: #{Nx.to_number(Nx.sum(loss_mask_batch)) |> round()} loss positions")
+IO.puts("Inverted mask: #{Nx.to_number(Nx.sum(inverted_mask)) |> round()} loss positions")
+IO.puts("")
+IO.puts("With an inverted mask, the model learns to predict USER messages")
+IO.puts("and special tokens — exactly backwards. It would learn to mimic")
+IO.puts("users instead of being a helpful assistant.")
+```
+
+### Challenge: Why Multi-Turn?
+
+Single-turn: each conversation is one user message + one assistant response.
+Multi-turn: the full conversation history is kept.
+
+```elixir
+multi_turn = [
+  %{role: "user", content: "What is Elixir?"},
+  %{role: "assistant", content: "A functional language."},
+  %{role: "user", content: "What VM does it run on?"},
+  %{role: "assistant", content: "The BEAM VM."}
+]
+
+single_turn = [
+  %{role: "user", content: "What VM does it run on?"},
+  %{role: "assistant", content: "The BEAM VM."}
+]
+
+{multi_ids, _} = Conversation.render(multi_turn, tok)
+{single_ids, _} = Conversation.render(single_turn, tok)
+
+IO.puts("Multi-turn: #{length(multi_ids)} tokens (full context)")
+IO.puts("Single-turn: #{length(single_ids)} tokens (no context)")
+IO.puts("")
+IO.puts("In multi-turn, when the assistant answers 'The BEAM VM.',")
+IO.puts("it can attend to 'What is Elixir?' and 'A functional language.'")
+IO.puts("The pronoun 'it' in 'What VM does IT run on?' refers to Elixir —")
+IO.puts("but without context, the model can't know that.")
+IO.puts("")
+IO.puts("Multi-turn SFT teaches the model to handle conversational references,")
+IO.puts("follow-up questions, and context-dependent responses.")
+```
+
+## Real-World Connection
+
+This is literally how ChatGPT was made:
+
+1. **Pre-train** on internet text (the model learns language)
+2. **SFT** on conversations (the model learns to be helpful) — *you just did this step*
+3. **RLHF** (the model learns to be safe and aligned with human preferences)
+
+The SFT step is the one that matters most for capability. InstructGPT showed that a 1.3B model with SFT beats a 175B model without it. The format — knowing *when* to respond, *how* to respond, and *when to stop* — is more important than raw scale.
+
+When you use ChatGPT, Claude, or Gemini, every response you see was shaped by SFT. The model isn't just predicting the next token — it's following a conversation pattern it learned from human-written examples, with a loss mask that focused its learning on being a good assistant.
+
+## What's Next
+
+We have a model that can (in theory) have conversations. But right now it lives in a notebook. Next: **serving it with Phoenix LiveView** — streaming tokens to a real chat interface in your browser.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **SFT** | Supervised Fine-Tuning — train on conversations with human-written responses. InstructGPT, Jan 2022. |
+| **Loss mask** | Binary mask controlling which tokens contribute to the loss (assistant = 1, else = 0) |
+| **Conversation format** | Special tokens mark role boundaries in the token stream |
+| **Multi-turn context** | Full conversation history so the model handles references and follow-ups |
+| **ChatGPT** | GPT-3.5 + SFT + RLHF. Nov 30, 2022. 100M users in 2 months. |
+| **The key insight** | A model 100x smaller wins if it knows the format of conversation |

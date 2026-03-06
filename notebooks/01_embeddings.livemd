@@ -1,35 +1,19 @@
 # 01: Embeddings
 
 ```elixir
-Mix.install([
-  {:nx, "~> 0.10"},
-  {:exla, "~> 0.10"},
-  {:emlx, github: "elixir-nx/emlx", branch: "main"},
-  {:kino, "~> 0.14"},
-  {:vega_lite, "~> 0.1"},
-  {:kino_vega_lite, "~> 0.1"}
-])
+Code.require_file("setup.exs", __DIR__)
 
-# Backend: "emlx" (default, Apple Metal GPU), "exla", or "emlx_cpu"
-backend = System.get_env("NX_BACKEND", "emlx")
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
 
-case backend do
-  "exla" ->
-    Nx.global_default_backend(EXLA.Backend)
-    Nx.Defn.global_default_options(compiler: EXLA)
-    IO.puts("Backend: EXLA (CPU on Mac, CUDA on Linux)")
-
-  "emlx_cpu" ->
-    Nx.global_default_backend({EMLX.Backend, device: :cpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (CPU)")
-
-  _ ->
-    Nx.global_default_backend({EMLX.Backend, device: :gpu})
-    Nx.Defn.global_default_options(compiler: EMLX)
-    IO.puts("Backend: EMLX (Apple Metal GPU)")
-end
-
+NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
@@ -61,11 +45,32 @@ embedding = wte[token_id]
 IO.inspect(embedding, label: "embedding for token 2")
 ```
 
+### Nx Mini-Lesson: Nx.take (Table Lookup)
+
+In Elixir, to look up multiple items from a list by index, you'd write `Enum.map(indices, fn i -> Enum.at(list, i) end)`. In Nx, the equivalent is `Nx.take` -- but it works on tensors and runs in parallel on the GPU:
+
+```elixir
+# A small lookup table: 5 rows, each with 3 values
+table = Nx.tensor([[0.1, 0.2, 0.3],
+                   [0.4, 0.5, 0.6],
+                   [0.7, 0.8, 0.9],
+                   [1.0, 1.1, 1.2],
+                   [1.3, 1.4, 1.5]])
+
+# Look up rows 0, 2, and 4 all at once
+indices = Nx.tensor([0, 2, 4])
+result = Nx.take(table, indices, axis: 0)
+IO.inspect(result, label: "rows 0, 2, 4 from the table")
+IO.inspect(Nx.shape(result), label: "shape: 3 rows looked up, each with 3 values")
+```
+
+This is exactly how embeddings work: the embedding table is a `{vocab_size, n_embd}` tensor, and `Nx.take` grabs the rows we need by token ID.
+
 ```elixir
 # Embed a whole sequence at once using Nx.take
 token_ids = Nx.tensor([0, 2, 4, 1])
 embedded = Nx.take(wte, token_ids, axis: 0)
-IO.inspect(Nx.shape(embedded), label: "shape")
+IO.inspect(Nx.shape(embedded), label: "shape: 4 tokens, each a 3-dim vector")
 IO.inspect(embedded, label: "embedded sequence")
 ```
 
@@ -144,7 +149,37 @@ end
 
 ## Combining Token + Position Embeddings
 
-The full embedding is simply **token embedding + position embedding**. Thanks to broadcasting, this works even though token embeddings are `{batch, seq_len, n_embd}` and position embeddings are `{seq_len, n_embd}`.
+The full embedding is simply **token embedding + position embedding**. But their shapes are different -- how can we add them?
+
+### Nx Mini-Lesson: Broadcasting
+
+In Elixir, you can't add a list to a number: `[1, 2, 3] + 1` is an error. In Nx, it works -- and the rules are called **broadcasting**:
+
+```elixir
+a = Nx.tensor([[1.0, 2.0, 3.0],
+               [4.0, 5.0, 6.0]])
+
+# Add a scalar -- broadcasts to every element
+IO.inspect(Nx.add(a, 10.0), label: "{2,3} + scalar")
+
+# Add a 1D tensor -- broadcasts along rows
+b = Nx.tensor([100.0, 200.0, 300.0])
+IO.inspect(Nx.add(a, b), label: "{2,3} + {3}")
+
+# Add a column -- broadcasts along columns
+c = Nx.tensor([[10.0], [20.0]])
+IO.inspect(Nx.add(a, c), label: "{2,3} + {2,1}")
+```
+
+The rule: Nx compares dimensions from the right. Each pair must either be equal, or one must be 1 (which stretches). Missing dimensions on the left are treated as 1.
+
+```
+{1, 5, 3} + {5, 3}  →  {1, 5, 3}  ✓  (3=3, 5=5, missing=1)
+{2, 3}    + {3}      →  {2, 3}     ✓  (3=3, missing=1)
+{2, 3}    + {2}      →  ERROR      ✗  (3≠2, neither is 1)
+```
+
+This is exactly what lets us add token embeddings `{batch, seq_len, n_embd}` and position embeddings `{seq_len, n_embd}` -- the batch dimension broadcasts automatically.
 
 ```elixir
 # Combine them
@@ -153,7 +188,9 @@ tok_emb = Nx.take(wte, idx, axis: 0)       # {1, 5, 3}
 pos_emb = Nx.slice_along_axis(wpe, 0, 5, axis: 0)  # {5, 3}
 
 x = Nx.add(tok_emb, pos_emb)  # {1, 5, 3} + {5, 3} = {1, 5, 3} via broadcasting
-IO.inspect(Nx.shape(x), label: "combined embedding shape")
+IO.inspect(Nx.shape(tok_emb), label: "token embedding shape")
+IO.inspect(Nx.shape(pos_emb), label: "position embedding shape")
+IO.inspect(Nx.shape(x), label: "combined (broadcast added)")
 ```
 
 ### Why Does Addition Work for Combining?
@@ -167,6 +204,8 @@ Think of it like GPS coordinates: latitude and longitude are independent numbers
 ## Dropout
 
 After combining embeddings, nanoGPT applies **dropout**: randomly zeroing out some values during training. This prevents the model from relying too heavily on any single feature, which improves generalization.
+
+> **Nx Bridge**: `Nx.Random.uniform(key, shape: ...)` returns `{tensor, new_key}` — a tensor of random floats AND a fresh PRNG key. `Nx.greater(mask, 0.2)` returns a tensor of 0s and 1s (like a boolean list). Multiplying by this "keep mask" zeroes out random elements. This pattern — generate random tensor, compare, mask — replaces the `if :rand.uniform() > 0.2` you'd write in Elixir.
 
 ```elixir
 # Dropout: randomly zero out 20% of values, scale up the rest
