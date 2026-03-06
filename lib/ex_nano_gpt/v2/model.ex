@@ -322,6 +322,159 @@ defmodule ExNanoGPT.V2.Model do
   end
 
   # ---------------------------------------------------------------------------
+  # Forward with KV cache (for autoregressive inference)
+  # ---------------------------------------------------------------------------
+
+  alias ExNanoGPT.V2.KVCache
+
+  @doc """
+  Forward pass with KV cache for incremental generation.
+
+  Only processes the new token(s) in `idx`, using cached K/V for previous tokens.
+  Returns `{logits, updated_cache}` where logits are for the last position only.
+  """
+  def forward_cached(idx, params, %__MODULE__{} = config, %KVCache{} = cache) do
+    %{n_layer: n, n_head: nh, n_kv_head: nkv, n_embd: d} = config
+    head_dim = div(d, nh)
+    new_tokens = Nx.axis_size(idx, 1)
+    pos = KVCache.get_pos(cache)
+    window_sizes = compute_window_sizes(config)
+
+    # RoPE for the new positions only
+    {full_cos, full_sin} = precompute_rope(pos + new_tokens, head_dim)
+    cos = Nx.slice_along_axis(full_cos, pos, new_tokens, axis: 1)
+    sin = Nx.slice_along_axis(full_sin, pos, new_tokens, axis: 1)
+
+    x = Nx.take(params.wte, idx, axis: 0)
+    x = rms_norm(x)
+    x0 = x
+
+    {x, cache} =
+      0..(n - 1)
+      |> Enum.reduce({x, cache}, fn i, {x, cache} ->
+        rl = Nx.reshape(params.resid_lambdas[i], {1, 1, 1})
+        xl = Nx.reshape(params.x0_lambdas[i], {1, 1, 1})
+        x = Nx.add(Nx.multiply(rl, x), Nx.multiply(xl, x0))
+
+        block_params = elem(params.blocks, i)
+        ve = elem(params.value_embeds, i)
+        ws = Enum.at(window_sizes, i)
+
+        {x, cache} = block_forward_cached(
+          x, block_params, ve, idx, cos, sin, cache, i,
+          n_head: nh, n_kv_head: nkv, window_size: ws
+        )
+        {x, cache}
+      end)
+
+    x = rms_norm(x)
+    # Only return logits for the last position
+    x = Nx.slice_along_axis(x, new_tokens - 1, 1, axis: 1)
+    logits = Nx.dot(x, [-1], params.lm_head, [1])
+    {softcap_logits(logits), cache}
+  end
+
+  defp block_forward_cached(x, block_params, ve, idx, cos, sin, cache, layer_idx, opts) do
+    n_head = opts[:n_head]
+    n_kv_head = opts[:n_kv_head]
+    head_dim = div(Nx.axis_size(x, 2), n_head)
+    {batch, seq_len, _} = Nx.shape(x)
+
+    x_normed = rms_norm(x)
+
+    v_extra =
+      case ve do
+        :none ->
+          Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch, seq_len, n_kv_head, head_dim})
+        ve_tensor ->
+          compute_v_extra(x_normed, idx, ve_tensor, block_params.ve_gate, n_kv_head, head_dim)
+      end
+
+    {attn_out, cache} = attention_forward_cached(
+      x_normed, block_params, v_extra, cos, sin, cache, layer_idx, opts
+    )
+    x = Nx.add(x, attn_out)
+    mlp_out = mlp_forward(rms_norm(x), block_params)
+    {Nx.add(x, mlp_out), cache}
+  end
+
+  defp attention_forward_cached(x, block_params, v_extra, cos, sin, cache, layer_idx, opts) do
+    n_head = opts[:n_head]
+    n_kv_head = opts[:n_kv_head]
+    window_size = opts[:window_size]
+    {batch, new_t, n_embd} = Nx.shape(x)
+    head_dim = div(n_embd, n_head)
+
+    # Project new tokens
+    q = Nx.dot(x, [-1], block_params.c_q, [0]) |> Nx.reshape({batch, new_t, n_head, head_dim})
+    k_new = Nx.dot(x, [-1], block_params.c_k, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
+    v_new = Nx.dot(x, [-1], block_params.c_v, [0]) |> Nx.reshape({batch, new_t, n_kv_head, head_dim})
+
+    v_new = Nx.add(v_new, v_extra)
+
+    q = apply_rope(q, cos, sin)
+    k_new = apply_rope(k_new, cos, sin)
+    q = rms_norm(q)
+    k_new = rms_norm(k_new)
+
+    # Update cache
+    cache = KVCache.update(cache, layer_idx, k_new, v_new)
+
+    # Read full K/V from cache (up to current position + new tokens)
+    {k_full, v_full} = KVCache.get_layer(cache, layer_idx)
+    # After update of last layer, pos is advanced. For intermediate layers, we need to
+    # compute total_len from the cache pos + new_t if this isn't the last layer yet.
+    total_len = if layer_idx < cache.n_layers - 1, do: cache.pos + new_t, else: cache.pos
+    k_full = Nx.slice_along_axis(k_full, 0, total_len, axis: 1)
+    v_full = Nx.slice_along_axis(v_full, 0, total_len, axis: 1)
+
+    # GQA expand K/V
+    repeat = div(n_head, n_kv_head)
+    if repeat > 1 do
+      k_full = k_full |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
+               |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
+               |> Nx.reshape({batch, total_len, n_head, head_dim})
+      v_full = v_full |> Nx.reshape({batch, total_len, n_kv_head, 1, head_dim})
+               |> Nx.broadcast({batch, total_len, n_kv_head, repeat, head_dim})
+               |> Nx.reshape({batch, total_len, n_head, head_dim})
+      do_cached_attention(q, k_full, v_full, block_params.c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache)
+    else
+      do_cached_attention(q, k_full, v_full, block_params.c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache)
+    end
+  end
+
+  defp do_cached_attention(q, k, v, c_proj, batch, new_t, n_head, head_dim, total_len, window_size, cache) do
+    # q: (B, new_t, H, D), k/v: (B, total_len, H, D)
+    # Transpose to (B, H, *, D)
+    q = Nx.transpose(q, axes: [0, 2, 1, 3])  # (B, H, new_t, D)
+    k = Nx.transpose(k, axes: [0, 2, 1, 3])  # (B, H, total_len, D)
+    v = Nx.transpose(v, axes: [0, 2, 1, 3])
+
+    scale = 1.0 / :math.sqrt(head_dim)
+    scores = Nx.multiply(Nx.dot(q, [3], [0, 1], k, [3], [0, 1]), scale)
+    # scores: (B, H, new_t, total_len)
+
+    # Causal mask: for the new positions, only attend to positions <= current
+    pos_offset = total_len - new_t
+    q_pos = Nx.add(Nx.iota({new_t, 1}, axis: 0, type: :s32), pos_offset)
+    k_pos = Nx.iota({1, total_len}, axis: 1, type: :s32)
+    causal = Nx.greater_equal(q_pos, k_pos)
+    window = Nx.greater(k_pos, Nx.subtract(q_pos, window_size))
+    mask = Nx.logical_and(causal, window)
+    mask = Nx.reshape(mask, {1, 1, new_t, total_len})
+    mask = Nx.broadcast(mask, {batch, n_head, new_t, total_len})
+    neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), {batch, n_head, new_t, total_len})
+    scores = Nx.select(mask, scores, neg_inf)
+
+    attn = stable_softmax(scores)
+    y = Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])  # (B, H, new_t, D)
+    y = Nx.transpose(y, axes: [0, 2, 1, 3])  # (B, new_t, H, D)
+    y = Nx.reshape(y, {batch, new_t, n_head * head_dim})
+    output = Nx.dot(y, [-1], c_proj, [0])
+    {output, cache}
+  end
+
+  # ---------------------------------------------------------------------------
   # Loss (with optional mask for SFT)
   # ---------------------------------------------------------------------------
 
