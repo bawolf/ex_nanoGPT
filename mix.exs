@@ -14,7 +14,8 @@ defmodule ExNanoGPT.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {ExNanoGPT.Application, []}
     ]
   end
 
@@ -26,7 +27,11 @@ defmodule ExNanoGPT.MixProject do
       {:nx, "~> 0.10"},
       {:exla, "~> 0.10"},
       {:emlx, github: "elixir-nx/emlx", branch: "main"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:phoenix, "~> 1.7"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.0"},
+      {:bandit, "~> 1.0"}
     ]
   end
 end

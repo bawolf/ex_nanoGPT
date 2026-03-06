@@ -2,7 +2,8 @@ defmodule ExNanoGPT.V2.ModelTest do
   use ExUnit.Case, async: false
 
   alias ExNanoGPT.V2.Model
-  alias ExNanoGPT.Test.{Npy, GoldenHelpers}
+  alias ExNanoGPT.Npy
+  alias ExNanoGPT.Test.GoldenHelpers
 
   @golden_dir Path.join([File.cwd!(), "test", "support", "golden_v2"])
 

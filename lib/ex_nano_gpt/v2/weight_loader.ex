@@ -23,7 +23,7 @@ defmodule ExNanoGPT.V2.WeightLoader do
   """
 
   alias ExNanoGPT.V2.Model
-  alias ExNanoGPT.Test.Npy
+  alias ExNanoGPT.Npy
 
   @doc """
   Load converted nanochat weights from a directory of .npy files.
