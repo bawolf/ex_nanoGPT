@@ -58,10 +58,12 @@ defmodule ExNanoGPT.Sampler do
       top_k: top_k
     )
 
-    generated_idx
-    |> Nx.squeeze(axes: [0])
-    |> Nx.to_flat_list()
-    |> Data.decode(data)
+    ids =
+      generated_idx
+      |> Nx.squeeze(axes: [0])
+      |> Nx.to_flat_list()
+
+    Data.decode(data, ids)
   end
 
   @doc """
