@@ -1,4 +1,4 @@
-# 07: Cross-Entropy Loss
+# 08: Cross-Entropy Loss
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -225,6 +225,15 @@ IO.inspect(Nx.sum(probs, axes: [-1]), label: "row sums (should be ~1.0)")
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Use `Nx.reduce_max(logits, axes: [-1], keep_axes: true)` to find the max value per row (operates independently on each row).
+2. Subtract the max from every element: `Nx.subtract(logits, max)`.
+3. Compute `shifted - log(sum(exp(shifted)))` — use `Nx.exp`, `Nx.sum` with `axes: [-1], keep_axes: true`, `Nx.log`, then `Nx.subtract`.
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -245,6 +254,8 @@ For example, if `log_probs` is a 3x4 matrix and `targets` is `[2, 0, 3]`, we wan
 - Row 0, column 2
 - Row 1, column 0
 - Row 2, column 3
+
+> **Nx Bridge**: `Nx.equal(a, b)` compares tensors element-wise, returning 1 where equal and 0 elsewhere -- like `a == b` but for every element. `Nx.negate(x)` flips the sign -- like `-x`. `Nx.not_equal(a, b)` is the opposite of `equal`. These three are the building blocks for masks and one-hot encoding.
 
 The trick: create a one-hot encoding of the targets and multiply element-wise, then sum each row. The one-hot mask zeros out everything except the correct column.
 
@@ -271,6 +282,16 @@ gathered = gather_log_probs.(test_log_probs, test_targets)
 IO.inspect(gathered, label: "gathered log-probs")
 IO.puts("Expected: [-1.44, -1.39] (row 0 col 0, row 1 col 2)")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Get the shape `{n, vocab_size}` from `log_probs`.
+2. Create column indices with `Nx.iota({n, vocab_size}, axis: 1)` and reshape `targets` to `{n, 1}`.
+3. Use `Nx.equal` to compare them and build a one-hot mask (1 where column index matches target, 0 elsewhere).
+4. Multiply `log_probs` by the one-hot mask element-wise, then `Nx.sum(..., axes: [-1])` to get the log-prob of the correct token per row.
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -321,6 +342,16 @@ loss = cross_entropy_loss.(test_logits, test_targets)
 IO.inspect(loss, label: "cross-entropy loss")
 IO.puts("The correct tokens have the highest logits, so loss should be low (~0.4-0.7)")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Flatten logits to `{batch * seq_len, vocab_size}` and targets to `{batch * seq_len}` using `Nx.reshape`.
+2. Apply log-softmax to the flattened logits (same logic as the first exercise).
+3. Gather the log-prob of each correct target using the one-hot trick from the second exercise.
+4. Negate the per-position NLL and take the mean with `Nx.negate(Nx.mean(nll))`.
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -459,21 +490,34 @@ The cross-entropy loss formula:
 
 **L = -(1/N) Σᵢ log P(yᵢ | x)**
 
-Each symbol:
-
-| Math | Meaning | Nx code |
-|------|---------|---------|
-| `L` | The loss (scalar) -- what training minimizes | Result of the loss function |
-| `N` | Number of predictions (batch_size × seq_len) | `Nx.axis_size(flat_targets, 0)` |
-| `yᵢ` | The correct token at position i | `targets[i]` |
-| `P(yᵢ \| x)` | Probability the model assigns to the correct token | `softmax(logits)[correct_index]` |
-| `log` | Natural logarithm (base e) | `Nx.log(x)` |
-| `-` | Negate (because log of probability is negative) | `Nx.negate(x)` |
-| `(1/N) Σᵢ` | Average over all positions | `Nx.mean(x)` |
-
 The intuition: "take the average of -log(probability of correct token) across all positions." Lower = better.
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T, L (loss), log, P(y|x) (conditional probability)
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `log` | Natural logarithm (base e) | `:math.log(x)` | `Nx.log(x)` |
+| `P(yᵢ \| x)` | Probability of correct token | `Enum.at(softmax_probs, correct_idx)` | `softmax(logits)[correct_index]` |
+| `-log P(yᵢ)` | Per-position loss | `-:math.log(prob)` | `Nx.negate(Nx.log(prob))` |
+| `(1/N) Σᵢ` | Average over all positions | `Enum.sum(losses) / length(losses)` | `Nx.mean(losses)` |
+| `L` | Total loss (scalar) | (combined above) | `cross_entropy_loss(logits, targets)` |
+
+<details>
+<summary>All symbols so far (notebooks 00-08)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+| `W_E^T` | Weight-tied output projection |
+| `L` | Loss (scalar) |
+| `log`, `P(y\|x)` | Logarithm, conditional probability |
+
+</details>
 
 ## Key Concepts
 

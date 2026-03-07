@@ -1,0 +1,138 @@
+# 14: The Road from GPT-2 to Modern LLMs
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## You Built a GPT
+
+Across the last 14 notebooks, you built a complete GPT-2 style language model from scratch. It can tokenize text, embed tokens, attend to context, predict the next token, train on data, and generate text.
+
+That architecture — published by OpenAI in February 2019 — is the foundation of every large language model that followed. But the field didn't stop there.
+
+This notebook is a **map of what changed** between GPT-2 and the models you use today (LLaMA, Mistral, Gemma, Claude, GPT-4). The good news: the core architecture is remarkably stable. The changes are targeted improvements to specific components — and you already understand every component they're improving.
+
+## What Stayed the Same
+
+The fundamental recipe hasn't changed:
+
+- **Decoder-only transformer**: stack attention + MLP blocks, predict next token
+- **Residual connections**: `x + F(x)` through every block
+- **Attention**: queries, keys, values, causal masking, softmax
+- **The training recipe**: cross-entropy loss, AdamW optimizer, cosine LR schedule
+- **Autoregressive generation**: one token at a time, left to right
+
+If you understand the v1 model you built, you understand ~80% of any modern LLM. The remaining 20% is targeted upgrades to individual components.
+
+## What Changed (and Why)
+
+Here's the timeline of key changes, and which notebooks in the v2 arc cover each one:
+
+```elixir
+changes = [
+  %{"year" => 2019, "change" => "GPT-2 published", "component" => "Baseline", "status" => "You built this"},
+  %{"year" => 2019, "change" => "RMSNorm replaces LayerNorm", "component" => "Normalization", "status" => "Next notebook"},
+  %{"year" => 2020, "change" => "GPT-3: scale to 175B params", "component" => "Scale", "status" => "Same architecture"},
+  %{"year" => 2021, "change" => "RoPE replaces learned positions", "component" => "Position encoding", "status" => "Next notebook"},
+  %{"year" => 2022, "change" => "BPE tokenization standardized", "component" => "Tokenization", "status" => "Upcoming"},
+  %{"year" => 2023, "change" => "GQA replaces MHA", "component" => "Attention", "status" => "Upcoming"},
+  %{"year" => 2023, "change" => "SwiGLU/ReLU² replaces GELU", "component" => "MLP activation", "status" => "Upcoming"},
+  %{"year" => 2023, "change" => "KV cache for fast generation", "component" => "Inference", "status" => "Upcoming"},
+  %{"year" => 2024, "change" => "Sliding window attention", "component" => "Attention", "status" => "Upcoming"},
+  %{"year" => 2024, "change" => "QK normalization", "component" => "Attention", "status" => "Upcoming"}
+]
+
+Vl.new(width: 600, height: 300, title: "Timeline: GPT-2 → Modern LLMs")
+|> Vl.data_from_values(changes)
+|> Vl.mark(:point, size: 150, filled: true)
+|> Vl.encode_field(:x, "year", type: :quantitative, title: "Year", scale: %{domain: [2018.5, 2024.5]})
+|> Vl.encode_field(:y, "component", type: :nominal, title: nil, sort: nil)
+|> Vl.encode_field(:color, "status", type: :nominal, scale: %{
+  domain: ["You built this", "Same architecture", "Next notebook", "Upcoming"],
+  range: ["#22c55e", "#a3e635", "#3b82f6", "#94a3b8"]
+})
+|> Vl.encode_field(:tooltip, "change", type: :nominal)
+```
+
+## The Four Big Upgrades
+
+### 1. LayerNorm → RMSNorm (Simpler Normalization)
+
+**Your v1 model**: LayerNorm subtracts the mean *and* divides by standard deviation. Has learnable scale (γ) and shift (β) parameters.
+
+**Modern models**: RMSNorm only divides by the root-mean-square. No mean subtraction, no learnable parameters. Zhang & Sennrich (NeurIPS 2019) showed the mean subtraction was dispensable.
+
+**Why it matters**: 7-64% faster with no quality loss. Every parameter and every FLOP saved compounds across billions of tokens.
+
+### 2. Learned Positions → RoPE (Rotary Position Embeddings)
+
+**Your v1 model**: A lookup table of 1024 position vectors. Position 1025 doesn't exist.
+
+**Modern models**: RoPE encodes position by *rotating* Q and K vectors. The dot product between rotated vectors depends only on the *difference* in positions, not the absolute positions.
+
+**Why it matters**: No sequence length ceiling. This is why Claude can handle 200k tokens, Gemini can handle 1M tokens, and GPT-4 can handle 128k. Your v1 model would crash at position 1025.
+
+### 3. Multi-Head Attention → Grouped-Query Attention (GQA)
+
+**Your v1 model**: Every head has its own Q, K, and V projections. With 12 heads, that's 12 separate K and V caches during generation.
+
+**Modern models**: GQA shares K and V across groups of heads. LLaMA 2 uses 8 KV heads shared across 32 query heads — a 4x reduction in KV cache memory.
+
+**Why it matters**: The KV cache is the main memory bottleneck during generation. GQA lets you serve longer conversations and more users per GPU.
+
+### 4. Character Tokens → BPE (Byte Pair Encoding)
+
+**Your v1 model**: Each character is a token. Vocabulary of 65.
+
+**Modern models**: BPE merges frequent character pairs into subword tokens. "the" is one token, not three. Vocabulary of 32k-100k.
+
+**Why it matters**: Same text in ~4x fewer tokens. The model "sees" more context per forward pass and trains more efficiently.
+
+## Side-by-Side: v1 vs v2 Architecture
+
+| Component | v1 (GPT-2 Style) | v2 (Modern) | Why |
+|-----------|------------------|-------------|-----|
+| **Normalization** | LayerNorm (mean + std) | RMSNorm (magnitude only) | Faster, simpler |
+| **Norm placement** | Pre-norm | Pre-norm | Same |
+| **Position** | Learned lookup table | RoPE (rotation) | No length ceiling |
+| **Attention** | Multi-Head (MHA) | Grouped-Query (GQA) | Less memory |
+| **MLP activation** | GELU | ReLU² or SwiGLU | Better gradients |
+| **Tokenization** | Character-level | BPE subwords | More efficient |
+| **Attention extras** | None | QK norm, sliding window | Stability, speed |
+| **Generation** | Recompute everything | KV cache | Much faster |
+| **Training** | AdamW + cosine LR | Same | Unchanged |
+| **Architecture** | Decoder-only transformer | Same | Unchanged |
+
+The bottom two rows are the key insight: **the training recipe and fundamental architecture didn't change**. Everything you learned about attention, residual connections, loss functions, and optimizers applies directly to modern models.
+
+## The v2 Roadmap
+
+Here's what we'll build in the remaining notebooks:
+
+1. **BPE Tokenization** — subword tokens, the merge algorithm, encoding/decoding
+2. **RMSNorm** — the simpler normalization
+3. **RoPE** — rotary position embeddings
+4. **Modern Attention** — grouped-query attention, QK norm, sliding window
+5. **The Modern Transformer** — putting the upgraded components together
+6. **KV Cache** — fast autoregressive generation
+7. **Conversation & SFT** — from language model to chatbot
+8. **Serving with LiveView** — deploying your model as a web app
+
+Each notebook swaps one component of your v1 model for the modern version. By the end, you'll have a model architecturally equivalent to LLaMA/Mistral — the same models running on millions of devices today.
+
+## What's Next
+
+We'll start with the most user-visible change: **BPE tokenization**. Instead of one character per token, you'll build a tokenizer that learns to merge common pairs of characters into subwords — the same algorithm used by GPT-4, LLaMA, and every modern LLM.

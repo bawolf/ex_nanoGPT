@@ -1,0 +1,334 @@
+# 03: Attention — The Core Idea
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## The Problem: Tokens Can't See Each Other
+
+So far, each token's embedding is computed independently. The word "bank" gets the same vector whether it appears in "river bank" or "bank account." The model has no way to use context.
+
+**Self-attention** fixes this. It's the mechanism that lets each token "look at" every other token in the sequence and decide how much to pay attention to it.
+
+Consider predicting the next word in: "The cat sat on the ___"
+
+The blank should be influenced by "cat" (it's the subject) and "sat on" (the verb phrase). Self-attention lets the model learn these relationships -- which tokens matter for predicting each position.
+
+## The Search Engine Metaphor
+
+The attention mechanism uses three views of the input:
+
+- **Query (Q)**: "What am I looking for?"
+- **Key (K)**: "What do I contain?"
+- **Value (V)**: "What information do I provide?"
+
+Think of it like a search engine:
+- The query is your search term
+- Keys are the titles of documents
+- Values are the actual content of documents
+- The search engine compares your query against all keys, then returns a weighted mix of values
+
+```elixir
+batch = 1
+seq_len = 4
+n_embd = 8
+
+key_rng = Nx.Random.key(42)
+{x, _} = Nx.Random.normal(key_rng, shape: {batch, seq_len, n_embd})
+IO.inspect(Nx.shape(x), label: "input x: {batch, seq_len, n_embd}")
+```
+
+## Step 1: Compute Attention Scores
+
+How much should token `i` attend to token `j`? We measure this with the **dot product**. If two vectors point in similar directions, their dot product is large. If they're orthogonal, it's near zero.
+
+For now, we'll use the embeddings directly as Q, K, and V. (In the next notebook, we'll learn why projecting them first is important.)
+
+```elixir
+q = x
+k = x
+v = x
+
+att = Nx.dot(q, [-1], k, [-1])
+IO.inspect(Nx.shape(att), label: "attention scores: {batch, seq_len, seq_len}")
+IO.inspect(att[0], label: "score matrix (token i's affinity for token j)")
+```
+
+### Scaling
+
+The dot products grow with the embedding dimension (more dimensions = bigger sums). This pushes values into the extremes of softmax, making gradients tiny. We fix this by dividing by `sqrt(d)`.
+
+```elixir
+scale = :math.sqrt(n_embd) |> then(&Nx.tensor(1.0 / &1))
+att = Nx.multiply(att, scale)
+IO.inspect(att[0], label: "scaled attention scores")
+```
+
+## Step 2: Causal Masking
+
+For language modeling, token `i` should only attend to tokens `0..i` (not future tokens). Otherwise the model could "cheat" by looking at the answer.
+
+We enforce this with a **causal mask**: set future positions to negative infinity before softmax, so they become zero probability.
+
+### Nx Mini-Lesson: Nx.iota and Nx.select (Building Masks)
+
+To build a causal mask, we need to compare every position against every other position. In Elixir, you'd use nested `for` comprehensions. In Nx, `Nx.iota` generates index grids and comparisons build masks in one shot:
+
+```elixir
+rows = Nx.iota({4, 4}, axis: 0)
+cols = Nx.iota({4, 4}, axis: 1)
+IO.inspect(rows, label: "row indices (each element = its row number)")
+IO.inspect(cols, label: "col indices (each element = its column number)")
+
+mask = Nx.greater_equal(rows, cols)
+IO.inspect(mask, label: "causal mask (1 = attend, 0 = block)")
+```
+
+> **Nx Bridge**: `Nx.select(condition, on_true, on_false)` is the tensor version of `if/else` -- it picks values element-by-element based on a boolean mask. In Elixir, you'd write `if mask, do: score, else: :neg_infinity` -- but `Nx.select` does this for every element simultaneously.
+
+### Exercise: Build the Causal Mask
+
+```elixir
+build_causal_mask = fn seq_len ->
+  # Build a {seq_len, seq_len} boolean tensor:
+  # position (i, j) is true if j <= i (can attend), false otherwise (future)
+  nil
+end
+
+mask = build_causal_mask.(4)
+IO.inspect(mask, label: "causal mask (4x4)")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Use `Nx.iota({seq_len, seq_len}, axis: 0)` for row indices
+2. Use `Nx.iota({seq_len, seq_len}, axis: 1)` for column indices
+3. Compare with `Nx.greater_equal(rows, cols)`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+build_causal_mask = fn seq_len ->
+  rows = Nx.iota({seq_len, seq_len}, axis: 0)
+  cols = Nx.iota({seq_len, seq_len}, axis: 1)
+  Nx.greater_equal(rows, cols)
+end
+```
+
+</details>
+
+```elixir
+mask = build_causal_mask.(seq_len) |> Nx.reshape({1, seq_len, seq_len})
+neg_inf = Nx.Constants.neg_infinity(:f32) |> Nx.broadcast({batch, seq_len, seq_len})
+att = Nx.select(mask, att, neg_inf)
+IO.inspect(att[0], label: "masked attention (upper triangle is -inf)")
+```
+
+## Step 3: Softmax
+
+Convert raw scores to probabilities. Each row sums to 1.0, and the `-inf` values become exactly 0.
+
+```elixir
+softmax = fn x ->
+  max = Nx.reduce_max(x, axes: [-1], keep_axes: true)
+  exp = Nx.exp(Nx.subtract(x, max))
+  Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+end
+
+att = softmax.(att)
+IO.inspect(att[0], label: "attention weights (rows sum to 1)")
+```
+
+## Visualize: Attention Heatmap
+
+The attention weights form a matrix showing "who attends to whom." Each row is a query, each column is a key. The causal mask creates the distinctive lower-triangle pattern.
+
+```elixir
+att_matrix = att[0]
+tokens = ["tok_0", "tok_1", "tok_2", "tok_3"]
+
+heatmap_data =
+  for i <- 0..3, j <- 0..3 do
+    %{
+      "query" => Enum.at(tokens, i),
+      "key" => Enum.at(tokens, j),
+      "weight" => Nx.to_number(att_matrix[i][j]) |> Float.round(3)
+    }
+  end
+
+Vl.new(width: 300, height: 300, title: "Causal Attention Weights")
+|> Vl.data_from_values(heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tokens, title: "Key (attended to)")
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tokens, title: "Query (attending)")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"}, title: "Attention")
+```
+
+## Step 4: Weighted Sum of Values
+
+Multiply the attention weights by the values. Token `i`'s output is a weighted combination of all tokens' values, weighted by how much attention `i` pays to each.
+
+```elixir
+output = Nx.dot(att, [-1], v, [-2])
+IO.inspect(Nx.shape(output), label: "output shape (should be {1, 4, 8})")
+```
+
+That's the complete single-head attention pipeline: **score → scale → mask → softmax → weighted sum**.
+
+## Interactive: How the Causal Mask Grows
+
+Use the slider to change the sequence length and see how the causal mask expands. Each token can only attend to tokens at or before its own position.
+
+```elixir
+seq_slider = Kino.Input.range("Sequence length", min: 2, max: 12, step: 1, default: 4)
+```
+
+```elixir
+sl = Kino.Input.read(seq_slider)
+tok_labels = Enum.map(0..(sl - 1), &"t#{&1}")
+
+mask_data =
+  for i <- 0..(sl - 1), j <- 0..(sl - 1) do
+    %{
+      "query" => Enum.at(tok_labels, i),
+      "key" => Enum.at(tok_labels, j),
+      "can_attend" => if(j <= i, do: 1, else: 0)
+    }
+  end
+
+Vl.new(width: min(sl * 40, 480), height: min(sl * 40, 480), title: "Causal Mask (#{sl} tokens)")
+|> Vl.data_from_values(mask_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tok_labels, title: "Key")
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tok_labels, title: "Query")
+|> Vl.encode_field(:color, "can_attend", type: :quantitative, scale: %{domain: [0, 1], range: ["#f1f5f9", "#3b82f6"]}, legend: nil)
+```
+
+## Break It: Remove the Causal Mask
+
+> **Before you run the next cell**: Without the causal mask, the attention heatmap was lower-triangular (zeros in the upper right). What shape do you expect the heatmap to become?
+
+Without the causal mask, every token can attend to every other token -- including future ones. The model can cheat by looking ahead.
+
+```elixir
+att_unmasked = Nx.dot(q, [-1], k, [-1])
+att_unmasked = Nx.multiply(att_unmasked, scale)
+att_unmasked = softmax.(att_unmasked)
+
+unmasked_data =
+  for i <- 0..3, j <- 0..3 do
+    %{
+      "query" => Enum.at(tokens, i),
+      "key" => Enum.at(tokens, j),
+      "weight" => Nx.to_number(att_unmasked[0][i][j]) |> Float.round(3)
+    }
+  end
+
+Vl.new(width: 300, height: 300, title: "Attention WITHOUT Causal Mask (cheating!)")
+|> Vl.data_from_values(unmasked_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tokens, title: "Key")
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tokens, title: "Query")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "reds"}, title: "Attention")
+```
+
+Notice the upper triangle is no longer zero. Token 0 now attends to tokens 1, 2, 3 -- it can see the future. In language modeling, this is cheating.
+
+## Break It: Remove the Scaling Factor
+
+> **Before you run the next cell**: Without the √d scaling, the raw dot products will be much larger. What does softmax do when its inputs are very large? Will attention spread across tokens or concentrate on one?
+
+Without dividing by √d, the dot products are much larger. Softmax pushes all the weight onto one token -- attention becomes nearly one-hot.
+
+```elixir
+att_unscaled = Nx.dot(q, [-1], k, [-1])
+mask_fresh = build_causal_mask.(seq_len) |> Nx.reshape({1, seq_len, seq_len})
+neg_inf_fresh = Nx.Constants.neg_infinity(:f32) |> Nx.broadcast({batch, seq_len, seq_len})
+att_unscaled = Nx.select(mask_fresh, att_unscaled, neg_inf_fresh)
+att_unscaled = softmax.(att_unscaled)
+
+scaling_data =
+  for i <- 0..3, j <- 0..3 do
+    [
+      %{"query" => "q#{i}", "key" => "k#{j}", "weight" => Nx.to_number(att[0][i][j]) |> Float.round(4), "variant" => "With √d scaling"},
+      %{"query" => "q#{i}", "key" => "k#{j}", "weight" => Nx.to_number(att_unscaled[0][i][j]) |> Float.round(4), "variant" => "Without scaling"}
+    ]
+  end
+  |> List.flatten()
+
+Vl.new(width: 200, height: 200, title: "Attention Weights: Scaling vs No Scaling")
+|> Vl.data_from_values(scaling_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, title: "Key")
+|> Vl.encode_field(:y, "query", type: :nominal, title: "Query")
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"})
+|> Vl.encode_field(:column, "variant", type: :nominal)
+```
+
+Without scaling, softmax sharpens to a spike. The model can only look at one token per position.
+
+## What's Next
+
+You now understand the complete attention pipeline: score, scale, mask, softmax, weighted sum. But one attention pattern isn't enough -- the model needs to look for multiple things simultaneously. In the next notebook, we'll split attention into **multiple heads** and add learned projections.
+
+## Math Notation: The Attention Equation
+
+The core equation of self-attention:
+
+**Attention(Q, K, V) = softmax(QK^T / √d_k) · V**
+
+Each piece -- same operation, four ways:
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `QK^T` | Dot product = "how similar?" | `for q <- qs, k <- ks, do: Enum.zip_with(q, k, &*/2) \|> Enum.sum()` | `Nx.dot(q, [-1], k, [-1])` |
+| `/ √d_k` | Scale down (prevent softmax saturation) | `score / :math.sqrt(dim)` | `Nx.divide(scores, Nx.sqrt(d_k))` |
+| `softmax(x)` | Scores → probabilities (rows sum to 1) | `exps = Enum.map(row, &:math.exp/1); Enum.map(exps, &(&1/Enum.sum(exps)))` | `Nx.exp(x) \|> Nx.divide(Nx.sum(Nx.exp(x), axes: [-1]))` |
+| `· V` | Weight values by attention | (nested zip_with and reduce) | `Nx.dot(att, [-1], v, [-2])` |
+
+<details>
+<summary>All symbols so far (notebooks 00-03)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ` | The i-th element |
+| `W ∈ ℝ^{V×d}` | Matrix shape |
+| `W[i]` | Row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V` | Query, Key, Value |
+| `d_k` | Head dimension |
+| `softmax` | Scores → probabilities |
+| `^T` | Transpose |
+
+</details>
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Self-attention** | Each token computes a weighted sum of all (past) tokens' values |
+| **Query (Q)** | "What am I looking for?" — used to score against keys |
+| **Key (K)** | "What do I contain?" — scored against queries |
+| **Value (V)** | "What information do I provide?" — weighted by attention |
+| **Scaled dot-product** | `Q @ K^T / sqrt(d_k)` — prevents extreme softmax values |
+| **Causal mask** | Prevents attending to future tokens (lower triangular) |
+| **Softmax** | Converts scores to probabilities (each row sums to 1) |

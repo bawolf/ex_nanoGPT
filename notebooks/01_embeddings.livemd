@@ -94,6 +94,15 @@ IO.inspect(Nx.shape(result), label: "should be {2, 3, 3}")
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. You need to look up each token ID in the embedding table — this is a table lookup.
+2. `Nx.take(table, indices, axis: 0)` grabs rows from a tensor by index.
+3. When `idx` has shape `{batch, seq_len}` and `wte` has shape `{vocab_size, n_embd}`, `Nx.take` handles the batched lookup automatically.
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -135,6 +144,15 @@ end
 result = position_embedding.(wpe, 5)
 IO.inspect(Nx.shape(result), label: "should be {5, 3}")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. You need the first `seq_len` rows from the position embedding table.
+2. Use `Nx.slice_along_axis/4` to extract a contiguous chunk along an axis.
+3. Slice along axis 0, starting at 0, taking `seq_len` elements.
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -246,6 +264,16 @@ IO.inspect(Nx.shape(result), label: "should be {2, 5, 3}")
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Get token embeddings from `wte` using `idx` — use `Nx.take(wte, idx, axis: 0)`.
+2. Get the sequence length from `idx` with `Nx.axis_size(idx, 1)`.
+3. Get position embeddings by slicing the first `seq_len` rows from `wpe` with `Nx.slice_along_axis`.
+4. Add token embeddings and position embeddings together — Nx will broadcast the shapes automatically.
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -325,6 +353,8 @@ Vl.new(width: 350, height: 350, title: "Cosine Similarity Between Character Embe
 
 ## Break It: What Happens Without Position Embeddings?
 
+> **Before you run the next cell**: If we feed 'abc' and 'cba' into the embedding layer *without* position embeddings, will the output at position 0 be different or the same?
+
 Position embeddings tell the model WHERE each token sits. Without them, 'abc' and 'cba' produce the same set of embedding vectors -- just in a different order. The model can't distinguish word order.
 
 ```elixir
@@ -354,6 +384,30 @@ IO.puts("  Are abc[0] and cba[2] identical? #{Nx.to_number(Nx.reduce_max(Nx.abs(
 IO.puts("\nPosition embeddings break the symmetry -- now the model knows order matters.")
 ```
 
+```elixir
+n_dims = min(Nx.axis_size(with_pos_abc, 2), 8)
+
+chart_data =
+  for label <- ["abc (no pos)", "cba (no pos)", "abc (with pos)", "cba (with pos)"],
+      dim <- 0..(n_dims - 1) do
+    vec = case label do
+      "abc (no pos)" -> without_pos_abc[0][0]
+      "cba (no pos)" -> without_pos_cba[0][0]
+      "abc (with pos)" -> with_pos_abc[0][0]
+      "cba (with pos)" -> with_pos_cba[0][0]
+    end
+    %{"label" => label, "dimension" => dim, "value" => Nx.to_number(vec[dim]) |> Float.round(4)}
+  end
+
+Vl.new(width: 150, height: 200, title: "Token at position 0: first #{n_dims} embedding dims")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "dimension", type: :nominal, title: "Dim")
+|> Vl.encode_field(:y, "value", type: :quantitative, title: "Value")
+|> Vl.encode_field(:color, "label", type: :nominal)
+|> Vl.encode_field(:column, "label", type: :nominal, title: nil)
+```
+
 ## What's Next
 
 We now have:
@@ -365,19 +419,26 @@ Next: **Layer Normalization** -- a simple but crucial operation that stabilizes 
 
 ## Math Notation: Matrices and Indexing
 
-New notation for this notebook:
+New notation for this notebook -- same concept, four ways:
 
-**Matrix shape**: `W ∈ ℝ^{V×d}` means "W is a matrix with V rows and d columns, containing real numbers." That's `{vocab_size, n_embd}` in Nx -- just the shape.
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `W ∈ ℝ^{V×d}` | Matrix of V rows, d columns | `rows = List.duplicate(List.duplicate(0.0, d), v)` | `Nx.shape(w) == {vocab_size, n_embd}` |
+| `W[i]` or `wᵢ` | Look up row i | `Enum.at(rows, i)` | `Nx.take(w, i, axis: 0)` |
+| `x + y` | Element-wise addition | `Enum.zip_with(x, y, &Kernel.+/2)` | `Nx.add(x, y)` |
 
-**Row lookup**: `W[i]` or `wᵢ` means "row i of the matrix" -- same as `Nx.take(w, i, axis: 0)` or `w[i]`.
+<details>
+<summary>All symbols so far (notebooks 00-01)</summary>
 
-| Math | Elixir/Nx | Meaning |
-|------|-----------|---------|
-| `W ∈ ℝ^{V×d}` | `Nx.shape(w) == {vocab_size, n_embd}` | Matrix of V rows, d columns |
-| `W[i]` | `Nx.take(w, i, axis: 0)` | Look up row i |
-| `x + y` | `Nx.add(x, y)` | Element-wise addition (with broadcasting) |
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ` | The i-th element |
+| `n` | Number of elements |
+| `W ∈ ℝ^{V×d}` | Matrix shape: V rows, d columns |
+| `W[i]` | Row lookup |
 
-**Running reference**: `Σ` (sum), `xᵢ` (indexing), `W ∈ ℝ^{m×n}` (matrix shape), `W[i]` (row lookup)
+</details>
 
 ## Key Concepts
 

@@ -1,7 +1,9 @@
 defmodule ExNanoGPTWeb.ChatLive do
   use Phoenix.LiveView
+  require Logger
 
   alias ExNanoGPT.V2.{Model, KVCache, Tokenizer}
+  alias ExNanoGPT.Sampler
 
   @max_tokens 256
 
@@ -12,6 +14,7 @@ defmodule ExNanoGPTWeb.ChatLive do
        messages: [],
        input: "",
        generating: false,
+       partial_response: "",
        temperature: 0.7,
        top_k: 40,
        model_loaded: false,
@@ -22,6 +25,7 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   @impl true
   def handle_event("send", %{"message" => message}, socket) when message != "" do
+    Logger.info("[Chat] Message received: #{String.slice(message, 0, 80)}")
     messages = socket.assigns.messages ++ [%{role: "user", content: message}]
 
     socket =
@@ -84,16 +88,13 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   @impl true
   def handle_info({:do_load_model, path}, socket) do
+    Logger.info("[Chat] Loading model from #{path}...")
+
     try do
       {params, config} = ExNanoGPT.V2.WeightLoader.load(path)
-      tok_path = Path.join(path, "tokenizer.etf")
-
-      tokenizer =
-        if File.exists?(tok_path) do
-          Tokenizer.load(tok_path)
-        else
-          Tokenizer.train("hello world", vocab_size: config.vocab_size)
-        end
+      tokenizer = load_tokenizer(path, config)
+      param_count = Model.count_params(params)
+      Logger.info("[Chat] Model loaded: #{param_count} parameters, #{config.n_layer} layers")
 
       {:noreply,
        assign(socket,
@@ -101,7 +102,7 @@ defmodule ExNanoGPTWeb.ChatLive do
          model_config: config,
          tokenizer: tokenizer,
          model_loaded: true,
-         status: "Model loaded! #{Model.count_params(params)} parameters."
+         status: "Model loaded! #{param_count} parameters."
        )}
     rescue
       e ->
@@ -120,7 +121,6 @@ defmodule ExNanoGPTWeb.ChatLive do
       top_k: top_k
     } = socket.assigns
 
-    # Build token sequence from conversation
     turns =
       Enum.map(messages, fn %{role: role, content: content} ->
         %{role: role, content: content}
@@ -129,6 +129,7 @@ defmodule ExNanoGPTWeb.ChatLive do
     {prompt_ids, _mask} = ExNanoGPT.V2.Conversation.render(turns, tok)
     ast_start = Tokenizer.encode_special(tok, "<|assistant_start|>")
     prompt_ids = prompt_ids ++ [ast_start]
+    Logger.info("[Chat] Processing prompt (#{length(prompt_ids)} tokens)...")
 
     head_dim = div(config.n_embd, config.n_head)
 
@@ -141,53 +142,146 @@ defmodule ExNanoGPTWeb.ChatLive do
         max_seq: config.sequence_len
       )
 
-    # Process prompt through cache
     prompt_tensor = Nx.tensor([prompt_ids], type: :s64)
-    {_logits, cache} = Model.forward_cached(prompt_tensor, params, config, cache)
+    t0 = System.monotonic_time(:millisecond)
+    {logits, cache} = Model.forward_cached(prompt_tensor, params, config, cache)
+    prompt_ms = System.monotonic_time(:millisecond) - t0
+    Logger.info("[Chat] Prompt processed in #{prompt_ms}ms, generating tokens...")
 
-    # Generate tokens
     ast_end = Tokenizer.encode_special(tok, "<|assistant_end|>")
     key = Nx.Random.key(System.system_time(:microsecond))
 
-    generated =
-      generate_tokens(params, config, tok, cache, temp, top_k, ast_end, @max_tokens, key)
+    logits = Nx.reshape(logits, {Nx.axis_size(logits, 2)})
+    {token_id, key} = sample_token(logits, temp, top_k, key)
+    first_token = Nx.to_number(token_id)
 
-    response = Tokenizer.decode(tok, generated)
-    messages = socket.assigns.messages ++ [%{role: "assistant", content: response}]
+    if first_token == ast_end do
+      Logger.info("[Chat] Generation complete (0 tokens, model returned end immediately)")
+      messages = messages ++ [%{role: "assistant", content: ""}]
+      {:noreply, assign(socket, messages: messages, generating: false, status: "Ready")}
+    else
+      text = Tokenizer.decode(tok, [first_token])
 
-    {:noreply, assign(socket, messages: messages, generating: false, status: "Ready")}
+      send(self(), {:generate_next, %{
+        cache: cache,
+        key: key,
+        last_token: first_token,
+        end_token: ast_end,
+        remaining: @max_tokens - 1,
+        generated_ids: [first_token],
+        start_time: System.monotonic_time(:millisecond)
+      }})
+
+      {:noreply,
+       assign(socket,
+         partial_response: text,
+         status: "Generating... (1/#{@max_tokens} tokens)"
+       )}
+    end
+  end
+
+  @impl true
+  def handle_info({:generate_next, state}, socket) do
+    %{
+      model_params: params,
+      model_config: config,
+      tokenizer: tok,
+      temperature: temp,
+      top_k: top_k
+    } = socket.assigns
+
+    %{
+      cache: cache,
+      key: key,
+      last_token: last_token,
+      end_token: end_token,
+      remaining: remaining,
+      generated_ids: generated_ids,
+      start_time: start_time
+    } = state
+
+    if remaining == 0 do
+      log_generation_complete(generated_ids, start_time)
+      finalize_generation(socket, generated_ids)
+    else
+      {logits, cache} =
+        Model.forward_cached(
+          Nx.tensor([[last_token]], type: :s64),
+          params,
+          config,
+          cache
+        )
+
+      logits = Nx.reshape(logits, {Nx.axis_size(logits, 2)})
+      {token_id, key} = sample_token(logits, temp, top_k, key)
+      token = Nx.to_number(token_id)
+
+      if token == end_token do
+        log_generation_complete(generated_ids, start_time)
+        finalize_generation(socket, generated_ids)
+      else
+        generated_ids = generated_ids ++ [token]
+        text = Tokenizer.decode(tok, generated_ids)
+        n = length(generated_ids)
+
+        if rem(n, 10) == 0 do
+          elapsed = System.monotonic_time(:millisecond) - start_time
+          ms_per_tok = div(elapsed, n)
+          Logger.info("[Chat] Token #{n}/#{@max_tokens} (#{ms_per_tok}ms/tok)")
+        end
+
+        send(self(), {:generate_next, %{
+          cache: cache,
+          key: key,
+          last_token: token,
+          end_token: end_token,
+          remaining: remaining - 1,
+          generated_ids: generated_ids,
+          start_time: start_time
+        }})
+
+        {:noreply,
+         assign(socket,
+           partial_response: text,
+           status: "Generating... (#{n}/#{@max_tokens} tokens)"
+         )}
+      end
+    end
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
 
-  defp generate_tokens(_params, _config, _tok, _cache, _temp, _top_k, _end_tok, 0, _key), do: []
+  defp finalize_generation(socket, generated_ids) do
+    tok = socket.assigns.tokenizer
+    response = Tokenizer.decode(tok, generated_ids)
+    messages = socket.assigns.messages ++ [%{role: "assistant", content: response}]
 
-  defp generate_tokens(params, config, tok, cache, temp, top_k, end_tok, remaining, key) do
-    # Generate one token at a time using the cache
-    {logits, cache} =
-      Model.forward_cached(
-        Nx.tensor([[List.last(cache_last_token(cache, tok))]], type: :s64),
-        params,
-        config,
-        cache
-      )
-
-    # Sample from logits
-    logits = Nx.reshape(logits, {Nx.axis_size(logits, 2)})
-    {token_id, key} = sample_token(logits, temp, top_k, key)
-    token = Nx.to_number(token_id)
-
-    if token == end_tok do
-      []
-    else
-      [
-        token
-        | generate_tokens(params, config, tok, cache, temp, top_k, end_tok, remaining - 1, key)
-      ]
-    end
+    {:noreply,
+     assign(socket,
+       messages: messages,
+       generating: false,
+       partial_response: "",
+       status: "Ready (#{length(generated_ids)} tokens)"
+     )}
   end
 
-  defp cache_last_token(_cache, _tok), do: [0]
+  defp log_generation_complete(generated_ids, start_time) do
+    n = length(generated_ids)
+    elapsed = System.monotonic_time(:millisecond) - start_time
+    avg = if n > 0, do: Float.round(elapsed / n, 1), else: 0
+    Logger.info("[Chat] Generation complete: #{n} tokens in #{elapsed}ms (#{avg}ms/tok)")
+  end
+
+  defp load_tokenizer(dir, _config) do
+    json_path = Path.join(dir, "tokenizer.json")
+    etf_path = Path.join(dir, "tokenizer.etf")
+
+    cond do
+      File.exists?(json_path) -> Tokenizer.load_vocab_json(json_path)
+      File.exists?(etf_path) -> Tokenizer.load(etf_path)
+      true -> raise "No tokenizer found. Run ./scripts/download_weights.sh to get the tokenizer, or place tokenizer.json or tokenizer.etf in #{dir}/"
+    end
+  end
 
   defp sample_token(logits, temperature, top_k, key) do
     logits =
@@ -197,28 +291,12 @@ defmodule ExNanoGPTWeb.ChatLive do
         logits
       end
 
-    # Top-K filtering
-    {n} = Nx.shape(logits)
-    k = min(top_k, n)
-
-    if k < n do
-      sorted = Nx.argsort(logits, direction: :desc)
-      kth_idx = sorted[k - 1] |> Nx.to_number()
-      threshold = logits[kth_idx]
-      mask = Nx.greater_equal(logits, threshold)
-      logits = Nx.select(mask, logits, Nx.Constants.neg_infinity(:f32))
-      sample_categorical(logits, key)
-    else
-      sample_categorical(logits, key)
-    end
-  end
-
-  defp sample_categorical(logits, key) do
-    max = Nx.reduce_max(logits)
-    probs = Nx.exp(Nx.subtract(logits, max))
-    probs = Nx.divide(probs, Nx.sum(probs))
-    {idx, key} = Nx.Random.choice(key, Nx.iota({Nx.axis_size(probs, 0)}), samples: 1, p: probs)
-    {idx[0], key}
+    logits = Nx.reshape(logits, {1, Nx.axis_size(logits, 0)})
+    logits = Sampler.apply_top_k(logits, top_k)
+    probs = Sampler.softmax(logits)
+    {key, sample_key} = Sampler.split_key(key)
+    idx = Sampler.sample_multinomial(probs, sample_key)
+    {Nx.squeeze(idx), key}
   end
 
   @impl true
@@ -275,7 +353,7 @@ defmodule ExNanoGPTWeb.ChatLive do
 
         <%= if @generating do %>
           <div class="bg-gray-800 rounded-2xl px-4 py-3 max-w-[80%]">
-            <span class="cursor-blink text-gray-400">▊</span>
+            <p class="text-sm whitespace-pre-wrap"><%= @partial_response %><span class="cursor-blink text-gray-400">▊</span></p>
           </div>
         <% end %>
       </div>

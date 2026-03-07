@@ -1,4 +1,4 @@
-# 13: Assembling the Modern Transformer — From Sparsity to Softcapping
+# 19: The Modern Transformer
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -87,14 +87,31 @@ ReLU-squared has the fewest active neurons. Fewer features fire, but the ones th
 
 ## Math Notation
 
-| Symbol | Meaning | Nx code |
-|--------|---------|---------|
-| `ReLU²(x)` | `max(0, x)²` | `Nx.multiply(Nx.max(x, 0), Nx.max(x, 0))` |
-| `λ_r` | Residual lambda | `resid_lambdas[i]` |
-| `λ_0` | x0 lambda (skip from initial embedding) | `x0_lambdas[i]` |
-| `softcap(x)` | `c · tanh(x/c)` | `softcap * Nx.tanh(x / softcap)` |
-| `W_E` | Input token embedding | `wte` |
-| `W_H` | Output lm_head (untied from W_E) | `lm_head` |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `ReLU²(x) = max(0,x)²` | Sparse activation | `max(0, x) * max(0, x)` | `Nx.multiply(Nx.max(x, 0), Nx.max(x, 0))` |
+| `λ_r · F(x) + λ_0 · x_0` | Scaled residual with initial skip | `lr * sublayer + l0 * x0` | `Nx.add(Nx.multiply(lr, sublayer), Nx.multiply(l0, x0))` |
+| `softcap(x) = c · tanh(x/c)` | Clamp logits to [-c, c] smoothly | `c * :math.tanh(x / c)` | `softcap * Nx.tanh(x / softcap)` |
+| `W_E` / `W_H` | Untied input/output embeddings | (separate matrices) | `wte` / `lm_head` |
+
+<details>
+<summary>All symbols so far (notebooks 00-18)</summary>
+
+| Symbol | Meaning | First seen |
+|--------|---------|-----------|
+| `Σ`, `xᵢ`, `n`, `W ∈ ℝ`, `W[i]` | Basics | 00-01 |
+| `μ, σ², ε, γ, β` | Normalization | 02 |
+| `Q, K, V, d_k, softmax, ^T` | Attention | 03 |
+| `GELU, Φ, erf` | Activation | 05 |
+| `x + F(x)`, `W_E^T` | Residuals, weight tying | 06-07 |
+| `L, log, P(y\|x)` | Loss | 08 |
+| `α, β₁/β₂, ∇, θ, λ, ∇_θ L` | Optimization | 09-10 |
+| `T` | Temperature | 12 |
+| `RMS(x), θᵢ, R(θ)` | RMSNorm, RoPE | 16-17 |
+| `n_h, n_kv, r, w, QK_norm` | GQA, sliding window | 18 |
+| `ReLU², λ_r, λ_0, softcap, W_H` | Modern transformer | 19 |
+
+</details>
 
 ## Logit Softcapping: Preventing Overconfidence
 
@@ -306,6 +323,8 @@ IO.puts("GPT-2-quality chatbot for under $100 in cloud compute.")
 
 ## Break It
 
+> **Predict**: What happens to the range of logit values without softcapping? Think about what `c * tanh(x/c)` does to large inputs.
+
 ### Remove softcapping
 
 Without softcapping, logits can grow unbounded. With random weights this is mild, but during training it causes instability.
@@ -330,6 +349,7 @@ If `lambda_r = 0`, the running hidden state is discarded at each layer. Only the
 broken_params = %{params | resid_lambdas: Nx.broadcast(Nx.tensor(0.0, type: :f32), {config.n_layer})}
 logits_broken = ExNanoGPT.V2.Model.forward(idx, broken_params, config)
 
+# Nx.standard_deviation measures spread; Nx.reduce_min finds the minimum value
 IO.puts("Normal logit std:     #{Float.round(Nx.to_number(Nx.standard_deviation(logits)), 4)}")
 IO.puts("resid_lambda=0 std:   #{Float.round(Nx.to_number(Nx.standard_deviation(logits_broken)), 4)}")
 IO.puts("\nWith resid_lambda=0, each block's computation is thrown away.")
@@ -363,7 +383,7 @@ Every change was motivated by a specific problem. Simpler normalization (RMSNorm
 
 ## The Full Symbol Table
 
-Every symbol you've learned across all 14 notebooks:
+Every symbol you've learned across notebooks 00-18:
 
 | Notebook | Symbols |
 |----------|---------|
@@ -371,22 +391,23 @@ Every symbol you've learned across all 14 notebooks:
 | 01 | W ∈ ℝ^{m×n} (matrix shape), W[i] (row lookup) |
 | 02 | μ (mean), σ² (variance), ε (epsilon), γ/β (scale/shift) |
 | 03 | Q, K, V (projections), d_k (head dim), softmax, ^T (transpose) |
-| 04 | GELU, Φ (Gaussian CDF), erf (error function) |
-| 05 | x_{l+1} = x_l + F(x_l) (residual connection) |
-| 06 | W_E^T (transposed weight tying) |
-| 07 | L (loss), log, P(y\|x) (conditional probability) |
-| 08 | α (learning rate), β₁/β₂ (decay rates), ∇ (gradient), θ (parameters) |
-| 09 | ∇_θ L (gradient of loss w.r.t. params) |
-| 10 | T (temperature), P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T) |
-| 11 | RMS(x), θᵢ (RoPE frequency), R(θ) (rotation matrix) |
-| 12 | n_h, n_kv (head counts), w (window size), W_Q/W_K/W_V |
-| 13 | ReLU²(x), λ_r/λ_0 (residual scaling), softcap(x), W_E/W_H (untied) |
+| 05 | GELU, Φ (Gaussian CDF), erf (error function) |
+| 06 | x_{l+1} = x_l + F(x_l) (residual connection) |
+| 07 | W_E^T (transposed weight tying) |
+| 08 | L (loss), log, P(y\|x) (conditional probability) |
+| 09 | α (learning rate), β₁/β₂ (decay rates), ∇ (gradient), θ (parameters) |
+| 10 | ∇_θ L (gradient of loss w.r.t. params) |
+| 12 | T (temperature), P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T) |
+| 16 | RMS(x) |
+| 17 | θᵢ (RoPE frequency), R(θ) (rotation matrix) |
+| 18 | n_h, n_kv (head counts), w (window size), W_Q/W_K/W_V |
+| 19 | ReLU²(x), λ_r/λ_0 (residual scaling), softcap(x), W_E/W_H (untied) |
 
 Every symbol maps directly to Nx code you wrote. You can now read modern ML papers and understand the architecture behind LLaMA, Gemma, and Mistral.
 
 ## The Whole Thing
 
-Everything from notebooks 11-13 — RoPE, RMSNorm, GQA, QK norm, sliding window, ReLU-squared, value embeddings, residual scaling, softcapping — fits in **one file, 292 lines**. Open `lib/ex_nano_gpt/v2_compact.ex` and read it top to bottom.
+Everything from notebooks 16-18 — RoPE, RMSNorm, GQA, QK norm, sliding window, ReLU-squared, value embeddings, residual scaling, softcapping — fits in **one file, 292 lines**. Open `lib/ex_nano_gpt/v2_compact.ex` and read it top to bottom.
 
 ```elixir
 Code.require_file("../lib/ex_nano_gpt/v2_compact.ex")
@@ -434,7 +455,7 @@ def forward(idx, params, %__MODULE__{} = config) do
 end
 ```
 
-RoPE frequencies, RMSNorm, per-layer residual scaling with x0 skip, value embeddings, sliding window attention, softcapping. Every line maps to something you built and verified in notebooks 11-13.
+RoPE frequencies, RMSNorm, per-layer residual scaling with x0 skip, value embeddings, sliding window attention, softcapping. Every line maps to something you built and verified in notebooks 16-18.
 
 </details>
 

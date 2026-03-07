@@ -1,4 +1,4 @@
-# 11: RoPE & RMSNorm — Taming Explosions, Encoding Position with Rotation
+# 17: RoPE — Encoding Position with Rotation
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -14,223 +14,16 @@ NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
-## Something Is Wrong
-
-Let's simulate what happens inside a deep neural network. We'll pass a random vector through 8 layers of random weight matrices — like a transformer without normalization.
-
-```elixir
-key = Nx.Random.key(7)
-{x, key} = Nx.Random.normal(key, shape: {1, 64})
-
-magnitudes =
-  Enum.reduce(1..8, {x, [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]}, fn _, {x, acc} ->
-    {w, _} = Nx.Random.normal(Nx.Random.key(42), 0.0, 0.5, shape: {64, 64})
-    x = Nx.dot(x, [-1], w, [0])
-    max_val = Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)
-    {x, acc ++ [max_val]}
-  end)
-  |> elem(1)
-
-chart_data =
-  magnitudes
-  |> Enum.with_index()
-  |> Enum.map(fn {val, layer} -> %{"layer" => layer, "max_abs_value" => val} end)
-
-Vl.new(width: 500, height: 300, title: "Max Activation Magnitude by Layer")
-|> Vl.data_from_values(chart_data)
-|> Vl.mark(:line, point: true, stroke_width: 2)
-|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
-|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
-```
-
-The values are exploding. By layer 8, activations can be thousands of times larger than the input. This is the *activation explosion* problem, and it makes training impossible — gradients blow up, loss becomes NaN, the model learns nothing.
-
-**Your mission: figure out a way to keep these values under control.**
-
-Here's a hint: what if, after each layer, we rescaled the vector so its magnitude stays near 1?
-
-## The Edinburgh Simplification (2019)
-
-In 2019, Biao Zhang and Rico Sennrich at the University of Edinburgh were studying LayerNorm — the normalization technique our v1 model uses. LayerNorm does two things: (1) subtract the mean, (2) divide by the standard deviation.
-
-They asked a simple question: **does subtracting the mean actually matter?**
-
-They ran experiments across machine translation, language modeling, and image classification. The answer: no. The re-centering step was dispensable. What mattered was controlling the *magnitude* of activations.
-
-Their solution, published at NeurIPS 2019: **RMSNorm** — Root Mean Square Normalization. Drop the mean subtraction entirely. Just divide by the root-mean-square. It was 7-64% faster across different architectures, with no quality loss.
-
-Today, RMSNorm is the default in LLaMA, Mistral, Gemma, and every modern LLM.
-
-## Math Notation
-
-New symbols for this notebook:
-
-| Symbol | Meaning | Nx code |
-|--------|---------|---------|
-| `x²` | Element-wise square | `Nx.multiply(x, x)` |
-| `ε` | Epsilon, tiny safety constant | `1.0e-5` |
-| `RMS(x)` | `√(mean(x²) + ε)` | `Nx.sqrt(Nx.mean(x*x) + 1e-5)` |
-| `θᵢ` | RoPE frequency for channel i | `1 / (base^(2i/d))` |
-| `R(θ)` | 2D rotation matrix | `[[cos θ, -sin θ], [sin θ, cos θ]]` |
-
-**Running reference** from notebooks 00–10: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, softmax, ∇, T
-
-## Discover RMSNorm
-
-### Warm-up: What's the RMS of a vector?
-
-The root-mean-square is a measure of *magnitude* — how big are the values, on average?
-
-`RMS(x) = √(mean(x²) + ε)`
-
-No mean subtraction. No learnable parameters. Just a single number that tells you how large the activations are.
-
-```elixir
-x = Nx.tensor([[100.0, 0.5, -30.0, 7.0]])
-
-variance = Nx.mean(Nx.multiply(x, x), axes: [-1], keep_axes: true)
-IO.inspect(Nx.to_number(Nx.squeeze(variance)), label: "mean(x²)")
-
-rms = Nx.sqrt(Nx.add(variance, 1.0e-5))
-IO.inspect(Nx.to_number(Nx.squeeze(rms)), label: "RMS(x)")
-
-normalized = Nx.divide(x, rms)
-IO.inspect(Nx.to_flat_list(normalized) |> Enum.map(&Float.round(&1, 4)), label: "after RMSNorm")
-
-check_rms = Nx.sqrt(Nx.mean(Nx.multiply(normalized, normalized)))
-IO.inspect(Nx.to_number(check_rms) |> Float.round(6), label: "RMS after norm (should be ~1.0)")
-```
-
-After dividing by RMS, the magnitude is controlled near 1.0, but the *direction* (relative proportions) is preserved. That's the whole trick.
-
-### What did we throw away?
-
-LayerNorm subtracts the mean first, centering the output at 0. RMSNorm doesn't center — it only scales. Let's see both side by side.
-
-```elixir
-x = Nx.tensor([[100.0, 0.5, -30.0, 7.0]])
-
-mean = Nx.mean(x, axes: [-1], keep_axes: true)
-var = Nx.variance(x, axes: [-1], keep_axes: true)
-ln_out = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))
-
-rms_var = Nx.mean(Nx.multiply(x, x), axes: [-1], keep_axes: true)
-rms_out = Nx.divide(x, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
-
-IO.inspect(Nx.to_flat_list(ln_out) |> Enum.map(&Float.round(&1, 4)), label: "LayerNorm")
-IO.inspect(Nx.to_flat_list(rms_out) |> Enum.map(&Float.round(&1, 4)), label: "RMSNorm")
-IO.puts("\nLayerNorm: mean=#{Float.round(Nx.to_number(Nx.mean(ln_out)), 6)} (centered at 0)")
-IO.puts("RMSNorm:  mean=#{Float.round(Nx.to_number(Nx.mean(rms_out)), 6)} (NOT centered)")
-IO.puts("\nLayerNorm has learnable γ and β parameters. RMSNorm has zero learnable parameters.")
-IO.puts("Simpler, faster, same result. That's the Edinburgh insight.")
-```
-
-### Exercise: Implement RMSNorm
-
-Now you build it. Two lines of Nx code.
-
-```elixir
-rms_norm = fn x ->
-  # TODO:
-  # 1. Compute mean(x²) across the last axis (keep_axes: true)
-  # 2. Divide x by sqrt(mean(x²) + 1.0e-5)
-  nil
-end
-
-x = Nx.tensor([
-  [10.0, 20.0, 30.0, 40.0],
-  [1.0, 1.0, 1.0, 1.0],
-  [-5.0, 0.0, 5.0, 10.0]
-])
-
-result = rms_norm.(x)
-IO.inspect(Nx.shape(result), label: "shape (should be {3, 4})")
-
-for i <- 0..2 do
-  row = result[i]
-  row_rms = Nx.sqrt(Nx.mean(Nx.multiply(row, row))) |> Nx.to_number() |> Float.round(4)
-  IO.puts("Row #{i}: RMS=#{row_rms} (should be ~1.0)")
-end
-```
-
-<details>
-<summary>Solution</summary>
-
-```elixir
-rms_norm = fn x ->
-  variance = Nx.mean(Nx.multiply(x, x), axes: [-1], keep_axes: true)
-  Nx.divide(x, Nx.sqrt(Nx.add(variance, 1.0e-5)))
-end
-```
-
-</details>
-
-### Verify Against the v2 Model
-
-```elixir
-x = Nx.tensor([
-  [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
-  [-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-])
-
-yours = rms_norm.(x)
-reference = ExNanoGPT.V2.Model.rms_norm(x)
-
-diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
-IO.puts(if diff < 1.0e-5, do: "MATCH! Max diff: #{diff}", else: "MISMATCH. Max diff: #{diff}")
-```
-
-### The Fix In Action
-
-Remember our exploding activations? Let's add RMSNorm and watch what happens.
-
-```elixir
-key = Nx.Random.key(7)
-{x, _key} = Nx.Random.normal(key, shape: {1, 64})
-
-{_, _, normed_vals, raw_vals} =
-  Enum.reduce(1..8, {x, x, [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)],
-    [Nx.to_number(Nx.reduce_max(Nx.abs(x))) |> Float.round(2)]}, fn _, {x_n, x_r, acc_n, acc_r} ->
-    {w, _} = Nx.Random.normal(Nx.Random.key(42), 0.0, 0.5, shape: {64, 64})
-
-    x_r = Nx.dot(x_r, [-1], w, [0])
-    max_r = Nx.to_number(Nx.reduce_max(Nx.abs(x_r))) |> Float.round(2)
-
-    rms_var = Nx.mean(Nx.multiply(x_n, x_n), axes: [-1], keep_axes: true)
-    x_n = Nx.divide(x_n, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
-    x_n = Nx.dot(x_n, [-1], w, [0])
-    max_n = Nx.to_number(Nx.reduce_max(Nx.abs(x_n))) |> Float.round(2)
-
-    {x_n, x_r, acc_n ++ [max_n], acc_r ++ [max_r]}
-  end)
-
-chart_data =
-  Enum.zip([0..8, normed_vals, raw_vals])
-  |> Enum.flat_map(fn {layer, vn, vr} ->
-    [
-      %{"layer" => layer, "max_abs_value" => vn, "variant" => "With RMSNorm"},
-      %{"layer" => layer, "max_abs_value" => vr, "variant" => "Without RMSNorm"}
-    ]
-  end)
-
-Vl.new(width: 500, height: 300, title: "The Fix: RMSNorm Tames Activation Explosion")
-|> Vl.data_from_values(chart_data)
-|> Vl.mark(:line, point: true)
-|> Vl.encode_field(:x, "layer", type: :quantitative, title: "Layer")
-|> Vl.encode_field(:y, "max_abs_value", type: :quantitative, title: "Max |value|", scale: %{type: "log"})
-|> Vl.encode_field(:color, "variant", type: :nominal)
-```
-
-With RMSNorm, activations stay bounded. Without it, they explode. Two lines of code, massive impact.
-
 ## The Position Problem
 
-Now for the second upgrade. Our v1 model uses *learned position embeddings* — a lookup table where position 0 gets one vector, position 1 gets another, and so on, up to the maximum sequence length.
+Our v1 model uses *learned position embeddings* — a lookup table where position 0 gets one vector, position 1 gets another, and so on, up to the maximum sequence length.
 
 What's wrong with that? Two things:
 
 1. **Hard ceiling**: if you trained with a maximum sequence length of 1024, position 1025 doesn't exist. The model crashes.
 2. **Absolute, not relative**: the model learns that position 5 is special, but it doesn't naturally learn that "two tokens apart" is a relationship.
+
+## Su's Insight: Positions as Rotations
 
 In April 2021, Jianlin Su at Zhuiyi Technology in Shenzhen published a series of blog posts with an elegant idea: **what if positions were rotations?**
 
@@ -271,7 +64,6 @@ For each position, multiply the position index by each inverse frequency to get 
 To multiply every position by every frequency, we need broadcasting. But `positions` has shape `{32}` and `inv_freq` has shape `{4}` -- they can't broadcast directly (32 ≠ 4). We need to add dimensions so they become `{32, 1}` and `{1, 4}`:
 
 ```elixir
-# Nx.new_axis inserts a size-1 dimension at position n
 row = Nx.tensor([1.0, 2.0, 3.0])
 IO.inspect(Nx.shape(row), label: "original: {3}")
 
@@ -281,7 +73,6 @@ IO.inspect(Nx.shape(col), label: "new_axis(row, 1): {3, 1}")
 expanded = Nx.new_axis(row, 0)
 IO.inspect(Nx.shape(expanded), label: "new_axis(row, 0): {1, 3}")
 
-# Now {3, 1} * {1, 3} broadcasts to {3, 3} — an outer product!
 IO.inspect(Nx.multiply(col, expanded), label: "outer product via broadcasting")
 ```
 
@@ -337,7 +128,7 @@ This is a rotation matrix applied to each (x₁, x₂) pair. The key property: w
 
 ### Visualize: Watch a Point Rotate
 
-Here's a single embedding pair `[1.0, 0.0]` being rotated to different positions. Each point on the circle is one position.
+A single embedding pair `[1.0, 0.0]` rotated to different positions. Each point on the circle is one position.
 
 ```elixir
 x1 = 1.0
@@ -360,8 +151,6 @@ Vl.new(width: 350, height: 350, title: "RoPE: Embedding Pair [1,0] Rotated to Ea
 |> Vl.encode_field(:color, "position", type: :quantitative, scale: %{scheme: "viridis"})
 |> Vl.encode_field(:tooltip, "position", type: :quantitative)
 ```
-
-Each position is a different angle on the unit circle. The model can distinguish positions by the rotation, and the *difference* between two rotations gives relative position.
 
 ### Interactive: RoPE Rotation Slider
 
@@ -408,7 +197,6 @@ second_half = Nx.slice_along_axis(t, 4, 4, axis: 1)
 IO.inspect(first_half, label: "first 4 cols")
 IO.inspect(second_half, label: "last 4 cols")
 
-# Nx.concatenate is the inverse — joins tensors along an axis (like ++ for lists)
 IO.inspect(Nx.concatenate([first_half, second_half], axis: 1), label: "rejoined (should match original)")
 ```
 
@@ -420,14 +208,10 @@ apply_rope = fn x, cos, sin ->
   # cos shape: {1, seq_len, 1, half}
   # sin shape: {1, seq_len, 1, half}
   #
-  # TODO:
   # 1. Split x into first half and second half along the last axis
   # 2. y1 =  x1 * cos + x2 * sin
   # 3. y2 = -x1 * sin + x2 * cos
   # 4. Concatenate y1 and y2 along the last axis
-  #
-  # Hint: Nx.slice_along_axis(x, start, length, axis: 3) to split
-  #       Nx.concatenate([y1, y2], axis: 3) to rejoin
   nil
 end
 
@@ -439,6 +223,17 @@ x = Nx.iota({1, seq_len, 2, head_dim}, type: :f32)
 result = apply_rope.(x, cos, sin)
 IO.inspect(Nx.shape(result), label: "shape (should be {1, 4, 2, 8})")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Get half: `half = div(Nx.axis_size(x, 3), 2)`
+2. Split: `Nx.slice_along_axis(x, 0, half, axis: 3)` and `Nx.slice_along_axis(x, half, half, axis: 3)`
+3. Rotate: `y1 = Nx.add(Nx.multiply(x1, cos), Nx.multiply(x2, sin))`
+4. Rotate: `y2 = Nx.add(Nx.multiply(Nx.negate(x1), sin), Nx.multiply(x2, cos))`
+5. Join: `Nx.concatenate([y1, y2], axis: 3)`
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -504,26 +299,11 @@ IO.puts("\nSame difference, same dot product. The absolute positions don't matte
 IO.puts("This is why RoPE naturally captures relative position information.")
 ```
 
-## Break It
+## Challenge: What happens with a tiny RoPE base?
 
-### What happens with eps=0?
+> **Predict**: If we shrink the base from 10000 to 2, the channels rotate much faster. Will nearby positions still have similar dot products, or will the pattern become chaotic?
 
-Without the tiny epsilon constant, normalization by a zero vector produces NaN.
-
-```elixir
-zero_input = Nx.tensor([[0.0, 0.0, 0.0, 0.0]])
-
-rms_var = Nx.mean(Nx.multiply(zero_input, zero_input), axes: [-1], keep_axes: true)
-safe = Nx.divide(zero_input, Nx.sqrt(Nx.add(rms_var, 1.0e-5)))
-IO.inspect(Nx.to_flat_list(safe), label: "eps=1e-5 (safe)")
-
-unsafe = Nx.divide(zero_input, Nx.sqrt(rms_var))
-IO.inspect(Nx.to_flat_list(unsafe), label: "eps=0 (NaN!)")
-```
-
-### Challenge: What happens with a tiny RoPE base?
-
-The base (10000 by default) controls how quickly channels rotate. What if we use a much smaller base? The channels rotate too fast, and positions become indistinguishable.
+The base (10000 by default) controls how quickly channels rotate. What if we use a much smaller base?
 
 ```elixir
 head_dim = 16
@@ -572,9 +352,44 @@ end
 
 IO.puts("\nWith base=2, the dot products oscillate chaotically.")
 IO.puts("The model can't distinguish nearby positions from distant ones.")
-IO.puts("\nThis is why recent work on extending context length (YaRN, NTK-aware scaling)")
-IO.puts("focuses on manipulating the RoPE base to support longer sequences.")
 ```
+
+```elixir
+heatmap_data =
+  for m <- 0..(seq_len - 1), n <- 0..(seq_len - 1) do
+    q_c_n = Nx.slice_along_axis(cos_normal, m, 1, axis: 1)
+    q_s_n = Nx.slice_along_axis(sin_normal, m, 1, axis: 1)
+    k_c_n = Nx.slice_along_axis(cos_normal, n, 1, axis: 1)
+    k_s_n = Nx.slice_along_axis(sin_normal, n, 1, axis: 1)
+    q_n = ExNanoGPT.V2.Model.apply_rope(q_raw, q_c_n, q_s_n)
+    k_n = ExNanoGPT.V2.Model.apply_rope(k_raw, k_c_n, k_s_n)
+    dot_normal = Nx.to_number(Nx.sum(Nx.multiply(q_n, k_n)))
+
+    q_c_b = Nx.slice_along_axis(cos_bad, m, 1, axis: 1)
+    q_s_b = Nx.slice_along_axis(sin_bad, m, 1, axis: 1)
+    k_c_b = Nx.slice_along_axis(cos_bad, n, 1, axis: 1)
+    k_s_b = Nx.slice_along_axis(sin_bad, n, 1, axis: 1)
+    q_b = ExNanoGPT.V2.Model.apply_rope(q_raw, q_c_b, q_s_b)
+    k_b = ExNanoGPT.V2.Model.apply_rope(k_raw, k_c_b, k_s_b)
+    dot_bad = Nx.to_number(Nx.sum(Nx.multiply(q_b, k_b)))
+
+    [
+      %{"query_pos" => m, "key_pos" => n, "dot_product" => Float.round(dot_normal, 3), "base" => "base=10000 (normal)"},
+      %{"query_pos" => m, "key_pos" => n, "dot_product" => Float.round(dot_bad, 3), "base" => "base=2 (broken)"}
+    ]
+  end
+  |> List.flatten()
+
+Vl.new(width: 250, height: 250, title: "RoPE Dot Products: Normal vs Broken Base")
+|> Vl.data_from_values(heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key_pos", type: :ordinal, title: "Key position")
+|> Vl.encode_field(:y, "query_pos", type: :ordinal, title: "Query position", sort: "descending")
+|> Vl.encode_field(:color, "dot_product", type: :quantitative, scale: %{scheme: "redblue", domainMid: 0})
+|> Vl.encode_field(:column, "base", type: :nominal)
+```
+
+With the normal base, the dot product depends smoothly on the distance between positions -- nearby tokens are similar, distant ones differ. With base=2, the pattern is chaotic -- the model can't tell position 1 from position 15.
 
 ## Real-World Connection
 
@@ -586,13 +401,42 @@ This property enabled the "context length race" of 2023-2024: Claude went to 200
 
 We've built the normalization and position encoding for the modern transformer. Next up: **modern attention** — how Noam Shazeer (co-author of the original Transformer paper) cut the memory cost of attention by 8x, and why it matters for running LLMs on your laptop.
 
+## Math Notation
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `θᵢ = 1 / base^(2i/d)` | RoPE frequency for channel i | `1.0 / :math.pow(base, 2*i/d)` | `Nx.exp(-2*i/d * Nx.log(base))` |
+| `R(θ)` | 2D rotation matrix | `[[cos(t), -sin(t)], [sin(t), cos(t)]]` | `Nx.stack` of cos/sin pairs |
+| `y₁ = x₁·cos + x₂·sin` | First component of rotation | `x1 * :math.cos(t) + x2 * :math.sin(t)` | `Nx.add(Nx.multiply(x1, cos), Nx.multiply(x2, sin))` |
+| `dot(R(mθ)q, R(nθ)k)` | Depends only on m-n | -- | `Nx.sum(Nx.multiply(q_rot, k_rot))` |
+
+<details>
+<summary>All symbols so far (notebooks 00-17)</summary>
+
+| Symbol | Meaning | First seen |
+|--------|---------|-----------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count | 00 |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup | 01 |
+| `μ, σ², ε` | Mean, variance, epsilon | 02 |
+| `γ, β` | Learnable scale and shift | 02 |
+| `Q, K, V`, `d_k`, `softmax`, `^T` | Attention | 03 |
+| `GELU`, `Φ`, `erf` | Activation | 05 |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection | 06 |
+| `W_E^T` | Weight-tied projection | 07 |
+| `L`, `log`, `P(y\|x)` | Loss, log, conditional prob | 08 |
+| `α`, `β₁/β₂`, `∇`, `θ`, `λ` | Optimizer symbols | 09 |
+| `T` | Temperature | 12 |
+| `RMS(x)` | Root mean square | 16 |
+| `θᵢ`, `R(θ)` | RoPE frequencies, rotation | 17 |
+
+</details>
+
 ## Key Concepts
 
 | Concept | What it means |
 |---------|--------------|
-| **RMSNorm** | Normalize by root-mean-square — no mean subtraction, no learnable params. Zhang & Sennrich, NeurIPS 2019. |
 | **RoPE** | Rotary Position Embeddings — encode position by rotating Q and K. Jianlin Su, April 2021. |
 | **Inverse frequency** | `θᵢ = 1/(base^(2i/d))` — low channels rotate fast, high channels rotate slow |
 | **Relative positions** | RoPE makes dot(Q, K) depend only on position *difference*, not absolute positions |
 | **Base** | Controls the frequency spectrum — 10000 is standard, too small = positions blur together |
-| **Epsilon** | Tiny constant (1e-5) preventing division by zero in normalization |
+| **No ceiling** | Unlike learned embeddings, RoPE can handle any sequence length |

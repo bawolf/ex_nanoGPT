@@ -1,0 +1,348 @@
+# 04: Multi-Head Attention
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## Why One Head Isn't Enough
+
+In the last notebook, we built a single attention pattern. But consider the sentence: "The cat sat on the mat because it was tired."
+
+The word "it" needs to attend to "cat" (semantic: what does "it" refer to?) *and* to "sat" (syntactic: what is "it" doing?). A single set of attention weights can only express one of these patterns at a time.
+
+**Multi-head attention** runs several attention heads in parallel, each learning a different pattern. One head might track subjects, another might track verbs, another might track adjectives.
+
+The trick: we don't increase computation. We split the embedding into `n_head` heads, each of size `head_dim = n_embd / n_head`. After attention, we concatenate the heads back together.
+
+## Setup: Q, K, V from Projections
+
+In a real transformer, Q, K, and V aren't the raw embeddings -- they come from a learned projection. A single weight matrix `c_attn` projects the input to Q, K, V simultaneously:
+
+```elixir
+batch = 1
+seq_len = 4
+n_embd = 8
+n_head = 2
+head_dim = div(n_embd, n_head)
+
+key_rng = Nx.Random.key(42)
+{x, _} = Nx.Random.normal(key_rng, shape: {batch, seq_len, n_embd})
+
+{c_attn_weight, _} = Nx.Random.normal(Nx.Random.key(1), 0.0, 0.02, shape: {n_embd, 3 * n_embd})
+c_attn_bias = Nx.broadcast(0.0, {3 * n_embd})
+
+qkv = Nx.dot(x, [-1], c_attn_weight, [0]) |> Nx.add(c_attn_bias)
+IO.inspect(Nx.shape(qkv), label: "QKV combined shape (should be {1, 4, 24})")
+```
+
+### Exercise: Split QKV
+
+Split the combined tensor into separate Q, K, V tensors, each of shape `{batch, seq_len, n_embd}`.
+
+```elixir
+split_qkv = fn qkv, n_embd ->
+  # Slice along the last axis to extract Q, K, V
+  {nil, nil, nil}
+end
+
+{q, k, v} = split_qkv.(qkv, n_embd)
+IO.inspect(Nx.shape(q), label: "Q shape (should be {1, 4, 8})")
+IO.inspect(Nx.shape(k), label: "K shape (should be {1, 4, 8})")
+IO.inspect(Nx.shape(v), label: "V shape (should be {1, 4, 8})")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Use `Nx.slice_along_axis(qkv, start, length, axis: 2)` to extract each third
+2. Q starts at index 0, K starts at `n_embd`, V starts at `2 * n_embd`
+3. Each has length `n_embd`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+split_qkv = fn qkv, n_embd ->
+  q = Nx.slice_along_axis(qkv, 0, n_embd, axis: 2)
+  k = Nx.slice_along_axis(qkv, n_embd, n_embd, axis: 2)
+  v = Nx.slice_along_axis(qkv, 2 * n_embd, n_embd, axis: 2)
+  {q, k, v}
+end
+```
+
+</details>
+
+## Splitting Into Heads
+
+### Nx Mini-Lesson: Nx.reshape and Nx.transpose
+
+To split embeddings into heads, we need two operations:
+
+**`Nx.reshape`** changes a tensor's dimensions without moving data. The total number of elements must stay the same:
+
+```elixir
+t = Nx.iota({12})
+IO.inspect(t, label: "1D: 12 elements")
+IO.inspect(Nx.reshape(t, {3, 4}), label: "reshaped to {3, 4}")
+IO.inspect(Nx.reshape(t, {2, 2, 3}), label: "reshaped to {2, 2, 3}")
+```
+
+**`Nx.transpose`** reorders axes. Read `axes: [0, 2, 1, 3]` as "new axis 0 = old axis 0, new axis 1 = old axis 2, new axis 2 = old axis 1, new axis 3 = old axis 3":
+
+```elixir
+t = Nx.iota({2, 3, 4})
+IO.inspect(Nx.shape(t), label: "original: {2, 3, 4}")
+
+t2 = Nx.transpose(t, axes: [0, 2, 1])
+IO.inspect(Nx.shape(t2), label: "transposed: {2, 4, 3}")
+```
+
+Together, they let us go from `{batch, seq, n_embd}` → reshape to `{batch, seq, heads, dim}` → transpose to `{batch, heads, seq, dim}`. Each head then gets its own independent seq×dim slice to compute attention over.
+
+```elixir
+reshape_to_heads = fn x ->
+  {b, t, _c} = Nx.shape(x)
+  x |> Nx.reshape({b, t, n_head, head_dim}) |> Nx.transpose(axes: [0, 2, 1, 3])
+end
+
+reshape_from_heads = fn x ->
+  {b, _h, t, _d} = Nx.shape(x)
+  x |> Nx.transpose(axes: [0, 2, 1, 3]) |> Nx.reshape({b, t, n_embd})
+end
+
+q_heads = reshape_to_heads.(q)
+k_heads = reshape_to_heads.(k)
+v_heads = reshape_to_heads.(v)
+IO.inspect(Nx.shape(q_heads), label: "Q with heads (should be {1, 2, 4, 4})")
+```
+
+## Attention Per Head
+
+### Nx Mini-Lesson: Nx.dot with Contract and Batch Axes
+
+You've seen `Nx.dot(a, b)` for simple matrix multiplication. For higher-dimensional tensors, you need to say which axes to **contract** (multiply-and-sum) and which are **batch** dimensions (keep aligned):
+
+```elixir
+x_demo = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+w_demo = Nx.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+IO.inspect(Nx.dot(x_demo, [-1], w_demo, [0]), label: "{2,3} dot {3,2} → {2,2}")
+```
+
+For attention, we have 4D tensors `{batch, heads, seq, head_dim}`. We want to dot over `head_dim` (axis 3) while keeping `batch` and `heads` (axes 0 and 1) aligned:
+
+`Nx.dot(q, [3], [0, 1], k, [3], [0, 1])`:
+- `[3]` and `[3]`: contract along axis 3 (head_dim) of both tensors
+- `[0, 1]` and `[0, 1]`: axes 0 and 1 are batch dims -- keep them aligned
+- Result: `{batch, heads, seq, head_dim}` × `{batch, heads, seq, head_dim}` → `{batch, heads, seq, seq}`
+
+### Exercise: Full Multi-Head Attention
+
+Put all the steps together. Given Q, K, V already reshaped to heads, compute the multi-head attention output.
+
+```elixir
+build_causal_mask = fn seq_len ->
+  rows = Nx.iota({seq_len, seq_len}, axis: 0)
+  cols = Nx.iota({seq_len, seq_len}, axis: 1)
+  Nx.greater_equal(rows, cols)
+end
+
+softmax = fn x ->
+  max = Nx.reduce_max(x, axes: [-1], keep_axes: true)
+  exp = Nx.exp(Nx.subtract(x, max))
+  Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+end
+
+multi_head_attention = fn q, k, v, n_head ->
+  {_b, _h, _t, head_dim} = Nx.shape(q)
+  seq_len = Nx.axis_size(q, 2)
+  batch = Nx.axis_size(q, 0)
+  scale = Nx.tensor(1.0 / :math.sqrt(head_dim))
+
+  # TODO:
+  # 1. Compute attention scores: q @ k^T * scale
+  #    Use Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) to dot over head_dim, keep batch & head
+  # 2. Build and apply causal mask (shape {1, 1, seq_len, seq_len} for broadcasting)
+  # 3. Softmax
+  # 4. att @ v to get weighted values
+  #    Use Nx.dot(att, [3], [0, 1], v, [2], [0, 1])
+  # 5. Reshape from heads back to {batch, seq_len, n_embd}
+  nil
+end
+
+result = multi_head_attention.(q_heads, k_heads, v_heads, n_head)
+IO.inspect(Nx.shape(result), label: "should be {1, 4, 8}")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Scores: `Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)`
+2. Mask: build a `{1, 1, seq_len, seq_len}` causal mask and use `Nx.select`
+3. Softmax: apply the softmax function to the masked scores
+4. Values: `Nx.dot(att, [3], [0, 1], v, [2], [0, 1])` — note v uses axis `[2]` not `[3]`
+5. Reshape: transpose axes `[0, 2, 1, 3]` then reshape to `{batch, seq_len, n_embd}`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+multi_head_attention = fn q, k, v, _n_head ->
+  {_b, _h, _t, head_dim} = Nx.shape(q)
+  seq_len = Nx.axis_size(q, 2)
+  batch = Nx.axis_size(q, 0)
+  n_h = Nx.axis_size(q, 1)
+  scale = Nx.tensor(1.0 / :math.sqrt(head_dim))
+
+  att = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+
+  rows = Nx.iota({1, 1, seq_len, seq_len}, axis: 2)
+  cols = Nx.iota({1, 1, seq_len, seq_len}, axis: 3)
+  mask = Nx.greater_equal(rows, cols)
+  mask = Nx.broadcast(mask, {batch, n_h, seq_len, seq_len})
+  neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), {batch, n_h, seq_len, seq_len})
+  att = Nx.select(mask, att, neg_inf)
+
+  max = Nx.reduce_max(att, axes: [-1], keep_axes: true)
+  exp = Nx.exp(Nx.subtract(att, max))
+  att = Nx.divide(exp, Nx.sum(exp, axes: [-1], keep_axes: true))
+
+  y = Nx.dot(att, [3], [0, 1], v, [2], [0, 1])
+
+  y |> Nx.transpose(axes: [0, 2, 1, 3]) |> Nx.reshape({batch, seq_len, head_dim * n_h})
+end
+```
+
+</details>
+
+## Interactive: How Head Count Affects Attention Patterns
+
+With more heads, each head has fewer dimensions and attends to different patterns. Use the selector to see how attention patterns change with different head counts.
+
+```elixir
+head_select = Kino.Input.select("Number of heads", [
+  {"1", "1"}, {"2", "2"}, {"4", "4"}, {"8", "8"}
+], default: "2")
+```
+
+```elixir
+num_heads = Kino.Input.read(head_select) |> String.to_integer()
+demo_embd = 8
+demo_hd = div(demo_embd, num_heads)
+demo_seq = 4
+
+key_rng = Nx.Random.key(42)
+{demo_x, _} = Nx.Random.normal(key_rng, shape: {1, demo_seq, demo_embd})
+{demo_w, _} = Nx.Random.normal(Nx.Random.key(1), 0.0, 0.02, shape: {demo_embd, 3 * demo_embd})
+demo_qkv = Nx.dot(demo_x, [-1], demo_w, [0])
+demo_q = Nx.slice_along_axis(demo_qkv, 0, demo_embd, axis: 2)
+demo_k = Nx.slice_along_axis(demo_qkv, demo_embd, demo_embd, axis: 2)
+
+demo_q_h = demo_q |> Nx.reshape({1, demo_seq, num_heads, demo_hd}) |> Nx.transpose(axes: [0, 2, 1, 3])
+demo_k_h = demo_k |> Nx.reshape({1, demo_seq, num_heads, demo_hd}) |> Nx.transpose(axes: [0, 2, 1, 3])
+
+demo_att = Nx.dot(demo_q_h, [3], [0, 1], demo_k_h, [3], [0, 1])
+  |> Nx.multiply(Nx.tensor(1.0 / :math.sqrt(demo_hd)))
+
+demo_rows = Nx.iota({1, 1, demo_seq, demo_seq}, axis: 2)
+demo_cols = Nx.iota({1, 1, demo_seq, demo_seq}, axis: 3)
+demo_mask = Nx.greater_equal(demo_rows, demo_cols) |> Nx.broadcast({1, num_heads, demo_seq, demo_seq})
+demo_att = Nx.select(demo_mask, demo_att, Nx.broadcast(Nx.Constants.neg_infinity(:f32), {1, num_heads, demo_seq, demo_seq}))
+
+demo_max = Nx.reduce_max(demo_att, axes: [-1], keep_axes: true)
+demo_exp = Nx.exp(Nx.subtract(demo_att, demo_max))
+demo_att = Nx.divide(demo_exp, Nx.sum(demo_exp, axes: [-1], keep_axes: true))
+
+tok_labels = Enum.map(0..(demo_seq - 1), &"t#{&1}")
+head_heatmap_data =
+  for h <- 0..(num_heads - 1), i <- 0..(demo_seq - 1), j <- 0..(demo_seq - 1) do
+    %{
+      "query" => Enum.at(tok_labels, i),
+      "key" => Enum.at(tok_labels, j),
+      "weight" => Nx.to_number(demo_att[0][h][i][j]) |> Float.round(3),
+      "head" => "Head #{h}"
+    }
+  end
+
+Vl.new(width: 120, height: 120, title: "#{num_heads} heads × #{demo_hd}d each (total #{demo_embd}d)")
+|> Vl.data_from_values(head_heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "key", type: :nominal, sort: tok_labels)
+|> Vl.encode_field(:y, "query", type: :nominal, sort: tok_labels)
+|> Vl.encode_field(:color, "weight", type: :quantitative, scale: %{scheme: "blues"})
+|> Vl.encode_field(:column, "head", type: :nominal)
+```
+
+Each head learns a different attention pattern. More heads = more patterns, but each head has fewer dimensions to work with.
+
+## The Output Projection: c_proj
+
+In nanoGPT's `CausalSelfAttention`, after merging the heads back together, there's one more linear projection (`c_proj`) that mixes information across heads, followed by dropout:
+
+```
+input → c_attn (Q,K,V) → split heads → attention → merge heads → c_proj → dropout → output
+```
+
+The c_proj weight is initialized with a smaller standard deviation (`0.02 / sqrt(2 * n_layer)`) to keep residual connections stable in deep networks. We'll see why this matters when we build the full transformer block.
+
+## What's Next
+
+We've now built the complete attention mechanism: projections, multiple heads, and the output projection. Next, we'll build the **MLP block** -- a simpler feed-forward network that processes each token independently after attention has mixed information across tokens.
+
+## Math Notation
+
+Multi-head attention splits the embedding, runs attention in parallel, and merges:
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `head_dim = d / h` | Divide embedding among heads | `div(n_embd, n_head)` | (integer arithmetic) |
+| `reshape(Q, [B,T,h,d/h])` | Split embedding into heads | `Enum.chunk_every(flat, head_dim)` | `Nx.reshape(q, {b, t, h, hd})` |
+| `transpose(0,2,1,3)` | Move head axis before sequence | (nested list manipulation) | `Nx.transpose(x, axes: [0, 2, 1, 3])` |
+| `concat(head₁...headₕ)` | Merge heads back | `List.flatten(heads)` | `Nx.reshape(y, {b, t, n_embd})` |
+| `x · W_proj + b` | Output projection across heads | `Enum.zip_with(x, w, &*/2) \|> Enum.sum()` | `Nx.dot(x, [-1], w, [0]) \|> Nx.add(b)` |
+
+<details>
+<summary>All symbols so far (notebooks 00-04)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ` | The i-th element |
+| `W ∈ ℝ^{V×d}` | Matrix shape |
+| `W[i]` | Row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V` | Query, Key, Value projections |
+| `d_k` | Head dimension |
+| `softmax` | Scores → probabilities |
+| `^T` | Transpose |
+| `n_head, head_dim` | Number of heads, dimension per head |
+| `c_attn, c_proj` | Attention input/output projections |
+
+</details>
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Multi-head** | Run N parallel attention heads on split embedding dims |
+| **head_dim** | `n_embd / n_head` — each head's slice of the embedding |
+| **c_attn** | Single linear layer projecting to Q, K, V at once |
+| **c_proj** | Output projection that mixes information across heads |
+| **reshape + transpose** | How we split `{B, T, C}` into `{B, heads, T, head_dim}` |

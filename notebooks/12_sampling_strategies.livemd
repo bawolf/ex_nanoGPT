@@ -1,0 +1,363 @@
+# 12: Sampling Strategies — Temperature and Top-k
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## The Big Picture
+
+We've built every piece of a GPT: embeddings, attention, layer norm, feed-forward layers, loss, optimizer, and training loop. Now comes the payoff: **generating text**.
+
+The generation process is beautifully simple:
+
+1. Start with some prompt tokens (e.g., `"ROMEO:"`)
+2. Feed them through the model to get logits for the next token
+3. Sample a token from those logits
+4. Append it to the sequence
+5. Repeat from step 2
+
+But step 3 — "sample a token" — has surprising depth. *How* you sample determines whether the model produces boring, repetitive text or creative, diverse text. This notebook covers the two key sampling controls: **temperature** and **top-k filtering**.
+
+## Temperature: Controlling Randomness
+
+Before sampling, we divide the logits by a **temperature** parameter. This controls how "creative" vs. "deterministic" the model is:
+
+- **Temperature = 1.0** (default): use the model's original probability distribution
+- **Temperature < 1.0** (e.g., 0.1): make the distribution "sharper" -- the most likely token becomes much more likely, others become negligible. Output is more predictable/repetitive.
+- **Temperature > 1.0** (e.g., 2.0): make the distribution "flatter" -- all tokens become more equally likely. Output is more random/diverse.
+
+At the extreme, temperature → 0 is greedy decoding (always pick the most likely), and temperature → infinity is uniform random.
+
+```elixir
+raw_logits = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+tokens = ["the", "a", "my", "his", "?"]
+
+for temp <- [0.1, 0.5, 1.0, 2.0, 5.0] do
+  scaled = Nx.divide(raw_logits, temp)
+  exps = Nx.exp(Nx.subtract(scaled, Nx.reduce_max(scaled)))
+  probs = Nx.divide(exps, Nx.sum(exps))
+  probs_list = Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4))
+
+  dist = Enum.zip(tokens, probs_list)
+    |> Enum.map(fn {tok, p} -> "#{tok}=#{p}" end)
+    |> Enum.join(", ")
+
+  IO.puts("temp=#{temp}: #{dist}")
+end
+```
+
+## Visualize: Temperature Effect on Probability Distribution
+
+```elixir
+raw_logits = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+token_names = ["the", "a", "my", "his", "?"]
+
+temp_data =
+  for temp <- [0.1, 0.5, 1.0, 2.0] do
+    scaled = Nx.divide(raw_logits, temp)
+    exps = Nx.exp(Nx.subtract(scaled, Nx.reduce_max(scaled)))
+    probs = Nx.divide(exps, Nx.sum(exps))
+
+    Enum.zip(token_names, Nx.to_flat_list(probs))
+    |> Enum.map(fn {tok, p} ->
+      %{"token" => tok, "probability" => Float.round(p, 4), "temperature" => "T=#{temp}"}
+    end)
+  end
+  |> List.flatten()
+
+Vl.new(width: 120, height: 200, title: "Temperature Effect on Sampling Distribution")
+|> Vl.data_from_values(temp_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, title: "Token")
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+|> Vl.encode_field(:column, "temperature", type: :nominal, title: "Temperature")
+```
+
+Low temperature (T=0.1): nearly all probability on "the". High temperature (T=2.0): much more spread out. Temperature controls the creativity/determinism tradeoff.
+
+## Interactive: Temperature Slider
+
+Adjust the temperature and see the probability distribution change in real time.
+
+```elixir
+temp_slider = Kino.Input.range("Temperature (x10)", min: 1, max: 30, step: 1, default: 10)
+```
+
+```elixir
+temp_val = Kino.Input.read(temp_slider) / 10.0
+raw_logits = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+token_names = ["the", "a", "my", "his", "?"]
+
+scaled = Nx.divide(raw_logits, temp_val)
+exps = Nx.exp(Nx.subtract(scaled, Nx.reduce_max(scaled)))
+probs = Nx.divide(exps, Nx.sum(exps))
+
+slider_data =
+  Enum.zip(token_names, Nx.to_flat_list(probs))
+  |> Enum.map(fn {tok, p} ->
+    %{"token" => tok, "probability" => Float.round(p, 4)}
+  end)
+
+Vl.new(width: 300, height: 200, title: "Temperature = #{Float.round(temp_val, 1)}")
+|> Vl.data_from_values(slider_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "token", type: :nominal, sort: token_names)
+|> Vl.encode_field(:y, "probability", type: :quantitative, scale: %{domain: [0, 1]})
+|> Vl.encode_field(:color, "token", type: :nominal, legend: nil)
+```
+
+## Top-k Filtering: Cutting Off the Long Tail
+
+Even with temperature, the model might assign tiny probabilities to many tokens. **Top-k filtering** keeps only the k most likely tokens and zeroes out the rest. This prevents the model from ever picking a truly unlikely token.
+
+> **Nx Bridge**: This section uses several new Nx functions. In Elixir, you'd sort a list with `Enum.sort/2` and compare with `<`. The Nx equivalents:
+> - `Nx.sort(t, direction: :desc)` -- sort a tensor (like `Enum.sort(list, :desc)`)
+> - `Nx.less(a, b)` -- element-wise `<` comparison, returns a boolean tensor
+> - `Nx.select(mask, if_true, if_false)` -- tensor `if/else` (from notebook 03)
+
+```elixir
+logits_example = Nx.tensor([2.0, 1.0, 0.5, 0.1, -1.0])
+k = 3
+
+sorted = Nx.sort(logits_example, axis: -1, direction: :desc)
+threshold = Nx.to_number(sorted[k - 1])
+IO.puts("Sorted: #{inspect(Nx.to_flat_list(sorted) |> Enum.map(&Float.round(&1, 2)))}")
+IO.puts("Threshold (#{k}-th value): #{threshold}")
+
+mask = Nx.less(logits_example, threshold)
+neg_inf = Nx.Constants.neg_infinity(:f32)
+filtered = Nx.select(mask, Nx.broadcast(neg_inf, Nx.shape(logits_example)), logits_example)
+IO.puts("Filtered logits: #{inspect(Nx.to_flat_list(filtered) |> Enum.map(&Float.round(&1, 2)))}")
+
+exps = Nx.exp(Nx.subtract(filtered, Nx.reduce_max(filtered)))
+probs = Nx.divide(exps, Nx.sum(exps))
+IO.puts("Probabilities: #{inspect(Nx.to_flat_list(probs) |> Enum.map(&Float.round(&1, 4)))}")
+```
+
+## Visualize: Before and After Top-k Filtering
+
+```elixir
+logits_65 = Nx.subtract(Nx.tensor(Enum.map(0..64, fn i -> 3.0 - i * 0.1 end)), 0.0)
+exps_all = Nx.exp(Nx.subtract(logits_65, Nx.reduce_max(logits_65)))
+probs_all = Nx.divide(exps_all, Nx.sum(exps_all))
+
+sorted = Nx.sort(logits_65, axis: -1, direction: :desc)
+threshold = Nx.to_number(sorted[9])
+filtered = Nx.select(
+  Nx.less(logits_65, threshold),
+  Nx.broadcast(Nx.Constants.neg_infinity(:f32), {65}),
+  logits_65
+)
+exps_filtered = Nx.exp(Nx.subtract(filtered, Nx.reduce_max(filtered)))
+probs_filtered = Nx.divide(exps_filtered, Nx.sum(exps_filtered))
+
+before_data = Enum.with_index(Nx.to_flat_list(probs_all)) |> Enum.map(fn {p, i} ->
+  %{"token_index" => i, "probability" => Float.round(p, 5), "stage" => "Before top-k"}
+end)
+
+after_data = Enum.with_index(Nx.to_flat_list(probs_filtered)) |> Enum.map(fn {p, i} ->
+  %{"token_index" => i, "probability" => Float.round(p, 5), "stage" => "After top-k=10"}
+end)
+
+Vl.new(width: 250, height: 200, title: "Top-k Filtering (k=10, vocab=65)")
+|> Vl.data_from_values(before_data ++ after_data)
+|> Vl.mark(:bar, opacity: 0.8)
+|> Vl.encode_field(:x, "token_index", type: :quantitative, title: "Token Index")
+|> Vl.encode_field(:y, "probability", type: :quantitative, title: "P")
+|> Vl.encode_field(:color, "stage", type: :nominal)
+|> Vl.encode_field(:column, "stage", type: :nominal)
+```
+
+## Exercise: Implement Temperature Scaling and Top-k Filtering
+
+Combine both techniques into a single function.
+
+```elixir
+apply_temperature_and_top_k = fn logits, temperature, top_k ->
+  # logits shape: {batch, vocab_size}
+  # temperature: positive float
+  # top_k: positive integer or nil
+  # Return: processed logits (same shape)
+  logits
+end
+
+test_logits = Nx.tensor([[2.0, 1.0, 0.5, 0.1, -1.0]])
+
+scaled = apply_temperature_and_top_k.(test_logits, 0.5, nil)
+IO.puts("Temp=0.5, no top-k:")
+IO.inspect(Nx.to_flat_list(scaled) |> Enum.map(&Float.round(&1, 3)), label: "  scaled logits")
+
+scaled_topk = apply_temperature_and_top_k.(test_logits, 0.5, 3)
+IO.puts("Temp=0.5, top-k=3:")
+IO.inspect(Nx.to_flat_list(scaled_topk) |> Enum.map(&Float.round(&1, 3)), label: "  filtered logits")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Divide logits by temperature: `Nx.divide(logits, temperature)`
+2. Sort descending: `Nx.sort(scaled, axis: -1, direction: :desc)`
+3. Get threshold: `Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)`
+4. Build mask: `Nx.less(scaled, threshold)`
+5. Apply mask: `Nx.select(mask, neg_inf, scaled)`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+apply_temperature_and_top_k = fn logits, temperature, top_k ->
+  scaled = Nx.divide(logits, temperature)
+
+  if top_k do
+    {_batch, vocab_size} = Nx.shape(scaled)
+    k = min(top_k, vocab_size)
+    sorted = Nx.sort(scaled, axis: -1, direction: :desc)
+    threshold = Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)
+    mask = Nx.less(scaled, threshold)
+    neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(scaled))
+    Nx.select(mask, neg_inf, scaled)
+  else
+    scaled
+  end
+end
+```
+
+</details>
+
+## The Gumbel-Max Trick for Sampling
+
+To generate text, we need to sample from the probability distribution. The standard approach is **multinomial sampling**: pick a random token where the probability of each token matches the model's predicted probabilities.
+
+Nx doesn't have a built-in multinomial sampler, but there's an elegant trick called **Gumbel-max**:
+
+1. Take `log(probabilities)` for each token
+2. Add random noise from the Gumbel distribution: `-log(-log(uniform_random))`
+3. Take the argmax
+
+This is mathematically equivalent to multinomial sampling. The noise "perturbs" the log-probs, and higher-probability tokens are more likely to survive the perturbation and remain the argmax.
+
+> **Nx Bridge**: New functions in this section:
+> - `Nx.argmax(t, axis: -1)` -- index of the largest element (like `Enum.max_by` returning the index)
+> - `Nx.as_type(t, :s32)` -- cast tensor type (like converting a float to an integer)
+
+### Exercise: Implement Gumbel-Max Sampling
+
+```elixir
+sample_multinomial = fn probs, key ->
+  # probs shape: {batch, vocab_size}
+  # key: PRNG key
+  # Return: {batch, 1} tensor of sampled token indices (as :s32)
+  Nx.tensor([[0]], type: :s32)
+end
+
+test_probs = Nx.tensor([[0.7, 0.2, 0.05, 0.05]])
+
+counts = %{0 => 0, 1 => 0, 2 => 0, 3 => 0}
+
+counts =
+  Enum.reduce(0..999, counts, fn i, acc ->
+    key = Nx.Random.key(i)
+    sampled = sample_multinomial.(test_probs, key)
+    idx = Nx.to_number(Nx.squeeze(sampled))
+    Map.update!(acc, idx, &(&1 + 1))
+  end)
+
+IO.puts("Sampled 1000 times from [0.7, 0.2, 0.05, 0.05]:")
+for {idx, count} <- Enum.sort(counts) do
+  bar = String.duplicate("█", div(count, 10))
+  IO.puts("  token #{idx}: #{count}/1000 (#{Float.round(count / 10, 1)}%) #{bar}")
+end
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Clamp probs: `Nx.max(probs, 1.0e-10)` to avoid log(0)
+2. Log probs: `Nx.log(clamped_probs)`
+3. Sample uniform: `{uniform, _} = Nx.Random.uniform(key, shape: Nx.shape(probs))`
+4. Gumbel noise: `Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))`
+5. Perturb: `Nx.add(log_probs, gumbel_noise)`
+6. Pick: `Nx.argmax(perturbed, axis: -1, keep_axis: true) |> Nx.as_type(:s32)`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+sample_multinomial = fn probs, key ->
+  log_probs = Nx.log(Nx.max(probs, 1.0e-10))
+  {uniform, _} = Nx.Random.uniform(key, shape: Nx.shape(probs))
+  gumbel_noise = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))
+  perturbed = Nx.add(log_probs, gumbel_noise)
+  indices = Nx.argmax(perturbed, axis: -1, keep_axis: true)
+  Nx.as_type(indices, :s32)
+end
+```
+
+</details>
+
+## What's Next
+
+You now have all the tools for sampling: temperature controls creativity, top-k cuts the long tail, and Gumbel-max converts probabilities to token choices. In the next notebook, we'll put these together into the **full autoregressive generation loop** and finally see our model generate text.
+
+## Math Notation: Temperature-Scaled Softmax
+
+Softmax with temperature:
+
+**P(i) = exp(zᵢ / T) / Σⱼ exp(zⱼ / T)**
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `zᵢ / T` | Scale logits by temperature | `logit / temperature` | `Nx.divide(logits, temperature)` |
+| `exp(x)` | Exponentiate | `:math.exp(x)` | `Nx.exp(x)` |
+| `Σⱼ exp(zⱼ/T)` | Sum of exponentials | `Enum.map(scaled, &:math.exp/1) \|> Enum.sum()` | `Nx.sum(Nx.exp(scaled), axes: [-1])` |
+| `T → 0` | Greedy (always pick most likely) | -- | `Nx.argmax(logits)` |
+| `T = 1` | Standard softmax | -- | Use distribution as-is |
+| `T → ∞` | Uniform random | -- | `Nx.Random.randint(key, 0, vocab_size)` |
+
+<details>
+<summary>All symbols so far (notebooks 00-12)</summary>
+
+| Symbol | Meaning | First seen |
+|--------|---------|-----------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count | 00 |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup | 01 |
+| `μ, σ², ε` | Mean, variance, epsilon | 02 |
+| `γ, β` | Learnable scale and shift | 02 |
+| `Q, K, V`, `d_k` | Attention projections, head dim | 03 |
+| `softmax`, `^T` | Probabilities, transpose | 03 |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function | 05 |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection | 06 |
+| `W_E^T` | Weight-tied output projection | 07 |
+| `L`, `log`, `P(y\|x)` | Loss, logarithm, conditional probability | 08 |
+| `α`, `β₁/β₂`, `λ` | Learning rate, decay rates, weight decay | 09 |
+| `∇`, `θ`, `∇_θ L` | Gradient, parameters, gradient of loss | 09-10 |
+| `T`, `P(i) = exp(zᵢ/T) / Σⱼ exp(zⱼ/T)` | Temperature, scaled softmax | 12 |
+
+</details>
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Temperature** | Divides logits before softmax; low = deterministic, high = creative |
+| **Top-k filtering** | Only consider the k most likely tokens; set the rest to negative infinity |
+| **Gumbel-max trick** | Sample from a categorical distribution via `argmax(log_probs + Gumbel_noise)` |
+| **Greedy decoding** | Always picking the most likely token (equivalent to temperature → 0) |

@@ -1,4 +1,4 @@
-# 05: The Transformer Block
+# 06: The Transformer Block
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -35,7 +35,13 @@ x → LayerNorm → Attention → add back to x → LayerNorm → MLP → add ba
 
 There are two important ideas here: **pre-norm** and **residual connections**. Let's understand both.
 
-## Residual Connections: The `x + ...` Pattern
+## Why Residual Connections?
+
+Before we look at the code, we need to understand the most important structural pattern in the transformer: the **residual connection**.
+
+Without residual connections, gradients vanish after about 6 layers — the earliest layers stop learning entirely. The signal degrades like a game of telephone, getting fainter at every step. The `x + F(x)` pattern creates a **gradient highway** that preserves signal through 12, 24, or even 100 layers. This single trick is why deep networks work at all.
+
+## The `x + ...` Pattern in Detail
 
 The core pattern in a transformer block is:
 
@@ -44,11 +50,7 @@ x = x + attention(layer_norm(x))
 x = x + mlp(layer_norm(x))
 ```
 
-Notice the `x + ...` on both lines. This is a **residual connection** (also called a "skip connection"). Instead of replacing `x` with the output of attention, we *add* the output to the original `x`.
-
-Why? Imagine a network with 12 blocks. Without residual connections, the gradient has to flow backward through all 12 blocks during training -- like a game of telephone where the signal degrades at each step. With residual connections, the gradient has a **shortcut**: it can flow directly through the `+` operations, bypassing the blocks entirely. The blocks only need to learn the *difference* from the identity function.
-
-This is what makes deep networks trainable. Without skip connections, anything beyond ~5 layers becomes extremely hard to train.
+Notice the `x + ...` on both lines. Instead of replacing `x` with the output of attention, we *add* the output to the original `x`. The gradient can flow directly through the `+` operations, bypassing the blocks entirely. The blocks only need to learn the *difference* from the identity function — a much easier task than learning the full transformation from scratch.
 
 ```elixir
 # Concrete example: residual connection
@@ -165,6 +167,20 @@ end
 result = block_forward.(x, ln_1_params, ln_2_params, attn_params, mlp_params, Nx.Random.key(0))
 IO.inspect(Nx.shape(result), label: "output shape (should be {1, 4, 8})")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Save x as residual
+2. Apply LayerNorm: ExNanoGPT.LayerNorm.forward(x, ln_1_params)
+3. Apply self-attention: ExNanoGPT.Attention.forward(x, attn_params, key, opts) with opts: [n_head: n_head, dropout_rate: 0.0, training: false]
+4. Add residual back: x = residual + x
+5. Save new x as residual
+6. Apply LayerNorm: ExNanoGPT.LayerNorm.forward(x, ln_2_params)
+7. Apply MLP: ExNanoGPT.MLP.forward(x, mlp_params, key, opts) with opts: [dropout_rate: 0.0, training: false]
+8. Add residual back: x = residual + x
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -383,6 +399,42 @@ IO.inspect(Nx.shape(output), label: "output after #{n_blocks} blocks (same shape
 
 The shape doesn't change -- every block takes `{batch, seq_len, n_embd}` and returns `{batch, seq_len, n_embd}`. What changes is the *content*: each block enriches the representation with more context and computation.
 
+## Interactive: Gradient Norm vs Depth
+
+How many blocks can you stack before gradients vanish? This simulation shows the gradient norm reaching the first block as we increase depth — with and without residual connections.
+
+```elixir
+depth_slider = Kino.Input.range("Number of blocks", min: 1, max: 20, step: 1, default: 6)
+```
+
+```elixir
+n_blocks = Kino.Input.read(depth_slider)
+demo_dim = 32
+
+depth_data =
+  for depth <- 1..n_blocks do
+    grad_with_residual = :math.pow(1.0, depth)
+
+    shrink = 0.7
+    grad_without = :math.pow(shrink, depth)
+
+    [
+      %{"blocks" => depth, "gradient_norm" => Float.round(grad_with_residual, 6), "type" => "With residuals"},
+      %{"blocks" => depth, "gradient_norm" => Float.round(grad_without, 6), "type" => "Without residuals"}
+    ]
+  end
+  |> List.flatten()
+
+Vl.new(width: 500, height: 250, title: "Gradient Reaching Block 1 (#{n_blocks} blocks)")
+|> Vl.data_from_values(depth_data)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "blocks", type: :quantitative, title: "Network Depth (blocks)")
+|> Vl.encode_field(:y, "gradient_norm", type: :quantitative, title: "Gradient Norm at Block 1")
+|> Vl.encode_field(:color, "type", type: :nominal)
+```
+
+Without residual connections, the gradient shrinks exponentially — by 20 blocks it's vanishingly small. With residual connections, it flows unimpeded. This is why the `x + F(x)` pattern is essential.
+
 ## What's Next
 
 We now have the complete repeating unit of GPT. In the next notebook, we'll assemble the **full model**: embeddings at the input, a stack of transformer blocks in the middle, and a projection head at the output that converts the final representations back into token probabilities. We'll also implement the loss function used for training.
@@ -397,12 +449,27 @@ This reads: "the output of layer l+1 is the input of layer l **plus** whatever t
 
 Why gradients flow: when computing ∂x_{l+1}/∂x_l, the chain rule gives us `1 + ∂F/∂x_l`. That `1 +` is the gradient highway -- even if `∂F/∂x_l` is tiny, the gradient is at least 1.
 
-| Math | Nx code | What it does |
-|------|---------|-------------|
-| `x_{l+1} = x_l + F(x_l)` | `Nx.add(x, sublayer.(x))` | Residual connection |
-| `F ∘ G` | `f.(g.(x))` | Function composition |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `x_{l+1} = x_l + F(x_l)` | Residual connection | `result = x + sublayer.(x)` | `Nx.add(x, sublayer.(x))` |
+| `F ∘ G` | Function composition | `f.(g.(x))` | `f.(g.(x))` |
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x_{l+1} = x_l + F(x_l) (residual)
+<details>
+<summary>All symbols so far (notebooks 00-06)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ`, `W[i]` | Indexing, row lookup |
+| `W ∈ ℝ^{V×d}` | Matrix shape |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+
+</details>
 
 ## Key Concepts
 

@@ -1,0 +1,353 @@
+# 10: Training Hyperparameters — LR Schedule, Clipping, and Weight Decay
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## The Big Picture
+
+Having a good optimizer (AdamW) is necessary but not sufficient. Three additional techniques make the difference between a training run that works and one that diverges:
+
+1. **Learning rate schedule**: change the learning rate over time
+2. **Gradient clipping**: prevent gradient explosions
+3. **Weight decay groups**: only regularize the right parameters
+
+## The Cosine Learning Rate Schedule
+
+Using a fixed learning rate isn't ideal. Modern training uses a **schedule** that changes the learning rate over time:
+
+1. **Warmup**: start from a very small LR and linearly increase to the peak LR over the first N steps. This prevents the model from making huge, destructive updates early on when the gradients are noisy and the parameters are random.
+
+2. **Cosine decay**: after warmup, smoothly decrease the LR following a cosine curve down to a minimum value. This lets the model make big updates early (exploring) and fine-grained updates later (polishing).
+
+3. **Constant minimum**: after the decay period, hold at the minimum LR.
+
+```elixir
+lr = 6.0e-4
+min_lr = 6.0e-5
+warmup_iters = 2000
+lr_decay_iters = 600_000
+
+points =
+  for iter <- Enum.concat([
+    Enum.to_list(0..2500//100),
+    Enum.to_list(3000..600_000//10_000),
+    Enum.to_list(600_000..650_000//10_000)
+  ]) do
+    computed_lr =
+      cond do
+        iter < warmup_iters ->
+          lr * (iter + 1) / (warmup_iters + 1)
+
+        iter > lr_decay_iters ->
+          min_lr
+
+        true ->
+          decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
+          coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          min_lr + coeff * (lr - min_lr)
+      end
+
+    {iter, computed_lr}
+  end
+
+IO.puts("LR schedule samples:")
+for {iter, computed_lr} <- Enum.take(points, 5) do
+  IO.puts("  step #{iter}: lr = #{Float.round(computed_lr, 8)}")
+end
+IO.puts("  ...")
+IO.puts("  step #{warmup_iters}: lr = #{Float.round(lr, 8)} (peak)")
+IO.puts("  step #{div(lr_decay_iters, 2)}: lr = #{Float.round(min_lr + 0.5 * (lr - min_lr), 8)} (midpoint)")
+IO.puts("  step #{lr_decay_iters}: lr = #{Float.round(min_lr, 8)} (minimum)")
+```
+
+## Visualize: Learning Rate Schedule
+
+The three phases -- warmup, cosine decay, constant minimum -- are clearly visible.
+
+```elixir
+lr = 6.0e-4
+min_lr = 6.0e-5
+warmup_iters = 2000
+lr_decay_iters = 600_000
+
+schedule_data =
+  for iter <- Enum.concat([
+    Enum.to_list(0..2500//50),
+    Enum.to_list(3000..600_000//5_000),
+    Enum.to_list(600_000..650_000//5_000)
+  ]) do
+    computed_lr =
+      cond do
+        iter < warmup_iters ->
+          lr * (iter + 1) / (warmup_iters + 1)
+        iter > lr_decay_iters ->
+          min_lr
+        true ->
+          decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
+          coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          min_lr + coeff * (lr - min_lr)
+      end
+
+    %{"step" => iter, "learning_rate" => computed_lr}
+  end
+
+Vl.new(width: 600, height: 300, title: "Cosine Learning Rate Schedule with Warmup")
+|> Vl.data_from_values(schedule_data)
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "step", type: :quantitative, title: "Training Step")
+|> Vl.encode_field(:y, "learning_rate", type: :quantitative, title: "Learning Rate")
+```
+
+## Exercise: Implement the Cosine LR Schedule with Warmup
+
+```elixir
+get_lr = fn iter, config ->
+  # config has keys: :learning_rate, :warmup_iters, :lr_decay_iters, :min_lr
+  # Return the learning rate for this iteration
+  0.0
+end
+
+lr_config = %{
+  learning_rate: 6.0e-4,
+  warmup_iters: 2000,
+  lr_decay_iters: 600_000,
+  min_lr: 6.0e-5
+}
+
+IO.puts("Step 0 (start of warmup): #{get_lr.(0, lr_config) |> Float.round(8)}")
+IO.puts("Step 1999 (end of warmup): #{get_lr.(1999, lr_config) |> Float.round(8)}")
+IO.puts("Step 2000 (peak): #{get_lr.(2000, lr_config) |> Float.round(8)}")
+IO.puts("Step 301000 (midpoint): #{get_lr.(301_000, lr_config) |> Float.round(8)}")
+IO.puts("Step 600000 (end of decay): #{get_lr.(600_000, lr_config) |> Float.round(8)}")
+IO.puts("Step 700000 (after decay): #{get_lr.(700_000, lr_config) |> Float.round(8)}")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Pattern match: `%{learning_rate: lr, warmup_iters: warmup, lr_decay_iters: decay_iters, min_lr: min_lr} = config`
+2. Use `cond` with three branches: `iter < warmup`, `iter > decay_iters`, and `true` (cosine decay)
+3. Warmup: `lr * (iter + 1) / (warmup + 1)`
+4. Cosine: `decay_ratio = (iter - warmup) / (decay_iters - warmup)`, then `coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))`, then `min_lr + coeff * (lr - min_lr)`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+get_lr = fn iter, config ->
+  %{learning_rate: lr, warmup_iters: warmup, lr_decay_iters: decay_iters, min_lr: min_lr} = config
+
+  cond do
+    iter < warmup ->
+      lr * (iter + 1) / (warmup + 1)
+
+    iter > decay_iters ->
+      min_lr
+
+    true ->
+      decay_ratio = (iter - warmup) / (decay_iters - warmup)
+      coeff = 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+      min_lr + coeff * (lr - min_lr)
+  end
+end
+```
+
+</details>
+
+## Gradient Clipping by Global Norm
+
+When training is unstable, gradients can become very large ("exploding gradients"). Gradient clipping prevents this by scaling all gradients down if their total magnitude exceeds a threshold.
+
+The **global norm** is computed across *all* parameters at once:
+
+```
+global_norm = sqrt(sum of (gradient_i²) for every element of every parameter)
+```
+
+If `global_norm > max_norm`, we scale every gradient by `max_norm / global_norm`. This preserves the direction of the gradients but limits their magnitude.
+
+### Exercise: Implement Gradient Clipping
+
+```elixir
+clip_grad_norm = fn grads, max_norm ->
+  # grads is a flat map of %{name => tensor}
+  # max_norm is the threshold (e.g. 1.0)
+  # Return clipped grads (same structure)
+  grads
+end
+
+big_grads = %{
+  w1: Nx.tensor([[3.0, 4.0]]),
+  w2: Nx.tensor([[0.0, 5.0]])
+}
+
+norm_before = :math.sqrt(Nx.to_number(Nx.sum(Nx.multiply(big_grads.w1, big_grads.w1))) +
+  Nx.to_number(Nx.sum(Nx.multiply(big_grads.w2, big_grads.w2))))
+IO.puts("Global norm before clipping: #{Float.round(norm_before, 4)}")
+
+clipped = clip_grad_norm.(big_grads, 1.0)
+norm_after = :math.sqrt(Nx.to_number(Nx.sum(Nx.multiply(clipped.w1, clipped.w1))) +
+  Nx.to_number(Nx.sum(Nx.multiply(clipped.w2, clipped.w2))))
+IO.puts("Global norm after clipping:  #{Float.round(norm_after, 4)} (should be ~1.0)")
+IO.puts("Direction preserved: gradients scaled proportionally")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Sum of squares per tensor: `Nx.sum(Nx.multiply(t, t))`
+2. Reduce across all tensors: `Enum.reduce(Map.values(grads), Nx.tensor(0.0), fn t, acc -> Nx.add(acc, Nx.sum(Nx.multiply(t, t))) end)`
+3. Global norm: `:math.sqrt(Nx.to_number(sum_sq))`
+4. If norm > max_norm: `scale = max_norm / (global_norm + 1.0e-6)`, then multiply all grads by `scale`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+clip_grad_norm = fn grads, max_norm ->
+  sum_sq =
+    grads
+    |> Map.values()
+    |> Enum.map(fn t -> Nx.sum(Nx.multiply(t, t)) end)
+    |> Enum.reduce(Nx.tensor(0.0), &Nx.add/2)
+
+  global_norm = :math.sqrt(Nx.to_number(sum_sq))
+
+  if global_norm > max_norm do
+    scale = max_norm / (global_norm + 1.0e-6)
+    Map.new(grads, fn {k, v} -> {k, Nx.multiply(v, scale)} end)
+  else
+    grads
+  end
+end
+```
+
+</details>
+
+## Weight Decay Groups: Which Parameters Get Decayed?
+
+Not all parameters should have weight decay. The rule in nanoGPT (and GPT-2 generally):
+
+- **Decay**: 2D+ tensors (weight matrices in linear layers and embeddings). These have many parameters and benefit from regularization.
+- **No decay**: 1D tensors (biases, layer norm scale/shift). These have few parameters and decaying them hurts performance.
+
+The check is simple: if the tensor has 2 or more dimensions, apply weight decay; otherwise, don't.
+
+```elixir
+examples = [
+  {"attention weight (2D)", Nx.iota({64, 64}), true},
+  {"embedding table (2D)", Nx.iota({65, 64}), true},
+  {"bias (1D)", Nx.iota({64}), false},
+  {"layer norm gamma (1D)", Nx.iota({64}), false}
+]
+
+for {name, tensor, should_decay} <- examples do
+  ndim = tuple_size(Nx.shape(tensor))
+  decayed = ndim >= 2
+  status = if decayed, do: "DECAY", else: "NO DECAY"
+  check = if decayed == should_decay, do: "✓", else: "✗"
+  IO.puts("#{check} #{status} - #{name} (#{ndim}D, shape #{inspect(Nx.shape(tensor))})")
+end
+```
+
+This is exactly what `ExNanoGPT.Optimizer` does -- it checks `tuple_size(Nx.shape(param)) >= 2` and sets weight decay to 0 for 1D parameters.
+
+## Verify LR Schedule Against the Real Implementation
+
+```elixir
+optim_config = ExNanoGPT.Optimizer.default_config()
+IO.inspect(optim_config, label: "default optimizer config")
+
+test_iters = [0, 100, 1000, 1999, 2000, 2001, 100_000, 300_000, 600_000, 700_000]
+
+IO.puts("\nLR schedule comparison:")
+IO.puts(String.pad_trailing("Step", 10) <> String.pad_trailing("Real", 15) <> "Ours")
+IO.puts(String.duplicate("-", 40))
+
+for iter <- test_iters do
+  real_lr = ExNanoGPT.Optimizer.get_lr(iter, optim_config)
+
+  our_lr = cond do
+    iter < optim_config.warmup_iters ->
+      optim_config.learning_rate * (iter + 1) / (optim_config.warmup_iters + 1)
+    iter > optim_config.lr_decay_iters ->
+      optim_config.min_lr
+    true ->
+      ratio = (iter - optim_config.warmup_iters) / (optim_config.lr_decay_iters - optim_config.warmup_iters)
+      coeff = 0.5 * (1.0 + :math.cos(:math.pi() * ratio))
+      optim_config.min_lr + coeff * (optim_config.learning_rate - optim_config.min_lr)
+  end
+
+  IO.puts(
+    String.pad_trailing("#{iter}", 10) <>
+    String.pad_trailing("#{Float.round(real_lr, 10)}", 15) <>
+    "#{Float.round(our_lr, 10)}"
+  )
+end
+```
+
+## What's Next
+
+We now have all the ingredients for training:
+- A model that produces logits (notebooks 01-07)
+- A loss function that measures wrongness (notebook 08)
+- An optimizer that knows how to improve parameters (notebooks 09-10)
+
+In the next notebook, we'll assemble the **training loop** -- the code that ties these pieces together and actually teaches the model to generate Shakespeare.
+
+## Math Notation
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `cos(πr)` | Cosine decay curve | `:math.cos(:math.pi() * ratio)` | (computed in Elixir) |
+| `‖g‖₂` | L2 norm of gradient vector | `:math.sqrt(Enum.sum(g, &(&1*&1)))` | `Nx.sqrt(Nx.sum(Nx.multiply(g, g)))` |
+| `g · (c/‖g‖)` | Scale gradient to max norm c | `Enum.map(g, &(&1 * scale))` | `Nx.multiply(g, scale)` |
+
+<details>
+<summary>All symbols so far (notebooks 00-10)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+| `W_E^T` | Weight-tied output projection |
+| `L`, `log`, `P(y\|x)` | Loss, logarithm, conditional probability |
+| `α`, `β₁/β₂` | Learning rate, decay rates |
+| `∇`, `θ`, `λ` | Gradient, parameters, weight decay |
+| `‖g‖₂` | L2 (global) norm |
+
+</details>
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Learning rate schedule** | Changes LR over time: linear warmup → cosine decay → constant minimum |
+| **Warmup** | Start with tiny LR and ramp up to prevent destructive early updates |
+| **Cosine decay** | Smoothly decrease LR following a cosine curve |
+| **Gradient clipping** | Scales all gradients down if their global norm exceeds a threshold |
+| **Weight decay groups** | Only decay 2D+ tensors (weights); skip biases and layer norm parameters |

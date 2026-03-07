@@ -1,4 +1,4 @@
-# 09: The Training Loop
+# 11: The Training Loop
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -44,6 +44,8 @@ In this notebook, we'll implement each piece and then wire them together.
 The backward pass -- computing gradients -- sounds hard. For a model with millions of parameters, we need to know how much each one contributed to the loss. Doing this by hand would be impractical.
 
 Fortunately, Nx provides **automatic differentiation** through `Nx.Defn.value_and_grad`. You give it a function that computes a scalar loss from some parameters, and it gives you back both the loss value and the gradients with respect to those parameters. The gradients have the exact same structure as the parameters -- every tensor gets a matching gradient tensor.
+
+> **Nx Bridge**: `Nx.pow(base, exponent)` raises a tensor to a power -- like `:math.pow/2` but for tensors. In Elixir you'd write `(x - 3) ** 2`; in Nx it's `Nx.pow(Nx.subtract(x, 3.0), 2)`.
 
 ```elixir
 # Simple example: minimize f(x) = (x - 3)^2
@@ -181,6 +183,17 @@ IO.puts("Gradient for wte shape: #{inspect(Nx.shape(grads.wte))}")
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Create a `loss_fn` that takes `{params, x, y, key}` as a single tuple argument.
+2. Inside `loss_fn`, call `ExNanoGPT.Model.forward_train(x, params, key, n_head: ..., dropout_rate: ...)` to get logits.
+3. Call `ExNanoGPT.Model.cross_entropy_loss(logits, y)` and return that as the loss.
+4. Use `Nx.Defn.value_and_grad(loss_fn).({params, x, y, dropout_key})` to get `{loss, {param_grads, _, _, _}}`.
+5. Return `{loss, param_grads}` (discard the gradients for x, y, and key).
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -251,6 +264,17 @@ end
 IO.puts("Last micro-step loss: #{Nx.to_number(last_loss) |> Float.round(4)}")
 IO.puts("Accumulated grads wte shape: #{inspect(Nx.shape(acc_grads.wte))}")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. For each micro_step from 0 to accum_steps-1, generate a batch with `Nx.Random.key(base_seed * accum_steps + micro_step)`.
+2. Compute loss and gradients (reuse the same loss_fn pattern from compute_loss_and_grads).
+3. Scale each gradient tensor by `1/accum_steps` with `Nx.divide(tensor, accum_steps)`.
+4. Add scaled gradients to accumulated gradients — use `Map.merge/3` with `fn _k, a, b -> Nx.add(a, b) end` for maps; for the blocks tuple, convert to list, zip, add element-wise, convert back.
+5. Return `{accumulated_grads, last_loss}` (the last micro-step's loss).
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -353,6 +377,17 @@ avg_loss = estimate_loss.(tiny_params, tiny_config, train_data, 4, 32, 10)
 IO.puts("Average loss over 10 batches: #{Float.round(avg_loss, 4)}")
 IO.puts("Expected: ~4.17 (random model)")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Loop over `i` from 0 to eval_iters-1 (use `for i <- 0..(eval_iters - 1)`).
+2. Get a batch with `Nx.Random.key(i + 50_000)` and `ExNanoGPT.Batch.get_batch`.
+3. Run the forward pass with `ExNanoGPT.Model.forward_train(..., dropout_rate: 0.0)` (evaluation mode — no dropout).
+4. Compute `ExNanoGPT.Model.cross_entropy_loss(logits, y)` and convert to float with `Nx.to_number(loss)`.
+5. Return the average: `Enum.sum(losses) / length(losses)`.
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -550,16 +585,33 @@ The gradient symbol you'll see everywhere:
 
 **∇_θ L** means "the gradient of the loss L with respect to all parameters θ"
 
-In Nx: `{loss, grads} = Nx.Defn.value_and_grad(loss_fn).(params)`
-
 The nabla symbol (∇) means "which direction to go to increase the function." We go the opposite direction (subtract the gradient) to decrease the loss.
 
-| Math | Nx code | What it does |
-|------|---------|-------------|
-| `∇_θ L` | `Nx.Defn.value_and_grad(loss_fn).(params)` | Compute loss + gradients |
-| `θ ← θ - α · ∇_θ L` | `Nx.subtract(param, Nx.multiply(lr, grad))` | One SGD step |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `∇_θ L` | Compute gradients of loss w.r.t. all params | (no manual equivalent) | `Nx.Defn.value_and_grad(loss_fn).(params)` |
+| `θ ← θ - α · ∇_θ L` | One SGD update step | `param - lr * grad` | `Nx.subtract(param, Nx.multiply(lr, grad))` |
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T, L, log, P(y|x), α, β₁/β₂, ∇ (gradient), θ (params), ∇_θ L (gradient of loss)
+<details>
+<summary>All symbols so far (notebooks 00-11)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+| `W_E^T` | Weight-tied output projection |
+| `L`, `log`, `P(y\|x)` | Loss, logarithm, conditional probability |
+| `α`, `β₁/β₂` | Learning rate, decay rates |
+| `∇`, `θ`, `λ` | Gradient, parameters, weight decay |
+| `∇_θ L` | Gradient of loss w.r.t. params |
+
+</details>
 
 ## Key Concepts
 

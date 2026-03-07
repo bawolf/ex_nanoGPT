@@ -153,40 +153,37 @@ defmodule ExNanoGPT.Sampler do
 
   Sets all logits below the k-th highest value to negative infinity,
   so they have zero probability after softmax.
+
+  Accepts either `{batch, vocab}` (2D) or `{vocab}` (1D) shaped logits.
   """
   @spec apply_top_k(Nx.Tensor.t(), pos_integer()) :: Nx.Tensor.t()
   def apply_top_k(logits, k) do
+    # Normalize to 2D {batch, vocab}
+    {logits, squeeze?} =
+      case Nx.shape(logits) do
+        {_vocab} -> {Nx.reshape(logits, {1, :auto}), true}
+        {_batch, _vocab} -> {logits, false}
+      end
+
     {_batch, vocab_size} = Nx.shape(logits)
     k = min(k, vocab_size)
 
-    # WORKAROUND: Rank-based top-k (avoids Nx.sort)
+    # Transfer to BinaryBackend (CPU) for sort. EMLX's Metal GPU backend
+    # has a bug where Nx.sort triggers SIGABRT:
+    #   "Unable to load kernel sort_mbsort_bool__uint32_bn512_tn4"
+    # CPU sort is O(n log n) and the transfer overhead for a single
+    # vocab-sized vector per token is negligible vs the forward pass.
     #
-    # The natural implementation would be:
-    #   sorted = Nx.sort(logits, axis: -1, direction: :desc)
-    #   threshold = sorted[[.., k - 1]]
-    #   mask = Nx.less(logits, Nx.new_axis(threshold, -1))
-    #   Nx.select(mask, Nx.Constants.neg_infinity(:f32), logits)
-    #
-    # This matches nanoGPT's torch.topk approach. However, EMLX's Metal GPU
-    # backend has a bug where Nx.sort crashes with:
-    #   "Unable to load kernel carg_block_sort_bool__uint32_bn32_tn4"
-    # MLX dispatches a boolean sort kernel for float tensors, causing SIGABRT
-    # (exit code 134) that kills the BEAM.
-    #
-    # This rank-based approach uses only Nx.greater/Nx.sum/Nx.select.
-    # For each element, count how many others are strictly greater. If >= k
-    # are greater, that element isn't in the top-k and gets masked out.
-    # O(vocab^2) but fine for char-level vocab (65 tokens = 4,225 comparisons).
-    #
-    # TO REVERT: When EMLX/MLX fixes the Metal sort kernel, replace this
-    # function body with the 4-line sorted version above.
+    # TO REVERT: When EMLX/MLX fixes the Metal sort kernel, remove the
+    # backend_transfer calls and sort logits directly.
     # Track: https://github.com/elixir-nx/emlx
-    # Works fine with NX_BACKEND=exla (EXLA's sort has no issues).
-    expanded = Nx.new_axis(logits, -1)
-    compared = Nx.new_axis(logits, -2)
-    rank = Nx.sum(Nx.greater(compared, expanded), axes: [-1])
-    mask = Nx.greater_equal(rank, k)
-    Nx.select(mask, Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(logits)), logits)
+    logits_cpu = Nx.backend_transfer(logits, Nx.BinaryBackend)
+    sorted = Nx.sort(logits_cpu, axis: -1, direction: :desc)
+    threshold = sorted[[.., k - 1]]
+    mask = Nx.less(logits_cpu, Nx.new_axis(threshold, -1))
+    result = Nx.select(mask, Nx.Constants.neg_infinity(:f32), logits_cpu)
+
+    if squeeze?, do: Nx.squeeze(result, axes: [0]), else: result
   end
 
   defn softmax(logits) do

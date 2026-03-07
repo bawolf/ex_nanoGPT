@@ -156,6 +156,16 @@ end
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Compute the mean across the last axis with `Nx.mean(x, axes: [-1], keep_axes: true)`.
+2. Compute the variance across the last axis with `Nx.variance(x, axes: [-1], keep_axes: true)`.
+3. Normalize: subtract the mean from x, then divide by `sqrt(variance + 1.0e-5)` — use `Nx.divide` and `Nx.sqrt`.
+4. Scale by `weight` and add `bias`: `output = weight * normalized + bias`.
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -220,7 +230,47 @@ diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_num
 IO.puts(if diff < 1.0e-6, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
 ```
 
+## Interactive: Epsilon Explorer
+
+Use the slider to change epsilon and see what happens to normalization. Watch what happens as epsilon approaches 0 — and what happens with a near-constant input.
+
+```elixir
+eps_slider = Kino.Input.range("Epsilon exponent (-1 to -10)", min: -10, max: -1, step: 1, default: -5)
+```
+
+```elixir
+eps_exp = Kino.Input.read(eps_slider)
+eps = :math.pow(10.0, eps_exp)
+
+inputs = [
+  {"Normal input", Nx.tensor([[10.0, 20.0, 30.0, 40.0]])},
+  {"Near-constant", Nx.tensor([[5.0, 5.0, 5.0, 5.0 + eps * 10]])},
+  {"All zeros", Nx.tensor([[0.0, 0.0, 0.0, 0.0]])}
+]
+
+results =
+  for {label, x} <- inputs do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    var = Nx.variance(x, axes: [-1], keep_axes: true)
+    normed = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(var, eps)))
+    vals = Nx.to_flat_list(normed) |> Enum.map(&Float.round(&1, 6))
+    has_nan = Enum.any?(vals, &(&1 != &1))
+    "**#{label}**: #{inspect(vals)}#{if has_nan, do: " ⚠️ NaN!", else: ""}"
+  end
+
+Kino.Markdown.new("""
+**Epsilon = 10^#{eps_exp} = #{eps}**
+
+#{Enum.join(results, "\n\n")}
+
+#{if eps_exp >= -2, do: "⚠️ Large epsilon — normalization is weaker, values won't center as tightly.", else: ""}
+#{if eps_exp <= -8, do: "⚠️ Tiny epsilon — near-constant inputs may produce extreme values.", else: ""}
+""")
+```
+
 ## Break It: What Happens Without Layer Norm?
+
+> **Before you run the next cell**: If we pass data through 6 random linear layers in sequence without normalizing, what do you think happens to the magnitude of the values? Will they stay roughly the same, grow, or shrink?
 
 Without layer norm, values grow or shrink as they flow through multiple layers. Let's simulate passing data through several linear transforms with and without normalization.
 
@@ -282,23 +332,33 @@ We've built two simple but important components: embeddings (notebook 01) and la
 
 ## Math Notation: The Layer Norm Formula
 
-Layer norm has four symbols worth knowing:
+Layer norm has four symbols worth knowing: **μ** (mu) for mean, **σ²** (sigma squared) for variance, **ε** (epsilon) for safety, and **γ, β** (gamma, beta) for learnable scale/shift.
 
-- **μ** (mu) = mean: `μ = (1/n) Σ xᵢ` → `Nx.mean(x, axes: [-1])`
-- **σ²** (sigma squared) = variance: `σ² = (1/n) Σ (xᵢ - μ)²` → `Nx.variance(x, axes: [-1])`
-- **ε** (epsilon) = tiny safety constant to avoid dividing by zero: `1.0e-5`
-- **γ, β** (gamma, beta) = learnable scale and shift, initialized to 1 and 0
+The full formula -- same operations, four ways:
 
-The full formula, symbol by symbol:
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `μ = (1/n) Σ xᵢ` | Average value | `Enum.sum(list) / length(list)` | `Nx.mean(x, axes: [-1])` |
+| `σ² = (1/n) Σ (xᵢ - μ)²` | How spread out | `Enum.map(list, &((&1-mu)**2)) \|> Enum.sum() \|> Kernel./(n)` | `Nx.variance(x, axes: [-1])` |
+| `x̂ = (x - μ) / √(σ² + ε)` | Normalize | `Enum.map(list, &((&1 - mu) / :math.sqrt(var + 1.0e-5)))` | `Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))` |
+| `y = γ · x̂ + β` | Scale and shift | `Enum.zip_with([gamma, x_hat, beta], fn [g,x,b] -> g*x+b end)` | `Nx.add(Nx.multiply(gamma, x_hat), beta)` |
 
-| Math | Nx code | What it does |
-|------|---------|-------------|
-| `μ = (1/n) Σ xᵢ` | `Nx.mean(x, axes: [-1])` | Average value |
-| `σ² = (1/n) Σ (xᵢ - μ)²` | `Nx.variance(x, axes: [-1])` | How spread out |
-| `x̂ = (x - μ) / √(σ² + ε)` | `(x - mean) / Nx.sqrt(var + 1.0e-5)` | Normalize |
-| `y = γ · x̂ + β` | `Nx.multiply(gamma, x_hat) + beta` | Scale and shift |
+<details>
+<summary>All symbols so far (notebooks 00-02)</summary>
 
-**Running reference**: Σ (sum), xᵢ (indexing), W ∈ ℝ (matrix), μ (mean), σ² (variance), ε (epsilon), γ/β (learnable scale/shift)
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ` | The i-th element |
+| `n` | Number of elements |
+| `W ∈ ℝ^{V×d}` | Matrix shape |
+| `W[i]` | Row lookup |
+| `μ` | Mean |
+| `σ²` | Variance |
+| `ε` | Safety constant (1e-5) |
+| `γ, β` | Learnable scale and shift |
+
+</details>
 
 ## Key Concepts
 

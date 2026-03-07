@@ -135,7 +135,12 @@ defmodule ExNanoGPT.V2.Tokenizer do
     prepend = Keyword.get(opts, :prepend)
     append = Keyword.get(opts, :append)
 
-    ids = text |> :binary.bin_to_list() |> apply_merges(tok.merges)
+    ids =
+      if tok.merges == [] do
+        encode_longest_match(text, tok.vocab)
+      else
+        text |> :binary.bin_to_list() |> apply_merges(tok.merges)
+      end
 
     ids = if prepend, do: [encode_special(tok, prepend) | ids], else: ids
     ids = if append, do: ids ++ [encode_special(tok, append)], else: ids
@@ -153,6 +158,34 @@ defmodule ExNanoGPT.V2.Tokenizer do
     {p1, p2} = pair
     ids = merge_pair(ids, {p1, p2}, new_id)
     apply_merges(ids, rest)
+  end
+
+  defp encode_longest_match(text, vocab) do
+    bytes = :binary.bin_to_list(text)
+    max_token_len = vocab |> Map.keys() |> Enum.map(&length/1) |> Enum.max(fn -> 1 end)
+    do_longest_match(bytes, vocab, max_token_len, [])
+  end
+
+  defp do_longest_match([], _vocab, _max_len, acc), do: Enum.reverse(acc)
+
+  defp do_longest_match(bytes, vocab, max_len, acc) do
+    window = min(max_len, length(bytes))
+
+    {token_id, consumed} =
+      Enum.reduce_while(window..1//-1, nil, fn len, _acc ->
+        candidate = Enum.take(bytes, len)
+
+        case Map.get(vocab, candidate) do
+          nil -> {:cont, nil}
+          id -> {:halt, {id, len}}
+        end
+      end)
+      |> case do
+        nil -> {hd(bytes), 1}
+        found -> found
+      end
+
+    do_longest_match(Enum.drop(bytes, consumed), vocab, max_len, [token_id | acc])
   end
 
   # ---------------------------------------------------------------------------
@@ -193,6 +226,35 @@ defmodule ExNanoGPT.V2.Tokenizer do
     }
 
     File.write!(path, :erlang.term_to_binary(data))
+  end
+
+  @doc "Load tokenizer from a JSON vocab file (from convert_tokenizer.py)."
+  def load_vocab_json(path) do
+    data = path |> File.read!() |> Jason.decode!()
+
+    vocab_map = data["vocab"]
+
+    vocab_inv =
+      vocab_map
+      |> Enum.map(fn {id_str, bytes} -> {String.to_integer(id_str), bytes} end)
+      |> Map.new()
+
+    vocab =
+      vocab_inv
+      |> Enum.map(fn {id, bytes} -> {bytes, id} end)
+      |> Map.new()
+
+    special_map = data["special_tokens"]
+    special_map_inv = Map.new(special_map, fn {k, v} -> {v, k} end)
+
+    %__MODULE__{
+      merges: [],
+      vocab: vocab,
+      vocab_inv: vocab_inv,
+      special_map: special_map,
+      special_map_inv: special_map_inv,
+      vocab_size: data["vocab_size"]
+    }
   end
 
   @doc "Load tokenizer from an ETF file."

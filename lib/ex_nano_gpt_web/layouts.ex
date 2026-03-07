@@ -1,21 +1,30 @@
 defmodule ExNanoGPTWeb.Layouts do
   use Phoenix.Component
 
+  @phoenix_vsn Application.compile_env(:phoenix, :vsn, to_string(Application.spec(:phoenix, :vsn)))
+  @lv_vsn Application.compile_env(:phoenix_live_view, :vsn, to_string(Application.spec(:phoenix_live_view, :vsn)))
+
   def root(assigns) do
+    assigns = assign(assigns, phoenix_vsn: @phoenix_vsn, lv_vsn: @lv_vsn)
+
     ~H"""
     <!DOCTYPE html>
     <html lang="en">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="csrf-token" content={Plug.CSRFProtection.get_csrf_token()} />
         <title>ExNanoGPT Chat</title>
         <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
         <script src="https://cdn.tailwindcss.com"></script>
-        <script defer phx-track-static src="https://cdn.jsdelivr.net/npm/phoenix@1.7.20/priv/static/phoenix.min.js"></script>
-        <script defer phx-track-static src="https://cdn.jsdelivr.net/npm/phoenix_live_view@1.0.4/priv/static/phoenix_live_view.min.js"></script>
+        <script src={"https://cdn.jsdelivr.net/npm/phoenix@#{@phoenix_vsn}/priv/static/phoenix.min.js"}></script>
+        <script src={"https://cdn.jsdelivr.net/npm/phoenix_live_view@#{@lv_vsn}/priv/static/phoenix_live_view.min.js"}></script>
         <script>
-          window.addEventListener("phx:page-loaded", () => {
-            let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket)
+          document.addEventListener("DOMContentLoaded", () => {
+            let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
+            let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
+              params: {_csrf_token: csrfToken}
+            })
             liveSocket.connect()
             window.liveSocket = liveSocket
           })

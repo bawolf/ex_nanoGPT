@@ -1,4 +1,4 @@
-# 04: The MLP Block
+# 05: The MLP Block
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -17,11 +17,13 @@ NotebookSetup.configure_backend!()
 alias VegaLite, as: Vl
 ```
 
-## What Does the MLP Do?
+## Why Does the Model Need an MLP?
 
-In the transformer, **self-attention** mixes information across tokens -- it lets each token look at other tokens. But after that mixing step, each token needs to actually *think* about what it's learned. That's what the **MLP** (multi-layer perceptron) does.
+Attention lets tokens look at each other — but it's a **linear** operation. It can only compute weighted averages of value vectors. Stacking 12 attention layers without anything else would be no more powerful than one attention layer (a weighted average of a weighted average is still a weighted average).
 
-The MLP processes each token **independently** -- the same little network runs on every token position, with no communication between them. It's like: attention is a group discussion, and the MLP is each person going away to think on their own.
+The **MLP** (multi-layer perceptron) adds **nonlinearity**. It's where the model does its "thinking" — transforming the information that attention gathered into something richer. Without the MLP, a 12-layer transformer would have the representational power of a single layer.
+
+The MLP processes each token **independently** — the same little network runs on every token position, with no communication between them. Think of it this way: attention is a group discussion, and the MLP is each person going away to process what they heard.
 
 ## The Architecture
 
@@ -43,6 +45,8 @@ You might know **ReLU** -- the activation function that's just `max(0, x)`. It o
 The formula is: `gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))`, where `erf` is the error function (a smooth S-curve from -1 to 1). You don't need to understand `erf` deeply -- just know that `erf(x / sqrt(2))` acts like a smooth switch between -1 and +1.
 
 Let's see how GELU compares to ReLU:
+
+> **Nx Bridge**: `Nx.linspace(-3.0, 3.0, n: 50)` creates 50 evenly spaced values from -3 to 3 -- like `for x <- -3..3, step: 0.12`. `Nx.erf(x)` is the error function, a smooth S-curve from -1 to 1 that's part of the GELU formula.
 
 ```elixir
 x = Nx.linspace(-3.0, 3.0, n: 50)
@@ -105,6 +109,15 @@ IO.inspect(result, label: "GELU output")
 # Expected (approximately):
 # [-0.0455, -0.1587, -0.1543, 0.0, 0.3457, 0.8413, 1.9545]
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Use the formula: gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+2. Nx.erf/1 and Nx.sqrt/1 are available
+3. For sqrt(2), use Nx.sqrt(Nx.tensor(2.0)) or Nx.sqrt(Nx.tensor(2.0, type: :f32))
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -179,6 +192,15 @@ IO.inspect(Nx.shape(result), label: "MLP output shape (should be {1, 4, 8})")
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. First linear: x @ c_fc_weight + c_fc_bias (n_embd -> 4*n_embd). Use Nx.dot(x, [-1], c_fc_weight, [0]) |> Nx.add(c_fc_bias)
+2. Apply GELU activation to the result
+3. Second linear: result @ c_proj_weight + c_proj_bias (4*n_embd -> n_embd). Use Nx.dot(x, [-1], c_proj_weight, [0]) |> Nx.add(c_proj_bias)
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -237,7 +259,60 @@ diff = Nx.subtract(yours, reference) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_num
 IO.puts(if diff < 1.0e-5, do: "✓ MATCH! Max diff: #{diff}", else: "✗ MISMATCH. Max diff: #{diff}")
 ```
 
+## Interactive: Expansion Ratio
+
+The MLP expands to 4x the embedding size by default. What if we used 1x, 2x, or 8x? More expansion means more parameters and computation, but also more representational power.
+
+```elixir
+expansion_slider = Kino.Input.range("Expansion ratio", min: 1, max: 8, step: 1, default: 4)
+```
+
+```elixir
+ratio = Kino.Input.read(expansion_slider)
+demo_n_embd = 32
+hidden = demo_n_embd * ratio
+
+{demo_w1, _} = Nx.Random.normal(Nx.Random.key(1), 0.0, 0.02, shape: {demo_n_embd, hidden})
+{demo_w2, _} = Nx.Random.normal(Nx.Random.key(2), 0.0, 0.02, shape: {hidden, demo_n_embd})
+demo_b1 = Nx.broadcast(0.0, {hidden})
+demo_b2 = Nx.broadcast(0.0, {demo_n_embd})
+
+{demo_x, _} = Nx.Random.normal(Nx.Random.key(42), shape: {1, 4, demo_n_embd})
+
+h = Nx.dot(demo_x, [-1], demo_w1, [0]) |> Nx.add(demo_b1)
+h = Nx.multiply(h, Nx.multiply(0.5, Nx.add(1.0, Nx.erf(Nx.divide(h, Nx.sqrt(Nx.tensor(2.0)))))))
+out = Nx.dot(h, [-1], demo_w2, [0]) |> Nx.add(demo_b2)
+
+w1_params = demo_n_embd * hidden + hidden
+w2_params = hidden * demo_n_embd + demo_n_embd
+total = w1_params + w2_params
+
+hidden_range = Nx.to_flat_list(h[0][0]) |> Enum.map(&abs/1)
+active = Enum.count(hidden_range, &(&1 > 0.01))
+
+Kino.Markdown.new("""
+**Expansion ratio: #{ratio}x** — hidden dim = #{hidden}
+
+| Metric | Value |
+|--------|-------|
+| Parameters in MLP | #{total} |
+| Hidden dim | #{hidden} |
+| Active hidden units (>0.01) | #{active}/#{hidden} (#{Float.round(active / hidden * 100, 1)}%) |
+
+Shape: `{#{demo_n_embd}} → {#{hidden}} → {#{demo_n_embd}}`
+
+#{cond do
+  ratio == 1 -> "Minimal expansion — very little nonlinear capacity."
+  ratio <= 3 -> "Modest expansion — fewer parameters, but less room for complex patterns."
+  ratio == 4 -> "Standard GPT-2 ratio — the sweet spot for most transformers."
+  true -> "Large expansion — more capacity but significantly more parameters."
+end}
+""")
+```
+
 ## Break It: What Happens Without an Activation Function?
+
+> **Before you run the next cell**: If we stack two linear layers without any activation between them, will the result be different from a single linear layer? Or are they mathematically equivalent?
 
 If we remove the activation function, the MLP becomes just two linear layers in sequence. But `Linear(Linear(x))` is mathematically equivalent to a single linear layer -- the model gains no new capability from the extra layer.
 
@@ -293,19 +368,31 @@ Next: **The transformer block** -- combining LayerNorm, attention, and MLP with 
 
 The GELU activation function:
 
-**GELU(x) = x · Φ(x)** where Φ is the Gaussian CDF
+**GELU(x) = x · Φ(x)** where Φ is the Gaussian CDF. Expanded: `GELU(x) = x · 0.5 · (1 + erf(x / √2))`
 
-Expanded: `GELU(x) = x · 0.5 · (1 + erf(x / √2))`
-
-| Math | Nx code | What it does |
-|------|---------|-------------|
-| `Φ(x)` | `0.5 * (1 + Nx.erf(x / Nx.sqrt(2)))` | Gaussian CDF: smooth 0→1 switch |
-| `erf(x)` | `Nx.erf(x)` | Error function: S-curve from -1 to 1 |
-| `√2` | `Nx.sqrt(Nx.tensor(2.0))` | Square root of 2 |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `Φ(x)` | Gaussian CDF: smooth 0→1 switch | `0.5 * (1 + :math.erf(x / :math.sqrt(2)))` | `0.5 * (1 + Nx.erf(x / Nx.sqrt(2)))` |
+| `erf(x)` | Error function: S-curve from -1 to 1 | `:math.erf(x)` | `Nx.erf(x)` |
+| `GELU(x)` | Soft gate: pass positive, block negative | `x * 0.5 * (1 + :math.erf(x / :math.sqrt(2)))` | `x * 0.5 * (1 + Nx.erf(x / Nx.sqrt(2)))` |
 
 The key intuition: `Φ(x)` acts as a soft gate. For large positive x, Φ ≈ 1 so GELU ≈ x (pass through). For large negative x, Φ ≈ 0 so GELU ≈ 0 (block). The transition is smooth, unlike ReLU's hard corner.
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ (CDF), erf
+<details>
+<summary>All symbols so far (notebooks 00-05)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ` | Sum all elements |
+| `xᵢ`, `W[i]` | Indexing, row lookup |
+| `W ∈ ℝ^{V×d}` | Matrix shape |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+
+</details>
 
 ## Key Concepts
 

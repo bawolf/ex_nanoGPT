@@ -1,4 +1,4 @@
-# 15: KV Cache — Why Generation Is Slow (and How to Fix It)
+# 20: KV Cache
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -383,6 +383,8 @@ Vl.new(width: 500, height: 300, title: "Generation Time: The KV Cache Payoff")
 The speedup grows with sequence length — exactly as the O(n²) vs O(n³) analysis predicts.
 
 ## Break It
+
+> **Predict**: During cached generation, we need to apply RoPE at the correct position (not always position 0). What happens to the generated text if we reset the position counter to 0 at each step?
 
 ### Wrong RoPE Position Offset
 
