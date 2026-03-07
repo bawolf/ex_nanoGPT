@@ -30,6 +30,7 @@ defmodule ExNanoGPT.MixProject do
       {:phoenix, "~> 1.7"},
       {:phoenix_live_view, "~> 1.0"},
       {:phoenix_html, "~> 4.0"},
+      {:tidewave, "~> 0.5.5", only: :dev},
       {:bandit, "~> 1.0"}
     ] ++ platform_deps()
   end

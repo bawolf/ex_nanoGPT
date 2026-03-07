@@ -5,7 +5,7 @@ defmodule ExNanoGPTWeb.ChatLive do
   alias ExNanoGPT.V2.{Model, KVCache, Tokenizer}
   alias ExNanoGPT.Sampler
 
-  @max_tokens 256
+  @max_tokens_options [32, 64, 128, 256, 512]
 
   @impl true
   def mount(_params, _session, socket) do
@@ -15,8 +15,10 @@ defmodule ExNanoGPTWeb.ChatLive do
        input: "",
        generating: false,
        partial_response: "",
+       generation_ref: nil,
        temperature: 0.7,
        top_k: 40,
+       max_tokens: 128,
        model_loaded: false,
        weights_path: "",
        status: "No model loaded. Enter a checkpoint path below."
@@ -50,20 +52,65 @@ defmodule ExNanoGPTWeb.ChatLive do
   def handle_event("send", _params, socket), do: {:noreply, socket}
 
   @impl true
-  def handle_event("update_input", %{"value" => value}, socket) do
-    {:noreply, assign(socket, input: value)}
+  def handle_event("update_input", %{"message" => message}, socket) do
+    {:noreply, assign(socket, input: message)}
+  end
+
+  def handle_event("update_input", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("update_settings", params, socket) do
+    socket =
+      socket
+      |> maybe_update_float(params, "temperature", :temperature)
+      |> maybe_update_int(params, "top_k", :top_k)
+      |> maybe_update_int(params, "max_tokens", :max_tokens)
+
+    {:noreply, socket}
   end
 
   @impl true
-  def handle_event("set_temperature", %{"value" => value}, socket) do
-    {temp, _} = Float.parse(value)
-    {:noreply, assign(socket, temperature: temp)}
+  def handle_event("stop_generating", _params, socket) do
+    Logger.info("[Chat] Generation stopped by user")
+    partial = socket.assigns.partial_response
+
+    messages =
+      if partial != "" do
+        socket.assigns.messages ++ [%{role: "assistant", content: partial <> " [stopped]"}]
+      else
+        socket.assigns.messages
+      end
+
+    {:noreply,
+     assign(socket,
+       generating: false,
+       generation_ref: nil,
+       partial_response: "",
+       messages: messages,
+       status: "Stopped"
+     )}
   end
 
   @impl true
-  def handle_event("set_top_k", %{"value" => value}, socket) do
-    {k, _} = Integer.parse(value)
-    {:noreply, assign(socket, top_k: k)}
+  def handle_event("retry", _params, socket) do
+    messages = socket.assigns.messages
+
+    case List.last(messages) do
+      %{role: "assistant"} ->
+        messages = List.delete_at(messages, -1)
+        user_msg = List.last(messages)
+
+        if user_msg && user_msg.role == "user" do
+          Logger.info("[Chat] Retrying last message")
+          send(self(), {:generate, user_msg.content})
+          {:noreply, assign(socket, messages: messages, generating: true, status: "Generating...")}
+        else
+          {:noreply, socket}
+        end
+
+      _ ->
+        {:noreply, socket}
+    end
   end
 
   @impl true
@@ -112,13 +159,16 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   @impl true
   def handle_info({:generate, _user_msg}, socket) do
+    ref = make_ref()
+
     %{
       model_params: params,
       model_config: config,
       tokenizer: tok,
       messages: messages,
       temperature: temp,
-      top_k: top_k
+      top_k: top_k,
+      max_tokens: max_tokens
     } = socket.assigns
 
     turns =
@@ -129,7 +179,7 @@ defmodule ExNanoGPTWeb.ChatLive do
     {prompt_ids, _mask} = ExNanoGPT.V2.Conversation.render(turns, tok)
     ast_start = Tokenizer.encode_special(tok, "<|assistant_start|>")
     prompt_ids = prompt_ids ++ [ast_start]
-    Logger.info("[Chat] Processing prompt (#{length(prompt_ids)} tokens)...")
+    Logger.info("[Chat] Processing prompt (#{length(prompt_ids)} tokens), max_tokens=#{max_tokens}...")
 
     head_dim = div(config.n_embd, config.n_head)
 
@@ -163,25 +213,38 @@ defmodule ExNanoGPTWeb.ChatLive do
       text = Tokenizer.decode(tok, [first_token])
 
       send(self(), {:generate_next, %{
+        ref: ref,
         cache: cache,
         key: key,
         last_token: first_token,
         end_token: ast_end,
-        remaining: @max_tokens - 1,
+        remaining: max_tokens - 1,
+        max_tokens: max_tokens,
         generated_ids: [first_token],
         start_time: System.monotonic_time(:millisecond)
       }})
 
       {:noreply,
        assign(socket,
+         generation_ref: ref,
          partial_response: text,
-         status: "Generating... (1/#{@max_tokens} tokens)"
+         status: "Generating... (1/#{max_tokens} tokens)"
        )}
     end
   end
 
   @impl true
-  def handle_info({:generate_next, state}, socket) do
+  def handle_info({:generate_next, %{ref: ref} = state}, socket) do
+    if ref != socket.assigns.generation_ref do
+      {:noreply, socket}
+    else
+      do_generate_next(state, socket)
+    end
+  end
+
+  def handle_info(_msg, socket), do: {:noreply, socket}
+
+  defp do_generate_next(state, socket) do
     %{
       model_params: params,
       model_config: config,
@@ -191,11 +254,13 @@ defmodule ExNanoGPTWeb.ChatLive do
     } = socket.assigns
 
     %{
+      ref: ref,
       cache: cache,
       key: key,
       last_token: last_token,
       end_token: end_token,
       remaining: remaining,
+      max_tokens: max_tokens,
       generated_ids: generated_ids,
       start_time: start_time
     } = state
@@ -227,15 +292,17 @@ defmodule ExNanoGPTWeb.ChatLive do
         if rem(n, 10) == 0 do
           elapsed = System.monotonic_time(:millisecond) - start_time
           ms_per_tok = div(elapsed, n)
-          Logger.info("[Chat] Token #{n}/#{@max_tokens} (#{ms_per_tok}ms/tok)")
+          Logger.info("[Chat] Token #{n}/#{max_tokens} (#{ms_per_tok}ms/tok)")
         end
 
         send(self(), {:generate_next, %{
+          ref: ref,
           cache: cache,
           key: key,
           last_token: token,
           end_token: end_token,
           remaining: remaining - 1,
+          max_tokens: max_tokens,
           generated_ids: generated_ids,
           start_time: start_time
         }})
@@ -243,13 +310,11 @@ defmodule ExNanoGPTWeb.ChatLive do
         {:noreply,
          assign(socket,
            partial_response: text,
-           status: "Generating... (#{n}/#{@max_tokens} tokens)"
+           status: "Generating... (#{n}/#{max_tokens} tokens)"
          )}
       end
     end
   end
-
-  def handle_info(_msg, socket), do: {:noreply, socket}
 
   defp finalize_generation(socket, generated_ids) do
     tok = socket.assigns.tokenizer
@@ -283,6 +348,24 @@ defmodule ExNanoGPTWeb.ChatLive do
     end
   end
 
+  defp maybe_update_float(socket, params, key, assign_key) do
+    case params[key] do
+      nil -> socket
+      val ->
+        {f, _} = Float.parse(val)
+        assign(socket, [{assign_key, f}])
+    end
+  end
+
+  defp maybe_update_int(socket, params, key, assign_key) do
+    case params[key] do
+      nil -> socket
+      val ->
+        {n, _} = Integer.parse(val)
+        assign(socket, [{assign_key, n}])
+    end
+  end
+
   defp sample_token(logits, temperature, top_k, key) do
     logits =
       if temperature > 0 do
@@ -299,8 +382,26 @@ defmodule ExNanoGPTWeb.ChatLive do
     {Nx.squeeze(idx), key}
   end
 
+  @special_token_re ~r/<\|[a-z_]+\|>/
+
+  defp render_message_content(text) do
+    parts = Regex.split(@special_token_re, text, include_captures: true)
+
+    Enum.map(parts, fn part ->
+      if Regex.match?(@special_token_re, part) do
+        Phoenix.HTML.raw(
+          ~s(<span class="inline-block bg-purple-900/60 text-purple-300 text-[10px] font-mono rounded px-1.5 py-0.5 mx-0.5 align-middle border border-purple-700/50">#{Phoenix.HTML.html_escape(part) |> Phoenix.HTML.safe_to_string()}</span>)
+        )
+      else
+        part
+      end
+    end)
+  end
+
   @impl true
   def render(assigns) do
+    assigns = assign(assigns, max_tokens_options: @max_tokens_options)
+
     ~H"""
     <div class="flex flex-col h-screen max-w-4xl mx-auto">
       <!-- Header -->
@@ -347,13 +448,30 @@ defmodule ExNanoGPTWeb.ChatLive do
             "max-w-[80%] rounded-2xl px-4 py-3",
             if(msg.role == "user", do: "ml-auto bg-blue-600 text-white", else: "bg-gray-800 text-gray-100")
           ]}>
-            <p class="text-sm whitespace-pre-wrap"><%= msg.content %></p>
+            <p class="text-sm whitespace-pre-wrap"><%= render_message_content(msg.content) %></p>
           </div>
         <% end %>
 
         <%= if @generating do %>
           <div class="bg-gray-800 rounded-2xl px-4 py-3 max-w-[80%]">
-            <p class="text-sm whitespace-pre-wrap"><%= @partial_response %><span class="cursor-blink text-gray-400">▊</span></p>
+            <p class="text-sm whitespace-pre-wrap"><%= render_message_content(@partial_response) %><span class="cursor-blink text-gray-400">▊</span></p>
+          </div>
+          <div class="flex justify-start">
+            <button phx-click="stop_generating"
+                    class="text-xs text-red-400 hover:text-red-300 bg-gray-800 hover:bg-gray-700
+                           rounded-lg px-3 py-1.5 transition-colors border border-gray-700">
+              Stop
+            </button>
+          </div>
+        <% end %>
+
+        <%= if not @generating and @messages != [] do %>
+          <div class="flex justify-start">
+            <button phx-click="retry"
+                    class="text-xs text-gray-400 hover:text-gray-200 bg-gray-800 hover:bg-gray-700
+                           rounded-lg px-3 py-1.5 transition-colors border border-gray-700">
+              Retry
+            </button>
           </div>
         <% end %>
       </div>
@@ -379,23 +497,33 @@ defmodule ExNanoGPTWeb.ChatLive do
             Unload Model
           </button>
         <% end %>
-        <label>
-          Temperature: <%= @temperature %>
-          <input type="range" min="0.0" max="2.0" step="0.1" value={@temperature}
-                 phx-change="set_temperature" class="w-20 ml-1 align-middle" />
-        </label>
-        <label>
-          Top-K: <%= @top_k %>
-          <input type="range" min="1" max="100" step="1" value={@top_k}
-                 phx-change="set_top_k" class="w-20 ml-1 align-middle" />
-        </label>
+        <form phx-change="update_settings" class="flex flex-wrap items-center gap-4">
+          <label>
+            Temperature: <%= @temperature %>
+            <input type="range" name="temperature" min="0.0" max="2.0" step="0.1" value={@temperature}
+                   class="w-20 ml-1 align-middle" />
+          </label>
+          <label>
+            Top-K: <%= @top_k %>
+            <input type="range" name="top_k" min="1" max="100" step="1" value={@top_k}
+                   class="w-20 ml-1 align-middle" />
+          </label>
+          <label class="inline-flex items-center">
+            <span>Max tokens: <%= @max_tokens %></span>
+            <select name="max_tokens"
+                    class="bg-gray-800 rounded px-2 py-1 ml-1 border border-gray-700 text-xs align-middle">
+              <%= for n <- @max_tokens_options do %>
+                <option value={n} selected={n == @max_tokens}><%= n %></option>
+              <% end %>
+            </select>
+          </label>
+        </form>
       </div>
 
       <!-- Input -->
-      <form phx-submit="send" class="px-6 py-4 border-t border-gray-800">
+      <form phx-submit="send" phx-change="update_input" class="px-6 py-4 border-t border-gray-800">
         <div class="flex gap-3">
           <input type="text" name="message" value={@input}
-                 phx-keyup="update_input"
                  placeholder="Type a message..."
                  autocomplete="off"
                  disabled={@generating}
