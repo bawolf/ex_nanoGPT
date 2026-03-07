@@ -103,7 +103,9 @@ defmodule ExNanoGPTWeb.ChatLive do
         if user_msg && user_msg.role == "user" do
           Logger.info("[Chat] Retrying last message")
           send(self(), {:generate, user_msg.content})
-          {:noreply, assign(socket, messages: messages, generating: true, status: "Generating...")}
+
+          {:noreply,
+           assign(socket, messages: messages, generating: true, status: "Generating...")}
         else
           {:noreply, socket}
         end
@@ -179,7 +181,10 @@ defmodule ExNanoGPTWeb.ChatLive do
     {prompt_ids, _mask} = ExNanoGPT.V2.Conversation.render(turns, tok)
     ast_start = Tokenizer.encode_special(tok, "<|assistant_start|>")
     prompt_ids = prompt_ids ++ [ast_start]
-    Logger.info("[Chat] Processing prompt (#{length(prompt_ids)} tokens), max_tokens=#{max_tokens}...")
+
+    Logger.info(
+      "[Chat] Processing prompt (#{length(prompt_ids)} tokens), max_tokens=#{max_tokens}..."
+    )
 
     head_dim = div(config.n_embd, config.n_head)
 
@@ -212,17 +217,21 @@ defmodule ExNanoGPTWeb.ChatLive do
     else
       text = Tokenizer.decode(tok, [first_token])
 
-      send(self(), {:generate_next, %{
-        ref: ref,
-        cache: cache,
-        key: key,
-        last_token: first_token,
-        end_token: ast_end,
-        remaining: max_tokens - 1,
-        max_tokens: max_tokens,
-        generated_ids: [first_token],
-        start_time: System.monotonic_time(:millisecond)
-      }})
+      send(
+        self(),
+        {:generate_next,
+         %{
+           ref: ref,
+           cache: cache,
+           key: key,
+           last_token: first_token,
+           end_token: ast_end,
+           remaining: max_tokens - 1,
+           max_tokens: max_tokens,
+           generated_ids: [first_token],
+           start_time: System.monotonic_time(:millisecond)
+         }}
+      )
 
       {:noreply,
        assign(socket,
@@ -295,17 +304,21 @@ defmodule ExNanoGPTWeb.ChatLive do
           Logger.info("[Chat] Token #{n}/#{max_tokens} (#{ms_per_tok}ms/tok)")
         end
 
-        send(self(), {:generate_next, %{
-          ref: ref,
-          cache: cache,
-          key: key,
-          last_token: token,
-          end_token: end_token,
-          remaining: remaining - 1,
-          max_tokens: max_tokens,
-          generated_ids: generated_ids,
-          start_time: start_time
-        }})
+        send(
+          self(),
+          {:generate_next,
+           %{
+             ref: ref,
+             cache: cache,
+             key: key,
+             last_token: token,
+             end_token: end_token,
+             remaining: remaining - 1,
+             max_tokens: max_tokens,
+             generated_ids: generated_ids,
+             start_time: start_time
+           }}
+        )
 
         {:noreply,
          assign(socket,
@@ -342,15 +355,22 @@ defmodule ExNanoGPTWeb.ChatLive do
     etf_path = Path.join(dir, "tokenizer.etf")
 
     cond do
-      File.exists?(json_path) -> Tokenizer.load_vocab_json(json_path)
-      File.exists?(etf_path) -> Tokenizer.load(etf_path)
-      true -> raise "No tokenizer found. Run ./scripts/download_weights.sh to get the tokenizer, or place tokenizer.json or tokenizer.etf in #{dir}/"
+      File.exists?(json_path) ->
+        Tokenizer.load_vocab_json(json_path)
+
+      File.exists?(etf_path) ->
+        Tokenizer.load(etf_path)
+
+      true ->
+        raise "No tokenizer found. Run ./scripts/download_weights.sh to get the tokenizer, or place tokenizer.json or tokenizer.etf in #{dir}/"
     end
   end
 
   defp maybe_update_float(socket, params, key, assign_key) do
     case params[key] do
-      nil -> socket
+      nil ->
+        socket
+
       val ->
         {f, _} = Float.parse(val)
         assign(socket, [{assign_key, f}])
@@ -359,7 +379,9 @@ defmodule ExNanoGPTWeb.ChatLive do
 
   defp maybe_update_int(socket, params, key, assign_key) do
     case params[key] do
-      nil -> socket
+      nil ->
+        socket
+
       val ->
         {n, _} = Integer.parse(val)
         assign(socket, [{assign_key, n}])

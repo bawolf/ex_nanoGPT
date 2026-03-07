@@ -1,8 +1,16 @@
 defmodule ExNanoGPTWeb.Layouts do
   use Phoenix.Component
 
-  @phoenix_vsn Application.compile_env(:phoenix, :vsn, to_string(Application.spec(:phoenix, :vsn)))
-  @lv_vsn Application.compile_env(:phoenix_live_view, :vsn, to_string(Application.spec(:phoenix_live_view, :vsn)))
+  @phoenix_vsn Application.compile_env(
+                 :phoenix,
+                 :vsn,
+                 to_string(Application.spec(:phoenix, :vsn))
+               )
+  @lv_vsn Application.compile_env(
+            :phoenix_live_view,
+            :vsn,
+            to_string(Application.spec(:phoenix_live_view, :vsn))
+          )
 
   def root(assigns) do
     assigns = assign(assigns, phoenix_vsn: @phoenix_vsn, lv_vsn: @lv_vsn)
