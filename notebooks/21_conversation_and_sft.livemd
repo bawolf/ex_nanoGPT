@@ -1,4 +1,4 @@
-# 16: From Completion to Chat — The Technique That Created ChatGPT
+# 21: Conversation and SFT
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -288,6 +288,8 @@ Vl.new(width: 600, height: 200, title: "Per-Token NLL — only green bars drive 
 Gray bars are multiplied by zero in the loss — they don't affect gradients. Only green bars (assistant tokens) drive learning.
 
 ## Break It
+
+> **Predict**: If we remove the loss mask and train on *all* tokens (including the user's messages and special tokens), what behavior would the model learn?
 
 ### No Loss Mask: Training on Everything
 

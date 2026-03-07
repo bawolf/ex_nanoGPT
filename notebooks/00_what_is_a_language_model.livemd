@@ -113,6 +113,15 @@ Map.get(itos, 0)
 ```
 
 <details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Use `Enum.with_index/1` on `chars` to get `[{char, 0}, {char, 1}, ...]`.
+2. Use `Map.new/2` to build `stoi`: the default `Map.new(list)` uses `{k, v}` pairs directly.
+3. For `itos`, use `Map.new(list, fn {ch, i} -> {i, ch} end)` to swap the key-value order.
+
+</details>
+
+<details>
 <summary>Solution</summary>
 
 ```elixir
@@ -141,6 +150,16 @@ IO.inspect(encoded, label: "encoded 'hello'", charlists: :as_lists)
 decoded = decode.(encoded)
 IO.inspect(decoded, label: "decoded back")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. For `encode`: convert the string to a list of characters with `String.to_charlist/1`.
+2. Map each character to its token ID using `Map.fetch!(stoi, char)`.
+3. For `decode`: map each token ID back to a character using `Map.fetch!(itos, id)`.
+4. Convert the resulting character list to a string with `List.to_string/1`.
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -250,7 +269,31 @@ end
 
 ## Batching
 
-We don't train on one sequence at a time -- we train on **batches** of sequences in parallel. This is faster and leads to more stable gradient estimates.
+That was **one training example** -- a single window of 8 characters from the dataset. But we don't train on one example at a time. We train on a **batch**: multiple windows grabbed from different random positions in the text, all processed simultaneously.
+
+Here's what a batch of 4 actually looks like, pulled from our Shakespeare data:
+
+```elixir
+batch_size = 4
+block_size = 8
+
+key = Nx.Random.key(42)
+data_len = Nx.axis_size(train_data, 0)
+max_start = data_len - block_size
+{starts, _} = Nx.Random.randint(key, 0, max_start, shape: {batch_size})
+
+for i <- 0..(batch_size - 1) do
+  pos = Nx.to_number(starts[i])
+  x_ids = Nx.to_flat_list(Nx.slice(train_data, [starts[i]], [block_size]))
+  y_ids = Nx.to_flat_list(Nx.slice(train_data, [Nx.add(starts[i], 1)], [block_size]))
+  IO.puts("Batch element #{i} (pos #{pos}): \"#{decode.(x_ids)}\" → \"#{decode.(y_ids)}\"")
+end
+```
+
+Each element is a different 8-character window from a random location in Shakespeare. The model sees all four in parallel and learns from all of them at once. Two reasons this matters:
+
+1. **Speed**: GPUs process many sequences simultaneously, so a batch of 4 isn't 4x slower than a batch of 1.
+2. **Stability**: Averaging gradients across multiple examples gives a smoother, more reliable learning signal than lurching from one example to the next.
 
 ### Exercise: Build a Batch
 
@@ -330,30 +373,91 @@ IO.inspect(Nx.shape(x), label: "x shape")
 IO.inspect(Nx.shape(y), label: "y shape")
 ```
 
-## Break It: What If Batches Aren't Random?
+### Explore: Where Do Batches Come From?
 
-What happens if every batch starts at position 0 instead of a random position? The model only ever sees the first `block_size` tokens and overfits to them.
+Click the button to draw a new random batch. Each click picks 4 random positions from the ~1M character dataset. Watch how they scatter across the entire text -- that's the point of random sampling.
 
 ```elixir
-# Always start at position 0 -- no randomness
-fixed_x = Nx.stack(List.duplicate(Nx.slice(train_data, [0], [block_size]), batch_size))
-fixed_y = Nx.stack(List.duplicate(Nx.slice(train_data, [1], [block_size]), batch_size))
-
-IO.puts("Fixed batch -- always the same #{batch_size} identical sequences:")
-IO.inspect(Nx.to_flat_list(fixed_x[0]), label: "x[0] (same every time)")
-
-# Random batch -- different every call
-key1 = Nx.Random.key(1)
-key2 = Nx.Random.key(2)
-{rand_x1, _} = get_batch.(train_data, key1)
-{rand_x2, _} = get_batch.(train_data, key2)
-
-IO.puts("\nRandom batches -- different every time:")
-IO.inspect(Nx.to_flat_list(rand_x1[0]), label: "batch 1, x[0]")
-IO.inspect(Nx.to_flat_list(rand_x2[0]), label: "batch 2, x[0]")
-IO.puts("\nWith fixed batches, the model memorizes one passage.")
-IO.puts("With random batches, it sees the whole dataset and learns general patterns.")
+batch_button = Kino.Input.button("Draw another batch")
 ```
+
+```elixir
+Kino.listen(batch_button, fn _event ->
+  batch_key = Nx.Random.key(:erlang.system_time())
+  data_len = Nx.axis_size(train_data, 0)
+  max_start = data_len - block_size
+  {starts, _} = Nx.Random.randint(batch_key, 0, max_start, shape: {batch_size})
+  positions = Nx.to_flat_list(starts)
+
+  text_lines =
+    for {pos, i} <- Enum.with_index(positions) do
+      ids = Nx.to_flat_list(Nx.slice(train_data, [Nx.tensor(pos)], [block_size]))
+      "  **Batch #{i}** (pos #{pos} of #{data_len}): `#{decode.(ids)}`"
+    end
+    |> Enum.join("\n\n")
+
+  chart =
+    Vl.new(width: 600, height: 60, title: "Batch positions in dataset")
+    |> Vl.data_from_values(Enum.map(positions, &%{"position" => &1, "y" => 0}))
+    |> Vl.mark(:tick, thickness: 3, size: 40)
+    |> Vl.encode_field(:x, "position", type: :quantitative, scale: %{domain: [0, data_len]}, title: "Character position")
+
+  Kino.render(Kino.Markdown.new(text_lines))
+  Kino.render(chart)
+end)
+```
+
+### Things to Notice About Batches
+
+A few details that become important at scale:
+
+- **Sequence length matters**: Our `block_size=8` means the model sees only 8 characters of context. Real LLMs use `block_size` of 2048, 8192, or even 128K. Longer context = more to learn from per example, but more memory and compute.
+- **Coverage over time**: Across many batches, random sampling ensures the model eventually sees the whole dataset. We'll visualize this in the next section.
+- **Overlap is fine**: Two batch elements might overlap or even cover the same text. With ~1M characters and windows of 8, collisions are rare, and even when they happen, the gradients just reinforce that example.
+
+## Break It: What If Batches Aren't Random?
+
+> **Before you run the next cell**: What do you think happens if every batch starts at position 0 instead of a random position? After 100 batches of 4 sequences each (400 windows total), how much of the ~1M character dataset will the model have seen?
+
+```elixir
+data_len = Nx.axis_size(train_data, 0)
+num_batches = 100
+
+random_coverage =
+  Enum.scan(1..num_batches, MapSet.new(), fn i, seen ->
+    key = Nx.Random.key(i)
+    {starts, _} = Nx.Random.randint(key, 0, data_len - block_size, shape: {batch_size})
+
+    new_positions =
+      for s <- Nx.to_flat_list(starts), offset <- 0..(block_size - 1), do: s + offset
+
+    MapSet.union(seen, MapSet.new(new_positions))
+  end)
+
+fixed_coverage =
+  Enum.scan(1..num_batches, MapSet.new(), fn _i, seen ->
+    new_positions = for offset <- 0..(block_size - 1), do: offset
+    MapSet.union(seen, MapSet.new(new_positions))
+  end)
+
+chart_data =
+  Enum.zip([1..num_batches, random_coverage, fixed_coverage])
+  |> Enum.flat_map(fn {batch, rand_set, fixed_set} ->
+    [
+      %{"batch" => batch, "unique_positions" => MapSet.size(rand_set), "strategy" => "Random"},
+      %{"batch" => batch, "unique_positions" => MapSet.size(fixed_set), "strategy" => "Fixed (always pos 0)"}
+    ]
+  end)
+
+Vl.new(width: 600, height: 300, title: "Dataset Coverage: Random vs Fixed Batches (batch_size=#{batch_size}, block_size=#{block_size})")
+|> Vl.data_from_values(chart_data)
+|> Vl.mark(:line, point: false)
+|> Vl.encode_field(:x, "batch", type: :quantitative, title: "Batch number")
+|> Vl.encode_field(:y, "unique_positions", type: :quantitative, title: "Unique character positions seen")
+|> Vl.encode_field(:color, "strategy", type: :nominal)
+```
+
+Random batches explore the dataset broadly -- after 100 batches the model has seen thousands of unique positions. Fixed batches see the same 8 characters over and over. A model trained on fixed batches memorizes one passage; a model trained on random batches learns the language.
 
 ## What's Next
 
@@ -366,21 +470,17 @@ In the next notebook, we'll build the first neural network component: **embeddin
 
 ## Math Notation: Your First Symbols
 
-Two symbols you'll see everywhere in ML:
+Two symbols you'll see everywhere in ML. Here's the key insight: **math notation, plain English, Elixir, and Nx are all saying the same thing**. The table below shows each concept four ways:
 
-**Sigma notation (Σ)**: "Add these up."
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `Σᵢ xᵢ` | Add up all elements | `Enum.sum(list)` | `Nx.sum(x)` |
+| `xᵢ` | The i-th element | `Enum.at(list, i)` | `x[i]` |
+| `n` | Number of elements | `length(list)` | `Nx.axis_size(x, 0)` |
 
-`Σᵢ xᵢ` means "sum all the x values" -- same as `Enum.sum(list)` or `Nx.sum(tensor)`.
+**Sigma notation (Σ)** just means "add these up." The subscript `i` is the loop variable -- `xᵢ` means "the i-th element."
 
-The subscript `i` is the loop variable. `xᵢ` means "the i-th element" -- same as `x[i]` or `Nx.slice`.
-
-| Math | Elixir/Nx | Meaning |
-|------|-----------|---------|
-| `Σᵢ xᵢ` | `Nx.sum(x)` | Add up all elements |
-| `xᵢ` | `x[i]` | The i-th element |
-| `n` | `Nx.axis_size(x, 0)` | Number of elements |
-
-These will come back in every notebook. By notebook 10, you'll be reading full equations.
+These will come back in every notebook. By notebook 13, you'll be reading full equations.
 
 ## Key Concepts
 

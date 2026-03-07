@@ -44,8 +44,19 @@ defmodule ExNanoGPT.V2.WeightLoader do
     wte = load_npy(dir, "transformer.wte.weight", dtype)
     lm_head = load_npy(dir, "lm_head.weight", dtype)
 
-    resid_lambdas = load_npy(dir, "transformer.resid_lambdas", dtype)
-    x0_lambdas = load_npy(dir, "transformer.x0_lambdas", dtype)
+    resid_lambdas =
+      if has_param?(metadata, "transformer.resid_lambdas") do
+        load_npy(dir, "transformer.resid_lambdas", dtype)
+      else
+        Nx.broadcast(Nx.tensor(1.0, type: dtype), {config.n_layer})
+      end
+
+    x0_lambdas =
+      if has_param?(metadata, "transformer.x0_lambdas") do
+        load_npy(dir, "transformer.x0_lambdas", dtype)
+      else
+        Nx.broadcast(Nx.tensor(0.0, type: dtype), {config.n_layer})
+      end
 
     blocks =
       for i <- 0..(config.n_layer - 1) do
@@ -97,7 +108,12 @@ defmodule ExNanoGPT.V2.WeightLoader do
   end
 
   defp build_config(metadata) do
-    cfg = metadata["config"] || %{}
+    cfg =
+      case metadata do
+        %{"config" => c} when c != %{} -> c
+        %{"model_config" => c} when c != %{} -> c
+        _ -> infer_config(metadata)
+      end
 
     %Model{
       sequence_len: Map.get(cfg, "sequence_len", 2048),
@@ -107,6 +123,35 @@ defmodule ExNanoGPT.V2.WeightLoader do
       n_kv_head: Map.get(cfg, "n_kv_head", 6),
       n_embd: Map.get(cfg, "n_embd", 768),
       window_pattern: Map.get(cfg, "window_pattern", "SSSL")
+    }
+  end
+
+  defp infer_config(metadata) do
+    params = metadata["params"] || %{}
+
+    n_layer =
+      params
+      |> Map.keys()
+      |> Enum.flat_map(fn key ->
+        case Regex.run(~r/transformer\.h\.(\d+)\./, key) do
+          [_, n] -> [String.to_integer(n)]
+          _ -> []
+        end
+      end)
+      |> Enum.max(fn -> 11 end)
+      |> Kernel.+(1)
+
+    wte_shape = get_in(params, ["transformer.wte.weight", "shape"]) || [32768, 768]
+    [vocab_size, n_embd] = wte_shape
+
+    %{
+      "sequence_len" => 2048,
+      "vocab_size" => vocab_size,
+      "n_layer" => n_layer,
+      "n_head" => div(n_embd, 128),
+      "n_kv_head" => div(n_embd, 128),
+      "n_embd" => n_embd,
+      "window_pattern" => "SSSL"
     }
   end
 

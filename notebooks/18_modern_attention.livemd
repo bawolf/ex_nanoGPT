@@ -1,4 +1,4 @@
-# 12: Modern Attention — How Shazeer's Memory Trick Enables LLMs on Your Laptop
+# 18: Modern Attention
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -16,7 +16,7 @@ alias VegaLite, as: Vl
 
 ## A Memory Budget Problem
 
-Imagine you're deploying a language model. It has 24 layers, 16 attention heads, embedding dimension 1536, and you want to support 2048-token conversations. During inference, you cache every token's K and V projections (we'll learn why in notebook 15).
+Imagine you're deploying a language model. It has 24 layers, 16 attention heads, embedding dimension 1536, and you want to support 2048-token conversations. During inference, you cache every token's K and V projections (we'll learn why in notebook 20).
 
 How much memory does that take?
 
@@ -49,16 +49,32 @@ Four years later, in 2023, Joshua Ainslie at Google Research found the sweet spo
 
 ## Math Notation
 
-| Symbol | Meaning | Nx code |
-|--------|---------|---------|
-| `n_h` | Number of Q heads | `n_head` |
-| `n_kv` | Number of K/V heads (≤ n_h) | `n_kv_head` |
-| `r` | Repeat factor: `n_h / n_kv` | `div(n_head, n_kv_head)` |
-| `W_Q` | Q projection, shape `{d, n_h × d_h}` | `c_q` |
-| `W_K` | K projection, shape `{d, n_kv × d_h}` | `c_k` |
-| `W_V` | V projection, shape `{d, n_kv × d_h}` | `c_v` |
-| `QK_norm` | RMSNorm applied to Q and K | `rms_norm(q)`, `rms_norm(k)` |
-| `w` | Sliding window size | `window_size` |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `n_h` | Number of Q heads | `n_head` | `n_head` |
+| `n_kv` | Number of K/V heads (≤ n_h) | `n_kv_head` | `n_kv_head` |
+| `r = n_h / n_kv` | Repeat factor for GQA | `div(n_head, n_kv_head)` | `div(n_head, n_kv_head)` |
+| `W_Q`, `W_K`, `W_V` | Separate Q/K/V projections | (weight matrices) | `c_q`, `c_k`, `c_v` |
+| `QK_norm` | Normalize Q and K before dot product | (apply rms_norm) | `rms_norm(q)`, `rms_norm(k)` |
+| `w` | Sliding window size | `window_size` | `window_size` |
+
+<details>
+<summary>All symbols so far (notebooks 00-17)</summary>
+
+| Symbol | Meaning | First seen |
+|--------|---------|-----------|
+| `Σ`, `xᵢ`, `n`, `W ∈ ℝ`, `W[i]` | Basics | 00-01 |
+| `μ, σ², ε, γ, β` | Normalization | 02 |
+| `Q, K, V, d_k, softmax, ^T` | Attention | 03 |
+| `GELU, Φ, erf` | Activation | 05 |
+| `x + F(x)`, `W_E^T` | Residuals, weight tying | 06-07 |
+| `L, log, P(y\|x)` | Loss | 08 |
+| `α, β₁/β₂, ∇, θ, λ, ∇_θ L` | Optimization | 09-10 |
+| `T` | Temperature | 12 |
+| `RMS(x), θᵢ, R(θ)` | RMSNorm, RoPE | 16-17 |
+| `n_h, n_kv, r, w, QK_norm` | GQA, sliding window | 18 |
+
+</details>
 
 ## Interactive: Memory Budget Calculator
 
@@ -336,6 +352,8 @@ end
 
 ### Build and Visualize the Masks
 
+> **Nx Bridge**: `Nx.logical_and(a, b)` combines two boolean tensors element-wise -- like `a and b` for every element. We use it to combine two masks: "can attend" (causal) AND "is within the window" (sliding).
+
 ```elixir
 seq_len = 16
 
@@ -525,6 +543,8 @@ Vl.new(width: 120, height: 120, title: "GQA Attention Weights")
 Heads 0 and 1 share a K/V group — notice their similar patterns. Same for heads 2 and 3.
 
 ## Break It
+
+> **Predict**: If we set the sliding window to size 1, each token can only attend to itself. What kind of language modeling behavior would that produce?
 
 ### Window size = 1
 

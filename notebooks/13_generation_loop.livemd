@@ -1,0 +1,298 @@
+# 13: The Generation Loop
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## The Big Picture
+
+In the previous notebook, you built the sampling toolkit: temperature scaling, top-k filtering, and the Gumbel-max trick. Now we'll wire these into the **autoregressive generation loop** -- the code that actually produces text, one token at a time.
+
+## Setting Up a Tiny Model
+
+We'll work with a small model for demonstrations. It won't generate coherent Shakespeare (it's far too small and undertrained), but it will show the complete generation pipeline.
+
+```elixir
+tiny_config = %{
+  vocab_size: 65,
+  block_size: 32,
+  n_layer: 1,
+  n_head: 2,
+  n_embd: 32,
+  dropout: 0.0,
+  bias: true
+}
+
+key = Nx.Random.key(1337)
+tiny_params = ExNanoGPT.Model.init_params(tiny_config, key)
+
+data_dir = ExNanoGPT.Data.data_dir()
+
+meta =
+  if File.exists?(Path.join(data_dir, "meta.etf")) do
+    ExNanoGPT.Data.load_meta(Path.join(data_dir, "meta.etf"))
+  else
+    IO.puts("Preparing data...")
+    ExNanoGPT.Data.prepare()
+  end
+
+IO.puts("Model: #{ExNanoGPT.Model.count_params(tiny_params)} parameters")
+IO.puts("Vocab size: #{meta.vocab_size}")
+IO.puts("Block size: #{tiny_config.block_size}")
+```
+
+## The Forward Pass for Generation
+
+During training, we compute logits for all positions (because we need the loss at every position). During generation, we only care about the **last position** -- that's where the prediction for the next token lives.
+
+```elixir
+prompt = "ROMEO:"
+prompt_ids = ExNanoGPT.Data.encode(meta, prompt)
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+IO.puts("Prompt: #{inspect(prompt)}")
+IO.puts("Token IDs: #{inspect(prompt_ids)}")
+IO.puts("Tensor shape: #{inspect(Nx.shape(idx))}")
+```
+
+```elixir
+logits = ExNanoGPT.Model.forward(idx, tiny_params, tiny_config, Nx.Random.key(0))
+IO.puts("Logits shape: #{inspect(Nx.shape(logits))}")
+IO.puts("That's {batch=1, last_position=1, vocab_size=65}")
+
+logits_flat = Nx.squeeze(logits, axes: [0, 1])
+IO.puts("\nTop 5 logit values:")
+sorted_indices = Nx.argsort(logits_flat, direction: :desc)
+for i <- 0..4 do
+  idx_val = Nx.to_number(sorted_indices[i])
+  logit_val = Nx.to_number(logits_flat[idx_val])
+  char = ExNanoGPT.Data.decode(meta, [idx_val])
+  IO.puts("  '#{char}' (id=#{idx_val}): #{Float.round(logit_val, 4)}")
+end
+
+IO.puts("\n(Random model, so these are random -- no meaningful predictions yet)")
+```
+
+## Exercise: The Full Autoregressive Generation Loop
+
+Now combine everything into a complete generation function. Given a starting sequence of tokens, generate `max_new_tokens` additional tokens one at a time.
+
+The loop:
+1. If the sequence is longer than `block_size`, crop to the last `block_size` tokens
+2. Forward pass to get logits for the last position
+3. Apply temperature scaling and optionally top-k filtering
+4. Softmax to get probabilities
+5. Sample one token using the Gumbel-max trick
+6. Append it to the sequence
+7. Repeat
+
+> **Nx Bridge**: `Nx.concatenate([a, b], axis: 1)` joins tensors along an axis -- like `a ++ b` for lists, but along any dimension of a tensor.
+
+```elixir
+generate = fn idx, params, model_config, key, opts ->
+  max_new_tokens = Keyword.get(opts, :max_new_tokens, 100)
+  temperature = Keyword.get(opts, :temperature, 1.0)
+  top_k = Keyword.get(opts, :top_k, nil)
+  block_size = model_config.block_size
+
+  # TODO: implement the generation loop
+  # Use Enum.reduce over 0..(max_new_tokens - 1), accumulating {idx, key}
+  #
+  # Each iteration:
+  # 1. Crop: if seq_len > block_size, take last block_size tokens
+  # 2. Forward pass: ExNanoGPT.Model.forward(idx_cond, params, model_config, key)
+  # 3. Squeeze to {batch, vocab_size}
+  # 4. Divide by temperature
+  # 5. Top-k filtering (if top_k is not nil)
+  # 6. Softmax to probabilities
+  # 7. Gumbel-max sampling
+  # 8. Concatenate new token to sequence
+  # 9. Split key for next iteration
+  idx
+end
+
+prompt_ids = ExNanoGPT.Data.encode(meta, "ROMEO:")
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+generated = generate.(idx, tiny_params, tiny_config, Nx.Random.key(42),
+  max_new_tokens: 50, temperature: 1.0, top_k: 10)
+
+output_ids = generated |> Nx.squeeze(axes: [0]) |> Nx.to_flat_list()
+output_text = ExNanoGPT.Data.decode(meta, output_ids)
+IO.puts("Generated text (random model -- won't make sense):")
+IO.puts(output_text)
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Crop: `Nx.slice_along_axis(idx, seq_len - block_size, block_size, axis: 1)`
+2. Forward: `ExNanoGPT.Model.forward(idx_cond, params, model_config, key)` → `{batch, 1, vocab_size}`
+3. Squeeze position dim: `Nx.squeeze(logits, axes: [1])`
+4. Temperature: `Nx.divide(logits, temperature)`
+5. Top-k: sort, get threshold at index k-1, use `Nx.select` with `Nx.less`
+6. Softmax: subtract max, exp, divide by sum
+7. Gumbel-max: log probs + Gumbel noise, then argmax
+8. Key splitting: `keys = Nx.Random.split(key); key = keys[0]; sample_key = keys[1]`
+9. Concatenate: `Nx.concatenate([idx, idx_next], axis: 1)`
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+generate = fn idx, params, model_config, key, opts ->
+  max_new_tokens = Keyword.get(opts, :max_new_tokens, 100)
+  temperature = Keyword.get(opts, :temperature, 1.0)
+  top_k = Keyword.get(opts, :top_k, nil)
+  block_size = model_config.block_size
+
+  {final_idx, _final_key} =
+    Enum.reduce(0..(max_new_tokens - 1), {idx, key}, fn _i, {idx, key} ->
+      seq_len = Nx.axis_size(idx, 1)
+      idx_cond =
+        if seq_len > block_size do
+          Nx.slice_along_axis(idx, seq_len - block_size, block_size, axis: 1)
+        else
+          idx
+        end
+
+      logits = ExNanoGPT.Model.forward(idx_cond, params, model_config, key)
+      logits = Nx.squeeze(logits, axes: [1])
+      logits = Nx.divide(logits, temperature)
+
+      logits =
+        if top_k do
+          {_b, vs} = Nx.shape(logits)
+          k = min(top_k, vs)
+          sorted = Nx.sort(logits, axis: -1, direction: :desc)
+          threshold = Nx.slice_along_axis(sorted, k - 1, 1, axis: -1)
+          mask = Nx.less(logits, threshold)
+          neg_inf = Nx.broadcast(Nx.Constants.neg_infinity(:f32), Nx.shape(logits))
+          Nx.select(mask, neg_inf, logits)
+        else
+          logits
+        end
+
+      max_val = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+      exps = Nx.exp(Nx.subtract(logits, max_val))
+      probs = Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+
+      keys = Nx.Random.split(key)
+      sample_key = keys[1]
+      key = keys[0]
+
+      log_probs = Nx.log(Nx.max(probs, 1.0e-10))
+      {uniform, _} = Nx.Random.uniform(sample_key, shape: Nx.shape(probs))
+      gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.max(uniform, 1.0e-10)))))
+      idx_next = Nx.argmax(Nx.add(log_probs, gumbel), axis: -1, keep_axis: true)
+      idx_next = Nx.as_type(idx_next, :s32)
+
+      new_idx = Nx.concatenate([idx, idx_next], axis: 1)
+      {new_idx, key}
+    end)
+
+  final_idx
+end
+```
+
+</details>
+
+## Demo: Generating Text
+
+Let's use both our implementation and the real `ExNanoGPT.Sampler` to generate text from the random tiny model.
+
+```elixir
+IO.puts("=== Generation with our implementation ===")
+prompt_ids = ExNanoGPT.Data.encode(meta, "\n")
+idx = Nx.tensor([prompt_ids], type: :s32)
+
+our_output = generate.(idx, tiny_params, tiny_config, Nx.Random.key(42),
+  max_new_tokens: 200, temperature: 0.8, top_k: 20)
+
+our_text = our_output |> Nx.squeeze(axes: [0]) |> Nx.to_flat_list() |> then(&ExNanoGPT.Data.decode(meta, &1))
+IO.puts(our_text)
+```
+
+```elixir
+IO.puts("=== Generation with ExNanoGPT.Sampler ===")
+real_text = ExNanoGPT.Sampler.generate_text(
+  tiny_params, tiny_config, meta, "\n", Nx.Random.key(42),
+  max_new_tokens: 200, temperature: 0.8, top_k: 20
+)
+
+IO.puts(real_text)
+```
+
+```elixir
+for temp <- [0.1, 0.5, 1.0, 2.0] do
+  text = ExNanoGPT.Sampler.generate_text(
+    tiny_params, tiny_config, meta, "H", Nx.Random.key(123),
+    max_new_tokens: 80, temperature: temp, top_k: 10
+  )
+
+  IO.puts("--- temperature = #{temp} ---")
+  IO.puts(text)
+  IO.puts("")
+end
+```
+
+## From Random to Shakespeare
+
+With a random model, the output is gibberish. But the code is exactly the same code that generates real Shakespeare from a trained model. The only difference is the quality of the parameters.
+
+If you were to train the full model (6 layers, 384 dimensions, ~10M parameters) on the Shakespeare dataset for a few thousand iterations on a GPU, you'd see output like:
+
+```
+ROMEO:
+What shall I swear by? Thou art all my world:
+And yet no doubt thou know'st my love is young.
+```
+
+The architecture, the loss function, the optimizer, the training loop, and the generation code are all the same. The only things that change are scale (more layers, more dimensions, more data, more compute) and time (more training iterations).
+
+## Congratulations!
+
+You've built a complete GPT from scratch in Elixir. Here's everything you implemented across these notebooks:
+
+| Notebook | What you built |
+|----------|---------------|
+| **00: Language Models** | Tokenization, encoding/decoding, batching |
+| **01: Embeddings** | Token and position embeddings -- converting IDs to vectors |
+| **02: Layer Norm** | Normalizing activations for stable training |
+| **03: Attention** | The core mechanism: letting tokens attend to each other |
+| **04: Multi-Head** | Parallel attention heads with learned projections |
+| **05: MLP** | Feed-forward layers with GELU activation |
+| **06: Transformer Block** | Pre-norm residual connections combining attention and MLP |
+| **07: The Full Model** | Stacking blocks with weight-tied input/output embeddings |
+| **08: Cross-Entropy Loss** | Measuring how wrong the model's predictions are |
+| **09: SGD + Adam** | AdamW with momentum, adaptive LR, weight decay |
+| **10: Training Hyperparameters** | LR schedule, gradient clipping, weight decay groups |
+| **11: Training Loop** | Tying it all together: batch → forward → backward → update |
+| **12: Sampling Strategies** | Temperature, top-k, Gumbel-max |
+| **13: Generation Loop** | Autoregressive generation, one token at a time |
+
+Every one of these components is present in GPT-2, GPT-3, and the models behind ChatGPT and Claude. The difference is scale -- more layers, more heads, more data, more compute -- but the fundamental ideas are the same ones you just built by hand.
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Autoregressive generation** | Generating one token at a time, feeding each output back as the next input |
+| **Context window** | The model can only see `block_size` tokens at once; crop longer sequences |
+| **Forward pass for generation** | Only the last position's logits matter (that's the next-token prediction) |
+| **The complete pipeline** | crop → forward → scale → filter → softmax → sample → append → repeat |

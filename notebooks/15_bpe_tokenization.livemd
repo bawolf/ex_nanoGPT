@@ -1,4 +1,4 @@
-# 14: BPE Tokenization — From a 1994 Compression Hack to the Heart of Every LLM
+# 15: BPE Tokenization — From a 1994 Compression Hack to the Heart of Every LLM
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -43,13 +43,31 @@ Today, GPT-4 uses ~100,000 BPE tokens. Every modern LLM uses some variant of BPE
 
 ## Math Notation
 
-| Symbol | Meaning | Example |
-|--------|---------|---------|
-| V | Vocabulary — the set of all tokens | {0, 1, ..., 255, 256, ...} |
-| \|V\| | Vocabulary size | 256 + num_merges + num_special |
-| (p, q) | An adjacent pair of token IDs | (116, 104) |
-| f(p, q) | Frequency of pair (p, q) in the corpus | f(116, 104) = 5 |
-| **(p\*, q\*) = argmax f(p, q)** | **Find the most frequent pair** | **The key equation** |
+BPE is pure string manipulation -- no tensors needed. But it still has a key equation:
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `V` | Vocabulary (set of all tokens) | `MapSet.new(0..255)` | N/A (preprocessing) |
+| `\|V\|` | Vocabulary size | `MapSet.size(vocab)` | N/A |
+| `f(p, q)` | Frequency of adjacent pair | `Enum.frequencies(pairs)` | N/A |
+| `(p*, q*) = argmax f(p,q)` | Find the most frequent pair | `Enum.max_by(freqs, fn {_k,v} -> v end)` | N/A |
+
+<details>
+<summary>All symbols so far (notebooks 00-15)</summary>
+
+| Symbol | Meaning | First seen |
+|--------|---------|-----------|
+| `Σ`, `xᵢ`, `n`, `W ∈ ℝ`, `W[i]` | Basics | 00-01 |
+| `μ, σ², ε, γ, β` | Normalization | 02 |
+| `Q, K, V, d_k, softmax, ^T` | Attention | 03 |
+| `GELU, Φ, erf` | Activation | 05 |
+| `x + F(x)`, `W_E^T` | Residuals, weight tying | 06-07 |
+| `L, log, P(y\|x)` | Loss | 08 |
+| `α, β₁/β₂, ∇, θ, λ, ∇_θ L` | Optimization | 09-10 |
+| `T` | Temperature | 12 |
+| `V, \|V\|, f(p,q), argmax` | BPE tokenization | 15 |
+
+</details>
 
 ## See the Pairs
 
@@ -362,6 +380,8 @@ IO.puts("  Total:       #{special_start + length(special_tokens)} tokens")
 ```
 
 ## Break It
+
+> **Predict**: Our BPE was trained on Shakespeare. What happens when we tokenize a word like "ChatGPT" that never appeared in the training corpus?
 
 ### Weird Splits: Why ChatGPT Tokenizes Words Strangely
 

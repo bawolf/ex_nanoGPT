@@ -1,4 +1,4 @@
-# 06: The Full GPT Model
+# 07: The Full GPT Model
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
@@ -20,6 +20,14 @@ alias VegaLite, as: Vl
 ## The Complete Architecture
 
 Over the last five notebooks, we've built every component of a GPT model individually. Now we assemble them into the full model. Here's the complete data flow:
+
+```
+tokens ─→ wte lookup ─→ + wpe ─→ dropout ─→ [Block 1] ─→ ... ─→ [Block N] ─→ ln_f ─→ @ wte.T ─→ logits
+                                                 ↑
+                                         ln → attn → add → ln → mlp → add
+```
+
+Or expanded vertically:
 
 ```
 token IDs → token embedding + position embedding → dropout
@@ -152,6 +160,18 @@ end
 logits = gpt_forward.(idx, params, config)
 IO.inspect(Nx.shape(logits), label: "logits shape (should be {2, 8, 65})")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Token embeddings: Nx.take(params.wte, idx, axis: 0). Shape: {batch, seq_len, n_embd}
+2. Position embeddings: Nx.take(params.wpe, positions, axis: 0). Use Nx.iota({seq_len}) for positions. Shape: {seq_len, n_embd}
+3. Add: x = tok_emb + pos_emb
+4. Pass through each block: Tuple.to_list(params.blocks) |> Enum.reduce(x, fn block_params, acc -> ExNanoGPT.Block.forward(acc, block_params, key, opts) end). opts: [n_head: n_head, dropout_rate: dropout, training: false]
+5. Final LayerNorm: ExNanoGPT.LayerNorm.forward(x, params.ln_f)
+6. Project to vocab: Nx.dot(x, [-1], params.wte, [-1]) — the weight-tied lm_head
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -303,6 +323,15 @@ IO.inspect(Nx.to_number(loss) |> Float.round(4), label: "loss")
 uniform_expected = :math.log(3) |> Float.round(4)
 IO.puts("Uniform prediction loss would be log(3) = #{uniform_expected}")
 ```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Log-softmax (stable): max_val = Nx.reduce_max(logits, axes: [-1], keep_axes: true), shifted = logits - max_val, log_probs = shifted - Nx.log(Nx.sum(Nx.exp(shifted), axes: [-1], keep_axes: true))
+2. Gather the log-prob of each target token: create a one-hot matrix from targets (shape {n, vocab_size}), multiply element-wise with log_probs and sum along vocab axis
+3. Return the mean negative log-probability: -mean(gathered_log_probs)
+
+</details>
 
 <details>
 <summary>Solution</summary>
@@ -463,13 +492,15 @@ def forward(idx, params, config) do
 end
 ```
 
-That's it. Token embeddings + position embeddings, N transformer blocks, final LayerNorm, weight-tied projection. Every line maps to something you built and verified in notebooks 00-06.
+That's it. Token embeddings + position embeddings, N transformer blocks, final LayerNorm, weight-tied projection. Every line maps to something you built and verified in notebooks 00-07.
 
 </details>
 
 ## What's Next
 
 You've now built a complete GPT model from scratch. Every component -- embeddings, layer norm, attention, MLP, the transformer block, the full assembly, and the loss function -- you understand because you implemented it.
+
+If you had pre-trained weights, you could load them right now and generate Shakespeare. We'll build the training pipeline in the next few notebooks, then close the loop.
 
 The next step is **training**: using gradient descent to update all these parameters so the model learns to predict Shakespeare. That involves:
 - Computing gradients with `Nx.Defn.value_and_grad`
@@ -482,20 +513,34 @@ The complete GPT forward pass in one line:
 
 **logits = LN(Block_N(... Block_1(E_tok + E_pos) ...)) · W_E^T**
 
-Each symbol:
+Each symbol -- same operation, four ways:
 
-| Math | Nx code | What it does |
-|------|---------|-------------|
-| `E_tok` | `Nx.take(wte, idx, axis: 0)` | Token embedding lookup |
-| `E_pos` | `Nx.take(wpe, positions, axis: 0)` | Position embedding lookup |
-| `Block_i(x)` | `Block.forward(x, block_params, ...)` | One transformer block |
-| `LN(x)` | `LayerNorm.forward(x, params.ln_f)` | Final layer normalization |
-| `W_E^T` | `params.wte` transposed | Weight-tied output projection |
-| `· W_E^T` | `Nx.dot(x, [-1], wte, [-1])` | Project back to vocabulary scores |
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `E_tok` | Token embedding lookup | `Enum.at(embedding_table, token_id)` | `Nx.take(wte, idx, axis: 0)` |
+| `E_pos` | Position embedding lookup | `Enum.at(pos_table, position)` | `Nx.take(wpe, positions, axis: 0)` |
+| `Block_i(x)` | One transformer block | (composed functions) | `Block.forward(x, block_params, ...)` |
+| `LN(x)` | Final layer normalization | (see notebook 02) | `LayerNorm.forward(x, params.ln_f)` |
+| `· W_E^T` | Project back to vocab scores | `for row <- wte, do: Enum.zip_with(x, row, &*/2) \|> Enum.sum()` | `Nx.dot(x, [-1], wte, [-1])` |
 
 The `^T` means transpose -- we dot the hidden state against each token's embedding to ask "how similar is this to each token?"
 
-**Running reference**: Σ, xᵢ, W ∈ ℝ, μ, σ², ε, γ/β, Q/K/V, d_k, softmax, ^T, GELU, Φ, erf, x+F(x), W_E^T (weight tying)
+<details>
+<summary>All symbols so far (notebooks 00-07)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+| `W_E^T` | Weight-tied output projection |
+
+</details>
 
 ## Key Concepts
 

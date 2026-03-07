@@ -1,0 +1,350 @@
+# 09: SGD and Adam — Learning to Optimize
+
+```elixir
+Code.require_file("setup.exs", __DIR__)
+
+Mix.install(
+  [
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"}
+  ] ++ NotebookSetup.platform_deps()
+)
+
+NotebookSetup.configure_backend!()
+alias VegaLite, as: Vl
+```
+
+## The Big Picture
+
+We now have a model that produces logits and a loss function that measures how wrong they are. The missing piece: **how do we adjust the model's parameters to make the loss go down?**
+
+That's what an optimizer does. It looks at the gradients (which tell us how to change each parameter to reduce the loss) and updates the parameters accordingly.
+
+We'll build up from the simplest optimizer to the one nanoGPT actually uses.
+
+## Starting Simple: Stochastic Gradient Descent (SGD)
+
+The simplest optimizer: multiply each gradient by a small number (the **learning rate**) and subtract it from the parameter.
+
+```
+new_parameter = old_parameter - learning_rate * gradient
+```
+
+That's it. The gradient points in the direction of *increasing* loss, so we go the opposite way.
+
+```elixir
+sgd_step = fn x, lr ->
+  gradient = 2.0 * (x - 3.0)
+  x - lr * gradient
+end
+
+{x, history} =
+  Enum.reduce(1..20, {10.0, [10.0]}, fn _step, {x, hist} ->
+    new_x = sgd_step.(x, 0.1)
+    {new_x, [new_x | hist]}
+  end)
+
+history = Enum.reverse(history)
+IO.puts("SGD finds x = #{Float.round(x, 6)} (target: 3.0)")
+IO.puts("First 10 steps: #{inspect(Enum.take(history, 10) |> Enum.map(&Float.round(&1, 3)))}")
+```
+
+## Visualize: SGD vs Adam on a Valley
+
+Let's see how SGD and Adam behave on a 2D loss surface shaped like an elongated valley: `f(x,y) = (x-3)² + 10*(y-2)²`. SGD oscillates; Adam converges smoothly.
+
+```elixir
+sgd_path =
+  Enum.reduce(1..50, {10.0, 10.0, [{10.0, 10.0}]}, fn _step, {x, y, hist} ->
+    gx = 2.0 * (x - 3.0)
+    gy = 20.0 * (y - 2.0)
+    lr = 0.05
+    new_x = x - lr * gx
+    new_y = y - lr * gy
+    {new_x, new_y, [{new_x, new_y} | hist]}
+  end)
+  |> elem(2)
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {{x, y}, i} ->
+    %{"x" => Float.round(x, 4), "y" => Float.round(y, 4), "step" => i, "optimizer" => "SGD"}
+  end)
+
+{_x, _y, _m_x, _m_y, _v_x, _v_y, adam_path} =
+  Enum.reduce(1..50, {10.0, 10.0, 0.0, 0.0, 0.0, 0.0, [{10.0, 10.0}]}, fn t, {x, y, mx, my, vx, vy, hist} ->
+    gx = 2.0 * (x - 3.0)
+    gy = 20.0 * (y - 2.0)
+    b1 = 0.9
+    b2 = 0.999
+    lr = 0.5
+    eps = 1.0e-8
+
+    mx = b1 * mx + (1 - b1) * gx
+    my = b1 * my + (1 - b1) * gy
+    vx = b2 * vx + (1 - b2) * gx * gx
+    vy = b2 * vy + (1 - b2) * gy * gy
+
+    mx_hat = mx / (1 - :math.pow(b1, t))
+    my_hat = my / (1 - :math.pow(b1, t))
+    vx_hat = vx / (1 - :math.pow(b2, t))
+    vy_hat = vy / (1 - :math.pow(b2, t))
+
+    new_x = x - lr * mx_hat / (:math.sqrt(vx_hat) + eps)
+    new_y = y - lr * my_hat / (:math.sqrt(vy_hat) + eps)
+    {new_x, new_y, mx, my, vx, vy, [{new_x, new_y} | hist]}
+  end)
+
+adam_data =
+  adam_path
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {{x, y}, i} ->
+    %{"x" => Float.round(x, 4), "y" => Float.round(y, 4), "step" => i, "optimizer" => "Adam"}
+  end)
+
+Vl.new(width: 500, height: 400, title: "SGD vs Adam on (x-3)² + 10(y-2)²")
+|> Vl.data_from_values(sgd_path ++ adam_data)
+|> Vl.mark(:line, point: true, opacity: 0.8)
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "x")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "y")
+|> Vl.encode_field(:color, "optimizer", type: :nominal)
+|> Vl.encode_field(:order, "step", type: :quantitative)
+```
+
+SGD works, but it has problems:
+- **Noisy gradients**: each mini-batch gives slightly different gradients, causing the parameter to bounce around
+- **One learning rate for all parameters**: some parameters need big updates, others need tiny ones
+- **No momentum**: it can get stuck oscillating in narrow valleys
+
+## Adam: Smarter Updates with Running Averages
+
+Adam fixes all three problems by keeping track of two running averages for each parameter:
+
+**First moment `m` (momentum)**: a smoothed average of recent gradients. Instead of reacting to every noisy gradient, the optimizer builds up a "consensus direction" over time. Think of it like a heavy ball rolling downhill -- it doesn't instantly change direction with every bump.
+
+```
+m = beta1 * m + (1 - beta1) * gradient
+```
+
+Here `beta1` is typically 0.9, meaning the new `m` is 90% old momentum + 10% current gradient.
+
+**Second moment `v` (adaptive learning rate)**: a smoothed average of squared gradients. This tracks how "volatile" each parameter's gradient is. Parameters with consistently large gradients get smaller learning rates; parameters with small gradients get larger ones. It's an automatic per-parameter learning rate adjustment.
+
+```
+v = beta2 * v + (1 - beta2) * gradient^2
+```
+
+Here `beta2` is typically 0.95 (nanoGPT) or 0.999.
+
+The update divides the momentum by the square root of the variance:
+
+```
+parameter -= learning_rate * m / (sqrt(v) + epsilon)
+```
+
+Each symbol:
+- `m` -- the smoothed gradient direction (which way to go)
+- `sqrt(v)` -- how much the gradient fluctuates (bigger = more cautious)
+- `epsilon` -- tiny constant (1e-8) to prevent division by zero
+- `learning_rate` -- overall step size
+
+**Bias correction**: There's one subtlety. At step 1, `m` and `v` were initialized to zero, so they're biased toward zero. We fix this by dividing by `(1 - beta^t)` where `t` is the step number. Early on, this correction is large; as `t` grows, it approaches 1 and has no effect.
+
+```
+m_corrected = m / (1 - beta1^t)
+v_corrected = v / (1 - beta2^t)
+```
+
+```elixir
+beta1 = 0.9
+
+IO.puts("Bias correction factor 1/(1-β₁ᵗ) at each step:")
+
+for t <- [1, 2, 5, 10, 50, 100] do
+  correction = 1.0 / (1.0 - :math.pow(beta1, t))
+  IO.puts("  step #{String.pad_leading("#{t}", 3)}: #{Float.round(correction, 4)}x")
+end
+
+IO.puts("\nAt step 1, the correction is 10x (huge!)")
+IO.puts("By step 100, it's barely 1.0 (negligible)")
+```
+
+## AdamW: Decoupling Weight Decay
+
+Classic Adam applies weight decay through the gradient: it adds `weight_decay * parameter` to the gradient before the Adam update. The problem is that Adam's adaptive learning rate then *also* scales the weight decay, which isn't what we want.
+
+**AdamW** decouples the two: it applies weight decay directly to the parameter, completely independent of the adaptive gradient step.
+
+```
+# Standard Adam (weight decay mixed into gradient):
+gradient = gradient + weight_decay * parameter   # decay goes through Adam's scaling
+parameter -= lr * adam_update(gradient)
+
+# AdamW (weight decay separate):
+parameter -= lr * adam_update(gradient)           # pure Adam step
+parameter -= lr * weight_decay * parameter        # separate decay step
+```
+
+This small change makes a real difference -- it's what nanoGPT and most modern transformers use.
+
+## Exercise: Implement One AdamW Update Step
+
+Given a single parameter tensor with its gradient, the running `m` and `v` states, and the hyperparameters, compute the updated parameter and new optimizer state.
+
+The full AdamW update for one parameter at step `t`:
+
+1. `m = beta1 * m + (1 - beta1) * grad` -- update momentum
+2. `v = beta2 * v + (1 - beta2) * grad * grad` -- update variance estimate
+3. `m_hat = m / (1 - beta1^t)` -- bias-corrected momentum
+4. `v_hat = v / (1 - beta2^t)` -- bias-corrected variance
+5. `param = param - lr * m_hat / (sqrt(v_hat) + eps)` -- Adam step
+6. `param = param - lr * weight_decay * param` -- weight decay (only for 2D+ tensors)
+
+```elixir
+adamw_update_single = fn param, grad, m, v, lr, t, config ->
+  # config has keys: :beta1, :beta2, :eps, :weight_decay
+  # Return {new_param, new_m, new_v}
+  {param, m, v}
+end
+
+config = %{beta1: 0.9, beta2: 0.95, eps: 1.0e-8, weight_decay: 0.1}
+
+param = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+grad = Nx.tensor([[0.1, -0.2, 0.3], [-0.1, 0.4, -0.5]])
+m = Nx.broadcast(0.0, {2, 3})
+v = Nx.broadcast(0.0, {2, 3})
+lr = 0.001
+t = 1
+
+{new_param, new_m, new_v} = adamw_update_single.(param, grad, m, v, lr, t, config)
+IO.inspect(new_param, label: "updated parameter")
+IO.inspect(new_m, label: "new m (momentum)")
+IO.inspect(new_v, label: "new v (variance)")
+```
+
+<details>
+<summary>Stuck? Step-by-step hints</summary>
+
+1. Pattern match config: `%{beta1: b1, beta2: b2, eps: eps, weight_decay: wd} = config`
+2. Momentum: `Nx.add(Nx.multiply(b1, m), Nx.multiply(1.0 - b1, grad))`
+3. Variance: `Nx.add(Nx.multiply(b2, v), Nx.multiply(1.0 - b2, Nx.multiply(grad, grad)))`
+4. Bias correction: divide each by `1.0 - :math.pow(beta, t)`
+5. Adam step: `Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), eps)))`
+6. Weight decay: `Nx.multiply(lr * wd, param)` — subtract from the result
+
+</details>
+
+<details>
+<summary>Solution</summary>
+
+```elixir
+adamw_update_single = fn param, grad, m, v, lr, t, config ->
+  %{beta1: b1, beta2: b2, eps: eps, weight_decay: wd} = config
+
+  new_m = Nx.add(Nx.multiply(b1, m), Nx.multiply(1.0 - b1, grad))
+  new_v = Nx.add(Nx.multiply(b2, v), Nx.multiply(1.0 - b2, Nx.multiply(grad, grad)))
+
+  m_hat = Nx.divide(new_m, 1.0 - :math.pow(b1, t))
+  v_hat = Nx.divide(new_v, 1.0 - :math.pow(b2, t))
+
+  adam_step = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), eps)))
+  decay_step = Nx.multiply(lr * wd, param)
+
+  new_param = Nx.subtract(Nx.subtract(param, adam_step), decay_step)
+
+  {new_param, new_m, new_v}
+end
+```
+
+</details>
+
+## Break It: What Happens with a Bad Learning Rate?
+
+> **Before you run the next cell**: With learning rates of 1.0, 0.1, and 0.001, which do you think will converge fastest? Will any of them diverge (loss goes up instead of down)?
+
+The learning rate is the most critical hyperparameter. Too high: the model diverges. Too low: nothing happens. Let's see all three on the simple `(x-3)²` problem.
+
+```elixir
+run_sgd = fn lr, steps ->
+  Enum.reduce(1..steps, {10.0, [10.0]}, fn _step, {x, hist} ->
+    gradient = 2.0 * (x - 3.0)
+    new_x = x - lr * gradient
+    {new_x, [new_x | hist]}
+  end)
+  |> elem(1)
+  |> Enum.reverse()
+  |> Enum.with_index()
+  |> Enum.map(fn {x, i} ->
+    loss = (x - 3.0) * (x - 3.0)
+    %{"step" => i, "loss" => Float.round(loss, 4), "lr" => "lr=#{lr}"}
+  end)
+end
+
+lr_data = run_sgd.(1.0, 20) ++ run_sgd.(0.1, 20) ++ run_sgd.(0.001, 20)
+
+Vl.new(width: 500, height: 300, title: "Learning Rate: Too High, Just Right, Too Low")
+|> Vl.data_from_values(lr_data)
+|> Vl.mark(:line, point: true)
+|> Vl.encode_field(:x, "step", type: :quantitative, title: "Step")
+|> Vl.encode_field(:y, "loss", type: :quantitative, title: "Loss = (x-3)²", scale: %{type: "log"})
+|> Vl.encode_field(:color, "lr", type: :nominal, title: "Learning Rate")
+```
+
+lr=1.0 diverges (loss explodes). lr=0.001 barely moves. lr=0.1 converges nicely. This is why LR schedules and adaptive optimizers like Adam exist -- to navigate this sensitivity.
+
+## What's Next
+
+We now understand how optimizers work -- from simple SGD to the AdamW optimizer that nanoGPT uses. But in practice, a good optimizer isn't enough: you also need a **learning rate schedule**, **gradient clipping**, and **weight decay groups**. We'll cover these training hyperparameters in the next notebook.
+
+## Math Notation: The Adam Update Rule
+
+The full AdamW update, symbol by symbol:
+
+1. **mₜ = β₁ · mₜ₋₁ + (1 - β₁) · gₜ** -- update momentum (smoothed gradient direction)
+2. **vₜ = β₂ · vₜ₋₁ + (1 - β₂) · gₜ²** -- update variance estimate (gradient volatility)
+3. **m̂ₜ = mₜ / (1 - β₁ᵗ)** -- bias-corrected momentum
+4. **v̂ₜ = vₜ / (1 - β₂ᵗ)** -- bias-corrected variance
+5. **θₜ = θₜ₋₁ - α · m̂ₜ / (√v̂ₜ + ε)** -- the update step
+6. **θₜ = θₜ - α · λ · θₜ** -- decoupled weight decay (AdamW only)
+
+| Formula | Meaning | Elixir | Nx |
+|---------|---------|--------|----|
+| `α` (learning rate) | Step size | `lr = 6.0e-4` | `lr` variable |
+| `β₁ · m + (1-β₁) · g` | Momentum update | `0.9 * m + 0.1 * g` | `Nx.add(Nx.multiply(0.9, m), Nx.multiply(0.1, g))` |
+| `β₂ · v + (1-β₂) · g²` | Variance update | `0.95 * v + 0.05 * g*g` | `Nx.add(Nx.multiply(0.95, v), Nx.multiply(0.05, Nx.multiply(g, g)))` |
+| `∇` (nabla) | Gradient | (automatic via backprop) | `Nx.Defn.value_and_grad(loss_fn).(params)` |
+| `θ` (theta) | Parameters | `params` map | The model weights |
+| `λ · θ` | Weight decay | `0.1 * param` | `Nx.multiply(weight_decay, param)` |
+
+<details>
+<summary>All symbols so far (notebooks 00-09)</summary>
+
+| Symbol | Meaning |
+|--------|---------|
+| `Σᵢ xᵢ`, `xᵢ`, `n` | Sum, indexing, count |
+| `W ∈ ℝ^{V×d}`, `W[i]` | Matrix shape, row lookup |
+| `μ, σ², ε` | Mean, variance, epsilon |
+| `γ, β` | Learnable scale and shift |
+| `Q, K, V`, `d_k` | Attention projections, head dim |
+| `softmax`, `^T` | Probabilities, transpose |
+| `GELU`, `Φ`, `erf` | Activation, Gaussian CDF, error function |
+| `x_{l+1} = x_l + F(x_l)` | Residual connection |
+| `W_E^T` | Weight-tied output projection |
+| `L`, `log`, `P(y\|x)` | Loss, logarithm, conditional probability |
+| `α`, `β₁/β₂` | Learning rate, decay rates |
+| `∇`, `θ`, `λ` | Gradient, parameters, weight decay |
+
+</details>
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **SGD** | Simplest optimizer: subtract `lr * gradient` from each parameter |
+| **Adam** | Tracks momentum (`m`) and gradient variance (`v`) for smarter, per-parameter updates |
+| **Bias correction** | Divides `m` and `v` by `(1 - beta^t)` to fix the zero-initialization bias in early steps |
+| **AdamW** | Adam with decoupled weight decay -- applies decay directly to parameters, not through gradients |
+| **Weight decay** | Gently pushes parameters toward zero to prevent overfitting (L2 regularization) |

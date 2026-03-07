@@ -1,4 +1,4 @@
-# 17: Serving with LiveView — From Notebook to Browser
+# 22: Serving with LiveView
 
 ```elixir
 Code.require_file("setup.exs", __DIR__)
